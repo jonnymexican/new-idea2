@@ -487,6 +487,42 @@ class TestWebServer(CheckpointFixture):
         self.assertEqual(done[0]["block_size"], 8)
         self.assertGreater(done[0]["in_context"], done[0]["prompt_tokens"])
 
+    def test_done_reports_what_the_window_dropped(self):
+        """The model reads the last block_size tokens and nothing older, so a
+        reply has to say how much was written but never seen — the page cannot
+        be honest about the window without these counts."""
+        # A prompt that fits: nothing is dropped on the prompt's account.
+        events, _ = self.stream({"prompt": "a\n", "max_new_tokens": 4, "seed": 3})
+        done = [e for e in events if e["t"] == "done"][0]
+        self.assertLessEqual(done["prompt_tokens"], done["block_size"])
+        self.assertEqual(done["dropped_prompt_tokens"], 0)
+        self.assertEqual(done["dropped_tokens"],
+                         max(0, done["in_context"] - done["block_size"]))
+
+        # A prompt longer than the window: its opening tokens never reach it.
+        events, _ = self.stream(
+            {"prompt": "KING HENRY: We are in the forest now, and it is cold.\n",
+             "max_new_tokens": 4, "seed": 3}
+        )
+        done = [e for e in events if e["t"] == "done"][0]
+        self.assertGreater(done["prompt_tokens"], done["block_size"])
+        self.assertEqual(done["dropped_prompt_tokens"],
+                         done["prompt_tokens"] - done["block_size"])
+        self.assertEqual(done["dropped_tokens"],
+                         max(0, done["in_context"] - done["block_size"]))
+        self.assertGreaterEqual(done["dropped_tokens"],
+                                done["dropped_prompt_tokens"])
+
+    def test_page_accounts_for_the_context_it_drops(self):
+        """A window that quietly forgets the beginning is the failure mode; the
+        page has somewhere to say so and marks what fell out."""
+        _, body, _ = self.get("/")
+        self.assertIn('id="window"', body)
+        self.assertIn("dropped_tokens", body)
+        self.assertIn("dropped_prompt_tokens", body)
+        self.assertIn("out of view", body)
+        self.assertIn('classList.add("dropped")', body)
+
     def test_same_seed_reproduces_the_reply(self):
         body = {"prompt": "KING:\n", "max_new_tokens": 8, "seed": 5}
         first, _ = self.stream(body)

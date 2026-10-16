@@ -265,6 +265,13 @@ NDJSON over `fetch` rather than Server-Sent Events, because `EventSource` cannot
 POST the settings along with the prompt — and a `TextDecoder` over a stream is a
 smaller cost than marshalling the request through a query string.
 
+`done` also carries the two counts that make the context window honest.
+`in_context` is every token written, but the model only reads the last
+`block_size` of them: `dropped_tokens` is how many ended up outside the window,
+and `dropped_prompt_tokens` is how many of the prompt alone never reached it. A
+prompt longer than the window is the quiet case — without those numbers the page
+would look as though the model had read all of it.
+
 **The controls are the sampling controls**, wired to the same names the CLI uses:
 temperature, top-k (0 disables it), top-p with an on/off toggle, repetition
 penalty and its window, max new tokens, a stop string, and a seed. Four presets
@@ -276,6 +283,14 @@ Two conveniences worth knowing: **Stop** aborts a reply and keeps the part that
 was already sampled, and **Tokens** shows how the tokenizer split the current
 text into subwords (`the king` → `t | he | k | ing`), which is the browser's
 version of `/tokens` in `chat.py`.
+
+The window is stated rather than implied. A line under the title reads
+`context window: 28/64 tokens in view`, and turns amber once the transcript is
+longer than the model can read: `the last 64 tokens are what the model reads —
+284 of 348 written are out of view`. When the prompt alone overflows it says so
+in words — the opening of what you typed was never read. In the token view the
+chips that have fallen out of the window are dimmed and dashed, so "what does
+the model actually see" is something you can look at rather than infer.
 
 It binds to `127.0.0.1` by default. It serves whatever checkpoint you point it at
 to anyone who can reach the port, so the flag is there if you want it elsewhere.
@@ -308,6 +323,9 @@ and would quietly invalidate the results if it broke again:
 - the web server serves a self-contained page, streams NDJSON chunks over
   chunked framing, rejects bad settings with a reason, and stops a reply when the
   browser walks away instead of sampling on into a dead socket
+- the window arithmetic the page reports is exact: a prompt of exactly
+  `block_size` tokens drops nothing and one token more drops one, with the counts
+  cross-checked against an independent `/api/tokens` encode
 
 ## Fetching the corpus again
 

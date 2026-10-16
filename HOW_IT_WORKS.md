@@ -207,6 +207,11 @@ character-level model, around 124 characters for the BPE one. That is the model'
 entire memory, and it is why a long session in `chat.py` eventually pushes the
 start of the conversation out of view.
 
+The page does not leave that implicit. It counts how much has fallen out and
+says so in words, and the token view dims the chips the model can no longer
+attend to — so the window is a visible property of the transcript rather than a
+number you have to interpret.
+
 [`chat.py`](chat.py) is this same loop with a prompt in front of it: the knobs
 above are commands, the running text is kept as context, and each sampled token
 is written as it arrives so you can watch a sentence form.

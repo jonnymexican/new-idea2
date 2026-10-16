@@ -24,8 +24,16 @@ Endpoints:
 
     {"t": "meta",  ...}                     what the reply is being made with
     {"t": "chunk", "text": "..."}           text to append, as it is sampled
-    {"t": "done",  "text": ..., "steps": n, "seconds": s, "in_context": n}
+    {"t": "done",  ...}                     the reply, its statistics, the window
     {"t": "error", "message": "..."}        after the headers, mid-stream
+
+`done` carries `text`, `steps`, `seconds`, `prompt_tokens`, `in_context` (every
+token written), `block_size`, and the two counts that make the window honest:
+`dropped_tokens` (written, but outside the window by the end) and
+`dropped_prompt_tokens` (tokens of the prompt alone that never reached the
+model, because `stream_reply` crops to the last `block_size` tokens). A prompt
+longer than the window is the quiet case: without that count, the page would
+look as though the model had read all of it.
 
 It is deliberately an NDJSON stream over chunked transfer encoding rather than
 Server-Sent Events: EventSource cannot POST, and 40 lines of fetch plus a
@@ -147,13 +155,19 @@ class Session:
                                                 ids, args, out)
             in_context = len(self.tokenizer.encode(params["prompt"] + text))
 
+        # `stream_reply` keeps the last block_size tokens, so everything before
+        # them is invisible to the model. Counted and reported rather than left
+        # for the reader to infer from a running total.
+        block = self.model.block_size
         return {
             "text": text,
             "steps": steps,
             "seconds": seconds,
             "prompt_tokens": prompt_tokens,
+            "dropped_prompt_tokens": max(0, prompt_tokens - block),
             "in_context": in_context,
-            "block_size": self.model.block_size,
+            "dropped_tokens": max(0, in_context - block),
+            "block_size": block,
         }
 
 
@@ -448,6 +462,10 @@ PAGE = """<!doctype html>
   h1 { font-size: 17px; margin: 0; letter-spacing: .2px; font-weight: 600; }
   h1 span { color: var(--accent); }
   .meta { color: var(--dim); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  /* The window line takes a row of its own under the title, and turns amber
+     once the transcript is longer than the model can see. */
+  .window { width: 100%; }
+  .window.warn { color: var(--accent); }
   .note {
     margin: 10px 22px 0; padding: 9px 12px; border-left: 2px solid var(--accent);
     background: #171a20; color: #c9cdd6; font-size: 12.5px; border-radius: 0 5px 5px 0;
@@ -457,9 +475,12 @@ PAGE = """<!doctype html>
     grid-template-columns: minmax(0, 1fr) 322px; gap: 0;
   }
   @media (max-width: 900px) {
-    /* Stacked: let the whole page scroll rather than squeezing two panes. */
+    /* Stacked: let the whole page scroll rather than squeezing two panes. The
+       rows are sized to their content instead of being stretched to fit, or
+       the token view is squeezed to nothing by the transcript above it. */
     body { overflow: auto; }
-    main { grid-template-columns: 1fr; }
+    main { grid-template-columns: 1fr; align-content: start; }
+    .doc-scroll { flex: 0 0 38vh; }
   }
   section.doc {
     padding: 16px 22px 18px; min-width: 0; min-height: 0;
@@ -522,6 +543,10 @@ PAGE = """<!doctype html>
   .tokens {
     margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px;
     max-height: 26vh; overflow-y: auto;
+    /* It carries the answer to "what does the model actually read", so it keeps
+       its height: as a shrinkable flex item a tall transcript squeezed it to
+       a sliver, chips and all. */
+    flex: 0 0 auto;
   }
   .tokens .chip {
     display: inline-block; background: #202634; border: 1px solid var(--line);
@@ -529,6 +554,7 @@ PAGE = """<!doctype html>
     font: 12px ui-monospace, Menlo, monospace; color: var(--accent-2);
   }
   .tokens .chip.space { color: #6f7787; }
+  .tokens .chip.dropped { opacity: .4; border-style: dashed; }
   code { background: #202634; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
   .err { color: var(--danger); font-size: 12.5px; margin-top: 8px; }
 </style>
@@ -537,6 +563,7 @@ PAGE = """<!doctype html>
 <header>
   <h1>Local <span>prompt</span></h1>
   <div class="meta" id="meta">connecting…</div>
+  <div class="meta window" id="window" hidden></div>
 </header>
 <div class="note">
   <strong>This is a base language model, not an assistant.</strong> It was trained
@@ -550,7 +577,8 @@ PAGE = """<!doctype html>
     <div class="doc-scroll" id="doc"><span class="hint">A blank page. Type a line
 below — a speaker's name, a scrap of dialogue — and the model will take it from
 there. It only remembers the last part of the text (its context window), so a
-long session will eventually drop the beginning.</span></div>
+long session will eventually drop the beginning — the line under the title
+keeps count of how much has gone.</span></div>
     <textarea id="prompt" rows="2" placeholder="KING HENRY:"></textarea>
     <div class="row">
       <button class="primary" id="send">Continue</button>
@@ -646,8 +674,11 @@ long session will eventually drop the beginning.</span></div>
 (() => {
   const $ = (id) => document.getElementById(id);
   const doc = $("doc"), statusEl = $("status"), errEl = $("err");
+  const windowEl = $("window");
   let transcript = "", live = null, controller = null, streaming = false;
-  let lastStats = { tokens: 0, seconds: 0, in_context: 0, block_size: 0 };
+  let blockSize = 0;      // the model's window, from /api/info
+  let lastStats = { tokens: 0, seconds: 0, in_context: 0, block_size: 0,
+                    prompt_tokens: 0, dropped_tokens: 0, dropped_prompt_tokens: 0 };
 
   // ---------------------------------------------------------------- numbers
   // Setting .value in JS fires no events, so this cannot loop back on itself.
@@ -699,14 +730,32 @@ long session will eventually drop the beginning.</span></div>
     const nearBottom = doc.scrollTop + doc.clientHeight >= doc.scrollHeight - 60;
     if (nearBottom) doc.scrollTop = doc.scrollHeight;
   };
+  // The window holds the last block_size tokens and nothing older, so the two
+  // counts that matter are how much is in view and how much has fallen out.
+  // "667/64" would be nonsense, and "all 64 tokens in view" while 603 sat out
+  // of view was worse.
+  const renderWindow = (s) => {
+    if (!s || !s.block_size) { windowEl.hidden = true; return; }
+    windowEl.hidden = false;
+    windowEl.className = "meta window" + (s.dropped_tokens ? " warn" : "");
+    const parts = s.dropped_tokens
+      ? [`context window full: the last ${s.block_size} tokens are what the model`
+         + ` reads — ${s.dropped_tokens} of ${s.in_context} written are out of view`]
+      : [`context window: ${s.in_context}/${s.block_size} tokens in view`];
+    if (s.dropped_prompt_tokens) {
+      parts.push(`your prompt was ${s.prompt_tokens} tokens, so the model saw`
+                 + ` only its last ${s.block_size} — the opening of what you`
+                 + ` typed was never read`);
+    }
+    windowEl.textContent = parts.join(" · ");
+  };
   const setStatus = () => {
     if (streaming) return;
     const s = lastStats;
+    renderWindow(s);
     if (!s.tokens) { statusEl.textContent = "idle"; return; }
-    // The window holds the last block_size tokens; the transcript can be much
-    // longer than that, and saying "667/64" would be nonsense.
-    const window_ = s.in_context > s.block_size
-      ? `all ${s.block_size} tokens in view (${s.in_context} written)`
+    const window_ = s.dropped_tokens
+      ? `${s.block_size} in view · ${s.dropped_tokens} out`
       : `${s.in_context}/${s.block_size} in view`;
     statusEl.textContent = `${s.tokens} tokens · `
       + `${(s.tokens / Math.max(s.seconds, 1e-9)).toFixed(0)} tok/s · ${window_}`;
@@ -802,6 +851,9 @@ long session will eventually drop the beginning.</span></div>
               seconds: event.total_seconds || event.seconds || 0,
               in_context: event.in_context,
               block_size: event.block_size,
+              prompt_tokens: event.prompt_tokens,
+              dropped_tokens: event.dropped_tokens,
+              dropped_prompt_tokens: event.dropped_prompt_tokens,
             };
           } else if (event.t === "error") {
             throw new Error(event.message);
@@ -840,7 +892,9 @@ long session will eventually drop the beginning.</span></div>
     doc.innerHTML = '<span class="hint">cleared.</span>';
     statusEl.textContent = "idle";
     clearFail();
-    lastStats = { tokens: 0, seconds: 0, in_context: 0, block_size: 0 };
+    lastStats = { tokens: 0, seconds: 0, in_context: 0, block_size: 0,
+                  prompt_tokens: 0, dropped_tokens: 0, dropped_prompt_tokens: 0 };
+    renderWindow(lastStats);
   });
   $("copy").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(transcript); statusEl.textContent = "copied"; }
@@ -867,10 +921,20 @@ long session will eventually drop the beginning.</span></div>
       });
       const info = await response.json();
       if (info.error) throw new Error(info.error);
+      // The same encode the model does, so these chips line up with its window:
+      // everything before the first `out` chips is no longer attended to.
+      const out = blockSize ? Math.max(0, info.count - blockSize) : 0;
       box.innerHTML = `<div class="meta" style="margin-bottom:8px">${info.count} tokens
         for ${info.chars} characters — ${(info.chars / Math.max(info.count, 1)).toFixed(2)}
-        characters each</div>`;
-      for (const t of info.tokens) box.appendChild(chip(t.id, t.text));
+        characters each</div>`
+        + (out ? `<div class="meta" style="margin:-4px 0 8px">the model no
+          longer sees the first ${out} of these — only the last ${blockSize} tokens
+          are in its window</div>` : "");
+      info.tokens.forEach((t, i) => {
+        const el = chip(t.id, t.text);
+        if (i < out) el.classList.add("dropped");   // out of the window
+        box.appendChild(el);
+      });
       box.hidden = false;
     } catch (exc) { fail(String(exc.message || exc)); }
   });
@@ -878,6 +942,7 @@ long session will eventually drop the beginning.</span></div>
   // ------------------------------------------------------------------ boot
   fetch("/api/info").then((r) => r.json()).then((info) => {
     if (info.error) throw new Error(info.error);
+    blockSize = info.block_size;
     $("meta").textContent =
       `${info.checkpoint} · ${info.tokenizer} vocab ${info.vocab_size} · `
       + `${info.num_params.toLocaleString()} params · ${info.block_size}-token context`;
