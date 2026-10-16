@@ -176,6 +176,7 @@ checkpoint carries its own tokenizer, so any run can be used:
 ```bash
 .venv/bin/python chat.py --checkpoint runs_v3/model.pt
 .venv/bin/python chat.py --prompt "KING HENRY:" --max-new-tokens 200
+.venv/bin/python chat.py --context 24        # hand the model a shorter window
 .venv/bin/python chat.py --prompt "KING:" --stop $'\n' --stats
 .venv/bin/python chat.py --checkpoint runs/does_not_exist.pt   # says so clearly
 echo "To be or not" | .venv/bin/python chat.py
@@ -203,12 +204,16 @@ to get one speaker's turn and nothing else.
 | `/penalty <f>` | repetition penalty; 1.0 disables it |
 | `/len <int>` | tokens per reply |
 | `/seed <int>` | reseed the sampler (same seed, same text) |
-| `/context` | what the model will see next, and how full it is |
+| `/window <int>` | how many tokens of the end of the text to give the model; its `block_size` is the ceiling |
+| `/context` | what the model will see next, how full it is, and how much of it the model has gone past |
 | `/tokens <text>` | how the tokenizer splits a line — subwords are visible this way |
 | `/reset`, `/save <file>`, `/help`, `/quit` | as they sound |
 
 The same knobs are flags (`--temperature`, `--top-k`, `--top-p`,
-`--repetition-penalty`, `--max-new-tokens`, `--seed`, `--stop`) for one-shot use.
+`--repetition-penalty`, `--max-new-tokens`, `--seed`, `--stop`, `--context`) for
+one-shot use. `--context` is the same window setting the browser's control
+moves: a smaller number is a handicap you choose, and the model keeps writing
+with less to go on.
 There is a browser front end for the same prompt — see
 [Talk to it in a browser](#talk-to-it-in-a-browser) below.
 
@@ -286,6 +291,15 @@ penalty and its window, max new tokens, a stop string, and a seed. Four presets
 torch per request, a fixed seed makes a reply reproducible: the same text and the
 same seed give the same continuation, which is what makes the page testable.
 
+One control is not a sampling control: **Context** sets how many tokens of the
+end of the text the model is actually given. `block_size` is what the checkpoint
+was trained for and therefore a ceiling, not a requirement — the positional
+embeddings cannot address more — so the control only ever shortens the window.
+Dragging it moves the line in the transcript at once, without generating
+anything, so the boundary is something you can watch travel up and down a
+transcript while the replies lose the thread around it. Lower it far enough and
+even the text you just typed partly falls outside.
+
 Two conveniences worth knowing: **Stop** aborts a reply and keeps the part that
 was already sampled, and **Tokens** shows how the tokenizer split the current
 text into subwords (`the king` → `t | he | k | ing`), which is the browser's
@@ -349,6 +363,11 @@ and would quietly invalidate the results if it broke again:
   that keeps it visible is resolved from the stylesheet the server actually
   sends — who shrinks, who caps, who yields — and the check is shown to fail on
   the layout that once collapsed the panel to about twelve pixels
+- the window can be deliberately shortened but never stretched past what the
+  checkpoint was trained for, and the crop is pinned where sampling noise cannot
+  mask it — on the width of the tensors the model is actually handed — alongside
+  a check that the preview the control asks for is exactly what a reply of the
+  same window reports
 - the edge of the model's window is a real place in the text, not a close one:
   the offset is cross-checked by slicing the same tokenisation two ways, holds
   for both tokenizers, and lands before the character when a byte-level token

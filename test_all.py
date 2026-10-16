@@ -22,6 +22,11 @@ before or that the numbers in the README would become wrong without:
 - the edge of the model's window is a real character offset, not an
   approximation: it is cross-checked two ways, works for both tokenizers, and
   goes before the character when a byte-level token cuts one in half
+- the window can be deliberately shortened but never stretched past what the
+  checkpoint was trained for, and the crop is pinned where sampling noise cannot
+  mask it — on the width of the tensors the model is actually handed — alongside
+  a check that the preview the control asks for is exactly what a reply of the
+  same window reports
 
 Standard library only, on purpose: this project has one dependency (torch) and
 the tests should not add a second.
@@ -33,6 +38,7 @@ the tests should not add a second.
 
 import html.parser
 import http.client
+import io
 import json
 import math
 import os
@@ -526,6 +532,103 @@ class TestSampling(unittest.TestCase):
         self.assertEqual(out.shape, (1, 9))
 
 
+class ModelSpy:
+    """A model wrapper that records the shape of every input it is handed.
+
+    Sampling from a randomly initialised model is close to RNG-dominated: with
+    the same seed, two different windows can produce the same characters by
+    coincidence, so comparing *outputs* is a weak way to show that the crop
+    happened. The input tensor is not subject to that — it either has the
+    window's width or it does not.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.block_size = model.block_size
+        self.shapes = []
+
+    def __call__(self, idx):
+        self.shapes.append(tuple(idx.shape))
+        return self.model(idx)
+
+
+class TestContextWindow(unittest.TestCase):
+    """chat.py: how much of the text the model is actually given.
+
+    `block_size` is a ceiling, not a requirement — that is what the positional
+    embeddings were trained for — so a caller can hand the model less than it
+    can hold. Everything measured against the window (what was dropped, where
+    the line falls) has to move with it, which is what these pin.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # One token per character, so a window of n is exactly n characters.
+        cls.tokenizer = CharTokenizer(text="hello there abcdefghijklmnopqrstuvwxyz")
+        torch.manual_seed(0)
+        cls.model = GPT(vocab_size=cls.tokenizer.vocab_size, n_embd=16, n_head=2,
+                        n_layer=1, block_size=8, dropout=0.0)
+        cls.model.eval()
+        cls.ids = cls.tokenizer.encode("hello there")     # longer than the window
+
+    def args(self, max_new_tokens=6):
+        return SimpleNamespace(temperature=0.8, top_k=200, top_p=None,
+                               repetition_penalty=1.0, penalty_window=64,
+                               max_new_tokens=max_new_tokens, stop=None)
+
+    def reply(self, context=None, max_new_tokens=6, seed=3, model=None):
+        torch.manual_seed(seed)
+        return chat.stream_reply(model or self.model, self.tokenizer, self.ids,
+                                 self.args(max_new_tokens), io.StringIO(),
+                                 context=context)[0]
+
+    def test_the_default_is_what_the_checkpoint_was_trained_for(self):
+        self.assertEqual(chat.context_window(self.model), 8)
+        self.assertEqual(chat.context_window(self.model, None), 8)
+
+    def test_a_longer_window_is_clamped_to_the_ceiling(self):
+        """More tokens than the positional embeddings address is not something
+        the model can honour, so it is not honoured."""
+        self.assertEqual(chat.context_window(self.model, 4096), 8)
+
+    def test_a_shorter_window_is_allowed(self):
+        self.assertEqual(chat.context_window(self.model, 3), 3)
+
+    def test_a_window_of_zero_is_refused(self):
+        with self.assertRaises(ValueError):
+            chat.context_window(self.model, 0)
+
+    def test_the_model_is_handed_the_window_and_nothing_older(self):
+        """The crop is the whole feature, and a randomly initialised model makes
+        sampled text a poor witness for it, so it is measured where it cannot be
+        masked: on the width of the tensors the model is actually handed."""
+        for asked, expected in ((1, 1), (2, 2), (5, 5), (8, 8), (99, 8), (None, 8)):
+            spy = ModelSpy(self.model)
+            self.reply(context=asked, max_new_tokens=4, model=spy)
+            self.assertEqual([shape[1] for shape in spy.shapes], [expected] * 4,
+                             f"asked for {asked}, the model got {spy.shapes}")
+
+    def test_the_reply_is_measured_from_the_cropped_prompt(self):
+        """What this pins is the bookkeeping rather than the crop: the text
+        returned excludes the part of the prompt the model never saw. Written out
+        by hand, since `stream_reply` is the only place the two meet."""
+        window, steps = 2, 6
+        text = self.reply(context=window, max_new_tokens=steps)
+
+        torch.manual_seed(3)
+        idx = torch.tensor(self.ids[-window:], dtype=torch.long)[None, ...]
+        base = self.tokenizer.decode(idx[0].tolist())
+        with torch.no_grad():
+            for _ in range(steps):
+                logits, _ = self.model(idx[:, -window:])
+                idx = torch.cat((idx, sample_next(logits[:, -1, :], 0.8, 200)),
+                                dim=1)
+        expected = self.tokenizer.decode(idx[0].tolist())[len(base):]
+        self.assertEqual(text, expected)
+        self.assertTrue(text)
+        self.assertEqual(len(base), window)          # one token per character
+
+
 class CheckpointFixture(unittest.TestCase):
     """Shared helper: write a checkpoint the way train.py would."""
 
@@ -779,6 +882,99 @@ class TestWebServer(CheckpointFixture):
         # the page has: the JSON round trip preserves the same code points, so
         # the line lands where the browser's own text puts it.)
 
+    def test_done_reports_the_window_it_actually_used(self):
+        """The control can hand the model less of the text than it can hold, so
+        every count has to be measured against the window that was used rather
+        than against what the model could have been given."""
+        prompt = "KING HENRY:\n" + read_corpus(600)
+        events, _ = self.stream({"prompt": prompt, "max_new_tokens": 4,
+                                 "context": 3, "seed": 5})
+        done = [e for e in events if e["t"] == "done"][0]
+        self.assertEqual(done["context"], 3)
+        self.assertEqual(done["block_size"], 8)      # the ceiling is unchanged
+        full = prompt + done["text"]
+        ids = self.tokenizer.encode(full)
+        self.assertEqual(done["dropped_tokens"], max(0, len(ids) - 3))
+        self.assertEqual(full[done["boundary_chars"]:],
+                         self.tokenizer.decode(ids[-3:]))
+
+        # With the model's own window the same text keeps far more of itself.
+        events, _ = self.stream({"prompt": prompt, "max_new_tokens": 4,
+                                 "seed": 5})
+        wide = [e for e in events if e["t"] == "done"][0]
+        self.assertEqual(wide["context"], wide["block_size"])
+        self.assertLess(wide["dropped_tokens"], done["dropped_tokens"])
+        # A wider window leaves less text above the line, so its boundary is
+        # earlier in the transcript, not later.
+        self.assertLess(wide["boundary_chars"], done["boundary_chars"])
+
+    def test_a_window_larger_than_the_model_is_clamped_not_refused(self):
+        events, _ = self.stream({"prompt": "a\n", "max_new_tokens": 2,
+                                 "context": 4000, "seed": 6})
+        done = [e for e in events if e["t"] == "done"][0]
+        self.assertEqual(done["context"], done["block_size"])
+
+    def test_a_window_of_zero_is_rejected(self):
+        status, body = self.post("/api/generate", {"prompt": "a\n", "context": 0})
+        self.assertEqual(status, 400)
+        self.assertIn("context", body)
+        status, _ = self.post("/api/generate", {"prompt": "a\n", "context": 2.5})
+        self.assertEqual(status, 400)
+
+    def test_the_window_endpoint_says_where_the_line_would_fall(self):
+        """The control asks this before generating anything, so the line moves
+        as the slider does rather than after a reply."""
+        text = read_corpus(600)
+        ids = self.tokenizer.encode(text)
+        for asked, expected in ((8, 8), (3, 3), (4000, 8)):
+            status, body = self.post("/api/window",
+                                     {"text": text, "context": asked})
+            self.assertEqual(status, 200)
+            info = json.loads(body)
+            self.assertEqual(info["context"], expected)
+            self.assertEqual(info["block_size"], 8)
+            self.assertEqual(info["tokens"], len(ids))
+            self.assertEqual(info["dropped_tokens"], max(0, len(ids) - expected))
+            self.assertEqual(text[info["boundary_chars"]:],
+                             self.tokenizer.decode(ids[-expected:]))
+        # No context given means the model's own window.
+        _, body = self.post("/api/window", {"text": text})
+        self.assertEqual(json.loads(body)["context"], 8)
+
+    def test_the_window_endpoint_agrees_with_what_a_reply_reports(self):
+        """The preview drawn while dragging has to be the line the next reply
+        would draw, or the page contradicts itself."""
+        prompt = "KING HENRY:\n" + read_corpus(600)
+        events, _ = self.stream({"prompt": prompt, "max_new_tokens": 4,
+                                 "context": 3, "seed": 5})
+        done = [e for e in events if e["t"] == "done"][0]
+        _, body = self.post("/api/window",
+                            {"text": prompt + done["text"], "context": 3})
+        info = json.loads(body)
+        self.assertEqual(info["boundary_chars"], done["boundary_chars"])
+        self.assertEqual(info["dropped_tokens"], done["dropped_tokens"])
+        self.assertEqual(info["tokens"], done["in_context"])
+        self.assertEqual(info["context"], done["context"])
+
+    def test_the_window_endpoint_rejects_bad_input(self):
+        for payload, why in (({"text": 42}, "text must be a string"),
+                             ({"text": "a", "context": 0}, "zero window"),
+                             ({"text": "a", "context": "big"}, "not a number"),
+                             ({"text": "a", "context": 2.5}, "not whole")):
+            status, body = self.post("/api/window", payload)
+            self.assertEqual(status, 400, why)
+            self.assertIn("error", body)
+
+    def test_page_offers_the_window_as_a_control(self):
+        """The control has to be there, be sent with the request, and be what
+        the readouts measure against."""
+        _, body, _ = self.get("/")
+        self.assertIn('id="context"', body)
+        self.assertIn('id="context-n"', body)
+        self.assertIn("context: windowSize()", body)
+        self.assertIn('fetch("/api/window"', body)
+        self.assertIn("inWindow", body)
+
     def test_a_window_that_drops_nothing_has_no_boundary_to_draw(self):
         events, _ = self.stream({"prompt": "a\n", "max_new_tokens": 2,
                                  "seed": 12})
@@ -943,6 +1139,7 @@ class TestWebServer(CheckpointFixture):
         self.assertIsNone(params["top_p"])       # nucleus off by default
         self.assertEqual(params["repetition_penalty"], 1.0)
         self.assertEqual(params["max_new_tokens"], 160)
+        self.assertIsNone(params["context"])     # unset means the model's own window
         self.assertIsNone(params["stop"])
         self.assertIsNone(params["seed"])        # no seed means a fresh draw
 

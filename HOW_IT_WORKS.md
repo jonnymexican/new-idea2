@@ -212,11 +212,19 @@ says so in words, and the token view dims the chips the model can no longer
 attend to — so the window is a visible property of the transcript rather than a
 number you have to interpret.
 
+The window is a ceiling rather than a requirement, and that distinction is easy
+to miss: `block_size` is what the positional embeddings were trained for, so the
+model cannot be *given* more than that — but it can be given less. The page's
+Context control does exactly that. Nothing about the attention changes; what
+changes is how many tokens the model is allowed to attend to, which is the
+difference between a model that has read the passage and one that has read the
+last line of it.
+
 The page also says *where* the reading stops, not only how much has fallen out.
 `done` reports the window's opening as a character offset, and the transcript
 gets a dashed rule at that offset with the text above it dimmed — so the model's
 memory has an edge you can point at, and the characters below the line tokenise
-to exactly `block_size` tokens. The offset is measured from the visible tail
+to exactly as many tokens as the window holds. The offset is measured from the visible tail
 rather than from the dropped prefix on purpose: a byte-level token can cut a
 multi-byte character in half, and the two ways of slicing then disagree by
 exactly that character. A reply that was stopped part-way leaves no line at all,

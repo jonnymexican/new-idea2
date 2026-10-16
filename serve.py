@@ -18,6 +18,7 @@ Endpoints:
     GET  /            the page (self-contained: inline CSS and JS)
     GET  /api/info    checkpoint, tokenizer and model description
     POST /api/tokens  {"text": ...} -> how the tokenizer splits it
+    POST /api/window  {"text": ..., "context": n} -> where the window would fall
     POST /api/generate  JSON settings -> newline-delimited JSON token stream
 
 `/api/generate` streams, so the shape matters. Each line is one JSON object:
@@ -27,13 +28,19 @@ Endpoints:
     {"t": "done",  ...}                     the reply, its statistics, the window
     {"t": "error", "message": "..."}        after the headers, mid-stream
 
+`/api/generate` accepts a `context` setting: how many tokens of the end of the
+transcript to give the model. The checkpoint's `block_size` is the ceiling — that
+is what its positional embeddings were trained for — and a smaller number is a
+deliberate handicap, which is the point of the page's control: the window moves
+and the replies change with it.
+
 `done` carries `text`, `steps`, `seconds`, `prompt_tokens`, `in_context` (every
-token written), `block_size`, and the two counts that make the window honest:
-`dropped_tokens` (written, but outside the window by the end) and
-`dropped_prompt_tokens` (tokens of the prompt alone that never reached the
-model, because `stream_reply` crops to the last `block_size` tokens). A prompt
-longer than the window is the quiet case: without that count, the page would
-look as though the model had read all of it.
+token written), `block_size` (the ceiling), `context` (the window actually
+used), and the two counts that make the window honest: `dropped_tokens` (written,
+but outside the window by the end) and `dropped_prompt_tokens` (tokens of the
+prompt alone that never reached the model, because `stream_reply` crops to the
+window). A prompt longer than the window is the quiet case: without that count,
+the page would look as though the model had read all of it.
 
 `boundary_chars` is where that window begins, as a character offset into the
 transcript the model was given (`prompt + text`), so the page can draw the edge
@@ -58,7 +65,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
 
-from chat import load_model, stream_reply
+from chat import context_window, load_model, stream_reply
 
 DEFAULT_CHECKPOINT = "runs_tok_bpe/model.pt"
 DEFAULT_HOST = "127.0.0.1"
@@ -69,6 +76,9 @@ DEFAULT_PORT = 8765
 MAX_BODY_BYTES = 1 << 20
 MAX_PROMPT_CHARS = 100_000
 MAX_NEW_TOKENS = 2000
+# An upper bound for validation only. The model's own `block_size` is the real
+# ceiling, and `context_window` is what applies it.
+MAX_CONTEXT = 4096
 
 
 class ClientGone(Exception):
@@ -168,6 +178,9 @@ class Session:
         """
         out = _EmitterStream(emit)
         block = self.model.block_size
+        # What the model will actually be given: the request may ask for less
+        # than this checkpoint can hold, and never for more.
+        window = context_window(self.model, params["context"])
         args = argparse.Namespace(
             temperature=params["temperature"],
             top_k=params["top_k"],
@@ -186,7 +199,7 @@ class Session:
             ids = self.tokenizer.encode(params["prompt"])
             prompt_tokens = len(ids)
             text, steps, seconds = stream_reply(self.model, self.tokenizer,
-                                                ids, args, out)
+                                                ids, args, out, context=window)
             # The transcript the model was given, and the tokens it made of it.
             # `in_context` is that whole sequence: every token written.
             full = params["prompt"] + text
@@ -194,23 +207,47 @@ class Session:
             in_context = len(full_ids)
             # Inside the lock as well: decoding walks the tokenizer's cache.
             boundary_chars = window_boundary_chars(self.tokenizer, full,
-                                                   full_ids, block)
+                                                   full_ids, window)
 
-        # `stream_reply` keeps the last block_size tokens, so everything before
+        # `stream_reply` keeps the last `window` tokens, so everything before
         # them is invisible to the model. Counted and reported rather than left
         # for the reader to infer from a running total — and located, as an
         # offset into the transcript, so the page can draw the edge of the
         # window where it actually falls instead of at some approximation.
+        # `window` and not `block`: the counts belong to the window that was
+        # used, while `block_size` stays what the model could have held.
         return {
             "text": text,
             "steps": steps,
             "seconds": seconds,
             "prompt_tokens": prompt_tokens,
-            "dropped_prompt_tokens": max(0, prompt_tokens - block),
+            "dropped_prompt_tokens": max(0, prompt_tokens - window),
             "in_context": in_context,
-            "dropped_tokens": max(0, in_context - block),
+            "dropped_tokens": max(0, in_context - window),
             "boundary_chars": boundary_chars,
+            "context": window,
             "block_size": block,
+        }
+
+    def window_for(self, text, context):
+        """Where the window would fall for `text` at a given size.
+
+        The control in the page needs this: dragging it should move the line in
+        the transcript at once, rather than leaving the reader to generate a
+        reply to find out what they just asked for. Nothing is sampled here, so
+        this is cheap — one encode, one decode of the window's tokens.
+        """
+        with self.lock:
+            ids = self.tokenizer.encode(text)
+            window = context_window(self.model, context)
+            boundary_chars = window_boundary_chars(self.tokenizer, text, ids,
+                                                   window)
+        return {
+            "tokens": len(ids),
+            "context": window,
+            "block_size": self.model.block_size,
+            "dropped_tokens": max(0, len(ids) - window),
+            "boundary_chars": boundary_chars,
         }
 
 
@@ -277,6 +314,13 @@ def validate(body):
     penalty_window = integer("penalty_window", 64, 1, 4096)
     max_new_tokens = integer("max_new_tokens", 160, 1, MAX_NEW_TOKENS)
 
+    # How much of the end of the transcript to give the model. Left unset it is
+    # the checkpoint's block_size; the clamp to that ceiling happens in the
+    # session, which is the only place that knows the model.
+    context = body.get("context", None)
+    if context is not None:
+        context = integer("context", 1, 1, MAX_CONTEXT)
+
     stop = body.get("stop", None)
     if stop is not None:
         if not isinstance(stop, str):
@@ -299,6 +343,7 @@ def validate(body):
         "repetition_penalty": repetition_penalty,
         "penalty_window": penalty_window,
         "max_new_tokens": max_new_tokens,
+        "context": context,
         "stop": stop,
         "seed": seed,
     }
@@ -429,6 +474,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error_json(400, "text must be a string")
                 return
             self.send_json(self.session.tokens(text))
+
+        elif path == "/api/window":
+            text = body.get("text", "")
+            if not isinstance(text, str):
+                self.send_error_json(400, "text must be a string")
+                return
+            if len(text) > MAX_PROMPT_CHARS:
+                self.send_error_json(400, "text is too long to tokenise")
+                return
+            context = body.get("context", None)
+            if context is not None:
+                if isinstance(context, bool) or not isinstance(context, int):
+                    self.send_error_json(400, "context must be a whole number")
+                    return
+                if not (1 <= context <= MAX_CONTEXT):
+                    self.send_error_json(
+                        400, f"context must be between 1 and {MAX_CONTEXT}")
+                    return
+            self.send_json(self.session.window_for(text, context))
 
         elif path == "/api/generate":
             try:
@@ -656,7 +720,19 @@ keeps count of how much has gone.</span></div>
   </section>
 
   <aside>
-    <h2>Sampling</h2>
+    <h2>The model's window</h2>
+    <div class="field">
+      <label>Context <output id="context-out">64</output></label>
+      <div class="pair">
+        <input type="range" id="context" min="1" max="64" step="1" value="64">
+        <input type="number" id="context-n" min="1" max="64" step="1" value="64">
+      </div>
+      <div class="hint" style="font-size:11.5px">How much of the end of the text
+        above the model is given. The line in the transcript moves with it, and
+        the replies lose the thread as it shrinks.</div>
+    </div>
+
+    <h2 style="margin-top:20px">Sampling</h2>
     <div class="presets">
       <button data-preset="default">Default</button>
       <button data-preset="steady">Steady</button>
@@ -739,9 +815,25 @@ keeps count of how much has gone.</span></div>
   const doc = $("doc"), statusEl = $("status"), errEl = $("err");
   const windowEl = $("window");
   let transcript = "", live = null, controller = null, streaming = false;
-  let blockSize = 0;      // the model's window, from /api/info
+  let blockSize = 0;      // the ceiling: what this checkpoint was trained for
   let lastStats = { tokens: 0, seconds: 0, in_context: 0, block_size: 0,
-                    prompt_tokens: 0, dropped_tokens: 0, dropped_prompt_tokens: 0 };
+                    context: 0, prompt_tokens: 0, dropped_tokens: 0,
+                    dropped_prompt_tokens: 0 };
+  // Set while the window control is being dragged: what the model *would* be
+  // given. It stands in for the window-decided numbers only, and the next reply
+  // replaces it with what actually happened.
+  let previewStats = null;
+  // What the model will actually be given. The control can ask for less than
+  // the checkpoint holds and never for more, so this is the number every
+  // readout has to measure against — the ceiling is a different fact.
+  const windowSize = () => {
+    const asked = parseInt($("context").value, 10);
+    if (!asked) return blockSize;
+    return blockSize ? Math.min(asked, blockSize) : asked;
+  };
+  // The window a reply reported being given, which is not necessarily the
+  // control's current setting: the line describes the request that was made.
+  const inWindow = (s) => s.context || s.block_size;
 
   // ---------------------------------------------------------------- numbers
   // Setting .value in JS fires no events, so this cannot loop back on itself.
@@ -755,6 +847,8 @@ keeps count of how much has gone.</span></div>
   bind($("temperature"), $("temperature-n"), $("temperature-out"), f2);
   bind($("top_k"), $("top_k-n"), $("top_k-out"), (v) => String(parseInt(v, 10) || 0));
   bind($("rep"), $("rep-n"), $("rep-out"), f2);
+  bind($("context"), $("context-n"), $("context-out"),
+       (v) => String(parseInt(v, 10) || 1));
 
   const pRange = $("top_p"), pNumber = $("top_p-n"), pOut = $("top_p-out"), pOn = $("top_p-on");
   const pEnabled = () => pOn.checked;
@@ -799,27 +893,37 @@ keeps count of how much has gone.</span></div>
   // of view was worse.
   const renderWindow = (s) => {
     if (!s || !s.block_size) { windowEl.hidden = true; return; }
+    const win = inWindow(s);
     windowEl.hidden = false;
     windowEl.className = "meta window" + (s.dropped_tokens ? " warn" : "");
     const parts = s.dropped_tokens
-      ? [`context window full: the last ${s.block_size} tokens are what the model`
+      ? [`context window full: the last ${win} tokens are what the model`
          + ` reads — ${s.dropped_tokens} of ${s.in_context} written are out of view`]
-      : [`context window: ${s.in_context}/${s.block_size} tokens in view`];
+      : [`context window: ${s.in_context}/${win} tokens in view`];
+    if (win < s.block_size) {
+      parts.push(`the window is set to ${win} of the ${s.block_size} tokens`
+                 + ` this model can hold`);
+    }
     if (s.dropped_prompt_tokens) {
       parts.push(`your prompt was ${s.prompt_tokens} tokens, so the model saw`
-                 + ` only its last ${s.block_size} — the opening of what you`
+                 + ` only its last ${win} — the opening of what you`
                  + ` typed was never read`);
     }
     windowEl.textContent = parts.join(" · ");
   };
   const setStatus = () => {
     if (streaming) return;
-    const s = lastStats;
+    // A preview wins over the last reply for everything the window decides.
+    // Tokens and seconds stay the reply's: those are facts about a generation
+    // that happened, not about a setting.
+    const s = previewStats ? Object.assign({}, lastStats, previewStats)
+                           : lastStats;
     renderWindow(s);
     if (!s.tokens) { statusEl.textContent = "idle"; return; }
+    const win = inWindow(s);
     const window_ = s.dropped_tokens
-      ? `${s.block_size} in view · ${s.dropped_tokens} out`
-      : `${s.in_context}/${s.block_size} in view`;
+      ? `${win} in view · ${s.dropped_tokens} out`
+      : `${s.in_context}/${win} in view`;
     statusEl.textContent = `${s.tokens} tokens · `
       + `${(s.tokens / Math.max(s.seconds, 1e-9)).toFixed(0)} tok/s · ${window_}`;
   };
@@ -879,6 +983,47 @@ keeps count of how much has gone.</span></div>
       child.classList.toggle("unread", above);
     }
   };
+  // Dragging the control should move the line at once rather than making you
+  // generate a reply to find out what you just asked for. The server answers
+  // where the window would fall for the text on screen at that size, so the line
+  // and the counts under the title describe what the *next* Continue will give
+  // the model — which is exactly the choice being made.
+  let previewTimer = null;
+  const previewWindow = async () => {
+    if (streaming || !transcript) return;
+    const text = transcript, asked = windowSize();
+    try {
+      const response = await fetch("/api/window", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, context: asked }),
+      });
+      const info = await response.json();
+      if (info.error) return;
+      if (streaming || transcript !== text) return;   // it moved on while we asked
+      drawCut(info.dropped_tokens && info.boundary_chars !== null
+        ? { offset: info.boundary_chars, dropped: info.dropped_tokens,
+            block: info.context }
+        : null);
+      // Everything the window decides now reads from the preview. The note about
+      // a prompt that overflowed belongs to the last reply and cannot be known
+      // for a window that has not generated anything yet, so it is not restated.
+      previewStats = { in_context: info.tokens, block_size: info.block_size,
+                       context: info.context,
+                       dropped_tokens: info.dropped_tokens,
+                       prompt_tokens: 0, dropped_prompt_tokens: 0 };
+      setStatus();
+    } catch (exc) {
+      // A preview is a nicety: the next completed reply reports the truth, and
+      // a preview that failed is not a reason to interrupt with an error.
+    }
+  };
+  const schedulePreview = () => {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(previewWindow, 120);
+  };
+  for (const el of [$("context"), $("context-n")]) {
+    el.addEventListener("input", schedulePreview);
+  }
 
   function append(kind, text) {
     const span = document.createElement("span");
@@ -896,6 +1041,7 @@ keeps count of how much has gone.</span></div>
     repetition_penalty: parseFloat($("rep").value),
     penalty_window: parseInt($("penalty_window").value, 10) || 64,
     max_new_tokens: parseInt($("max_new_tokens").value, 10) || 160,
+    context: windowSize(),
     stop: $("stop").value || null,
     seed: $("seed").value.trim() === "" ? null : parseInt($("seed").value, 10),
   });
@@ -917,6 +1063,7 @@ keeps count of how much has gone.</span></div>
     append("said", line + "\\n");
     live = append("reply live", "");
     transcript = prompt;
+    previewStats = null;          // the request about to be made is the truth now
     // The line described the transcript as it stood before this line was added,
     // so it goes now and comes back once the reply has moved the window again.
     cutOut();
@@ -974,14 +1121,16 @@ keeps count of how much has gone.</span></div>
               prompt_tokens: event.prompt_tokens,
               dropped_tokens: event.dropped_tokens,
               dropped_prompt_tokens: event.dropped_prompt_tokens,
+              context: event.context,
             };
             // Where the window begins, if the server could place it: null means
             // it could not, and then nothing is drawn.
             cut = event.dropped_tokens && event.boundary_chars !== null
                   && event.boundary_chars !== undefined
               ? { offset: event.boundary_chars, dropped: event.dropped_tokens,
-                  block: event.block_size }
+                  block: event.context }
               : null;
+            previewStats = null;   // what happened, not what was previewed
           } else if (event.t === "error") {
             throw new Error(event.message);
           }
@@ -1020,6 +1169,7 @@ keeps count of how much has gone.</span></div>
   });
   $("reset").addEventListener("click", () => {
     transcript = "";
+    previewStats = null;
     doc.innerHTML = '<span class="hint">cleared.</span>';
     statusEl.textContent = "idle";
     clearFail();
@@ -1055,12 +1205,15 @@ keeps count of how much has gone.</span></div>
       if (info.error) throw new Error(info.error);
       // The same encode the model does, so these chips line up with its window:
       // everything before the first `out` chips is no longer attended to.
-      const out = blockSize ? Math.max(0, info.count - blockSize) : 0;
+      // The window the control is set to, not the model's ceiling: the chips
+      // have to agree with the line in the transcript beside them.
+      const win = windowSize();
+      const out = win ? Math.max(0, info.count - win) : 0;
       box.innerHTML = `<div class="meta" style="margin-bottom:8px">${info.count} tokens
         for ${info.chars} characters — ${(info.chars / Math.max(info.count, 1)).toFixed(2)}
         characters each</div>`
         + (out ? `<div class="meta" style="margin:-4px 0 8px">the model no
-          longer sees the first ${out} of these — only the last ${blockSize} tokens
+          longer sees the first ${out} of these — only the last ${win} tokens
           are in its window</div>` : "");
       info.tokens.forEach((t, i) => {
         const el = chip(t.id, t.text);
@@ -1075,6 +1228,13 @@ keeps count of how much has gone.</span></div>
   fetch("/api/info").then((r) => r.json()).then((info) => {
     if (info.error) throw new Error(info.error);
     blockSize = info.block_size;
+    // The window starts at what the checkpoint was trained for; the control
+    // only ever shortens it.
+    for (const el of [$("context"), $("context-n")]) {
+      el.max = String(blockSize);
+      el.value = String(blockSize);
+    }
+    $("context-out").textContent = String(blockSize);
     $("meta").textContent =
       `${info.checkpoint} · ${info.tokenizer} vocab ${info.vocab_size} · `
       + `${info.num_params.toLocaleString()} params · ${info.block_size}-token context`;

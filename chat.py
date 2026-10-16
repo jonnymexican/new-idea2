@@ -12,10 +12,16 @@ and it is what makes the prompt box the most interesting way to look at one.
     .venv/bin/python chat.py                          # the BPE model by default
     .venv/bin/python chat.py --checkpoint runs_v3/model.pt
     .venv/bin/python chat.py --prompt "KING HENRY:" --max-new-tokens 200
+    .venv/bin/python chat.py --context 24        # a deliberately smaller window
     echo "To be or not" | .venv/bin/python chat.py
 
 In the prompt, an empty line generates from a fresh start, and anything else is
 appended to the running context and continued. /help lists the controls.
+
+`--context` (or `/window` at the prompt) sets how much of the end of the text
+the model is given. It cannot exceed the checkpoint's `block_size`, which is what
+the positional embeddings were trained for; below that, it is a handicap you can
+choose, and a useful one — the model keeps writing, but with less to go on.
 """
 
 import argparse
@@ -66,10 +72,32 @@ def load_model(path):
     return model, tokenizer, ckpt
 
 
-def stream_reply(model, tokenizer, ids, args, out):
-    """Generate a continuation of `ids`, printing it as it arrives."""
-    block = model.block_size
-    idx = torch.tensor(ids[-block:], dtype=torch.long)[None, ...]
+def context_window(model, requested=None):
+    """How many tokens of the running text the model is actually given.
+
+    `block_size` is a ceiling, not a requirement: the positional embeddings and
+    the attention mask were trained for at most that many tokens, so asking for
+    more is not a thing the model can do, and asking for fewer is a trade the
+    caller is entitled to make. Everything downstream measures against this
+    number rather than against the model's maximum.
+    """
+    if requested is None:
+        return model.block_size
+    if requested < 1:
+        raise ValueError("the context window must be at least one token")
+    return min(int(requested), model.block_size)
+
+
+def stream_reply(model, tokenizer, ids, args, out, context=None):
+    """Generate a continuation of `ids`, printing it as it arrives.
+
+    `context` is how much of the *end* of `ids` the model gets to see. It
+    defaults to the model's own `block_size`; passing less is how the window is
+    shortened deliberately, and it is the reason the crop below is not written
+    as `-block` any more.
+    """
+    window = context_window(model, context)
+    idx = torch.tensor(ids[-window:], dtype=torch.long)[None, ...]
     base = tokenizer.decode(idx[0].tolist())
     started = time.time()
 
@@ -87,7 +115,7 @@ def stream_reply(model, tokenizer, ids, args, out):
     steps, shown, text = 0, 0, ""
     with torch.no_grad():
         for _ in range(args.max_new_tokens):
-            logits, _ = model(idx[:, -block:])
+            logits, _ = model(idx[:, -window:])
             nxt = sample_next(penalise(logits[:, -1, :].clone()),
                               args.temperature, args.top_k, args.top_p)
             idx = torch.cat((idx, nxt), dim=1)
@@ -129,6 +157,9 @@ commands
   /k <int>           top-k cutoff (/k 0 disables it)
   /p <float>         nucleus sampling cutoff
   /len <int>         tokens to generate per reply
+  /window <int>      how many tokens of the text above the model is given
+                     (its block_size is the ceiling) — lower it and watch the
+                     model lose the thread
   /penalty <float>   repetition penalty (1.0 disables it)
   /seed <int>        reseed the sampler
   /save <file>       write the transcript so far
@@ -143,6 +174,10 @@ def repl(model, tokenizer, args):
     print(f"tokenizer  : {tokenizer.name}, vocab {tokenizer.vocab_size}")
     print(f"model      : {model.num_params():,} params, "
           f"{model.block_size}-token context")
+    if args.context is not None:
+        window = context_window(model, args.context)
+        print(f"window     : the model is given the last {window} tokens"
+              + (" (its own block_size)" if window == model.block_size else ""))
     print("note       : base model — it continues text, it does not answer questions")
     print("Type /help for commands; a blank line generates from a fresh start.\n")
 
@@ -168,10 +203,22 @@ def repl(model, tokenizer, args):
             elif command == "/reset":
                 context = ""
                 print("(context cleared)")
+            elif command in ("/window", "/w"):
+                try:
+                    args.context = context_window(model, int(rest))
+                except ValueError as exc:
+                    print(f"({exc})")
+                else:
+                    print(f"(the model will be given the last {args.context} "
+                          f"tokens; its block_size is {model.block_size})")
             elif command == "/context":
                 ids = tokenizer.encode(context)
                 shown = context[-200:].replace("\n", "\\n")
-                print(f"  {len(ids)}/{model.block_size} tokens: {shown!r}")
+                window = context_window(model, args.context)
+                hidden = max(0, len(ids) - window)
+                print(f"  {len(ids)}/{window} tokens in the window"
+                      + (f" ({hidden} above it the model cannot read)"
+                         if hidden else "") + f": {shown!r}")
             elif command == "/tokens":
                 show_tokens(tokenizer, rest or context, sys.stdout)
             elif command in ("/temp", "/temperature"):
@@ -210,7 +257,8 @@ def repl(model, tokenizer, args):
 
         try:
             reply, _, seconds = stream_reply(
-                model, tokenizer, tokenizer.encode(prompt_text), args, sys.stdout
+                model, tokenizer, tokenizer.encode(prompt_text), args, sys.stdout,
+                context=args.context,
             )
         except KeyboardInterrupt:
             print("\n(stopped)")
@@ -220,7 +268,8 @@ def repl(model, tokenizer, args):
         context = prompt_text + reply
         transcript += [line + "\n", reply]
 
-        status = (f"[{len(tokenizer.encode(context))}/{model.block_size} in context"
+        window = context_window(model, args.context)
+        status = (f"[{len(tokenizer.encode(context))}/{window} in context"
                   f" · temp {args.temperature}"
                   f" · {args.max_new_tokens} max new")
         if args.stats:
@@ -246,6 +295,10 @@ def main():
     ap.add_argument("--repetition-penalty", type=float, default=1.0,
                     help=">1 discourages repeating recent tokens (1.0 disables)")
     ap.add_argument("--penalty-window", type=int, default=64)
+    ap.add_argument("--context", type=int, default=None,
+                    help="tokens of the text above that the model is given; "
+                         "defaults to the checkpoint's block_size, and a "
+                         "smaller number is a deliberate handicap")
     ap.add_argument("--stop", default=None,
                     help="stop generating when this string appears")
     ap.add_argument("--seed", type=int, default=None)
@@ -260,7 +313,8 @@ def main():
 
     if args.prompt is not None:
         _, steps, seconds = stream_reply(
-            model, tokenizer, tokenizer.encode(args.prompt), args, sys.stdout
+            model, tokenizer, tokenizer.encode(args.prompt), args, sys.stdout,
+            context=args.context,
         )
         print()
         if args.stats:
@@ -272,7 +326,8 @@ def main():
         # Piped input with no --prompt: complete it and exit.
         text = sys.stdin.read()
         _, steps, seconds = stream_reply(
-            model, tokenizer, tokenizer.encode(text), args, sys.stdout
+            model, tokenizer, tokenizer.encode(text), args, sys.stdout,
+            context=args.context,
         )
         print()
         if args.stats:
