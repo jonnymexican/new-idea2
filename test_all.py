@@ -15,6 +15,10 @@ before or that the numbers in the README would become wrong without:
 - resuming writes no duplicate point at the seam step
 - the web server streams NDJSON chunks over chunked encoding, rejects bad
   settings with a reason, and stops sampling when the client walks away
+- the page's token view cannot be squeezed out of its own height: the layout
+  contract that keeps it visible is resolved from the stylesheet the server
+  actually sends, and the check is shown to catch the layout that once
+  collapsed it
 
 Standard library only, on purpose: this project has one dependency (torch) and
 the tests should not add a second.
@@ -24,10 +28,12 @@ the tests should not add a second.
     .venv/bin/python test_all.py TestWebServer # just the server
 """
 
+import html.parser
 import http.client
 import json
 import math
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -55,6 +61,229 @@ def read_corpus(limit=None):
     with open(os.path.join(HERE, CORPUS), "r", encoding="utf-8") as f:
         text = f.read()
     return text[:limit] if limit else text
+
+
+# ------------------------------------------------------------------- layout
+# The page's geometry, read out of the page itself.
+#
+# The token view exists to answer "what does the model actually read", and it
+# once collapsed to 12px — every chip present, none of them visible — because a
+# shrinkable flex item yields its space to whatever above it is taller. That is
+# a layout bug, and the suite is standard library only, so rather than growing a
+# browser dependency these helpers resolve the declarations the served page
+# really carries.
+#
+# What follows can prove the *contract* the layout rests on ("this panel cannot
+# shrink, and the pane above it is the one that gives space up"). What it cannot
+# do is measure a box; where a number depends on font metrics or on an
+# element's content, it is not guessed at here. A pixel measurement stays a
+# browser check.
+
+
+VOID_ELEMENTS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+}
+
+# At-rules that declare no box of their own, so there is nothing for a layout
+# check to read inside them. Anything else raises rather than being skipped: a
+# rule the resolver cannot see is a rule that escapes the checks below, and
+# quietly passing is the failure mode worth avoiding.
+IGNORED_AT_RULES = ("@keyframes",)
+
+
+class ElementPaths(html.parser.HTMLParser):
+    """Where each identified element sits in the document.
+
+    Flex factors only mean anything between siblings: whether the transcript
+    pane and the token view really do share one flex column is a question about
+    the tree, not about the stylesheet.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.paths = {}          # id -> tuple of (tag, id, classes) from the root
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        node = (tag, attrs.get("id"), tuple((attrs.get("class") or "").split()))
+        if tag in VOID_ELEMENTS:
+            return
+        self.stack.append(node)
+        if node[1]:
+            self.paths[node[1]] = tuple(self.stack)
+
+    def handle_endtag(self, tag):
+        if tag not in VOID_ELEMENTS and self.stack:
+            self.stack.pop()
+
+
+def element_paths(html):
+    parser = ElementPaths()
+    parser.feed(html)
+    return parser.paths
+
+
+def page_stylesheet(html):
+    """The contents of the page's inline <style> block."""
+    start = html.index("<style>") + len("<style>")
+    end = html.index("</style>", start)
+    return html[start:end]
+
+
+def strip_comments(css):
+    """CSS with its comments removed, so a comment cannot read as a rule."""
+    out, i = [], 0
+    while i < len(css):
+        if css.startswith("/*", i):
+            i = css.index("*/", i) + 2
+        else:
+            out.append(css[i])
+            i += 1
+    return "".join(out)
+
+
+def brace_blocks(text):
+    """Split one stylesheet level into (prelude, body) pairs."""
+    pairs, depth, prelude, body = [], 0, "", ""
+    for ch in text:
+        if ch == "{" and depth == 0:
+            depth, body = 1, ""
+        elif ch == "{":
+            depth += 1
+            body += ch
+        elif ch == "}" and depth == 1:
+            depth = 0
+            pairs.append((prelude, body))
+            prelude = ""
+        elif ch == "}":
+            depth -= 1
+            body += ch
+        elif depth:
+            body += ch
+        else:
+            prelude += ch
+    return pairs
+
+
+def stylesheet_rules(html):
+    """(media, selector, declarations) for every rule, in source order.
+
+    `declarations` is an ordered list of (property, value) pairs, because the
+    cascade settles `flex: 0 0 auto` against a later `flex-shrink` by source
+    order rather than by name. `media` is the condition a rule sits inside, or
+    None at the top level.
+    """
+    rules = []
+
+    def parse(text, media):
+        for prelude, body in brace_blocks(text):
+            prelude = prelude.strip()
+            if prelude.startswith("@"):
+                if prelude.startswith("@media"):
+                    parse(body, prelude[len("@media"):].strip())
+                elif not prelude.startswith(IGNORED_AT_RULES):
+                    raise ValueError(f"unsupported at-rule in the page: {prelude}")
+                continue
+            declarations = []
+            for chunk in body.split(";"):
+                if not chunk.strip():
+                    continue
+                prop, _, value = chunk.partition(":")
+                declarations.append((prop.strip().lower(), value.strip()))
+            for selector in prelude.split(","):
+                rules.append((media, selector.strip(), declarations))
+
+    parse(strip_comments(page_stylesheet(html)), None)
+    return rules
+
+
+def media_matches(condition, width):
+    """Would a media block apply at viewport width `width`?
+
+    Only the features this page uses are understood, and anything else raises:
+    a condition that silently evaluated to False would hide rules from the
+    layout checks instead of failing them.
+    """
+    if condition is None:
+        return True
+    matched = True
+    for part in condition.split(" and "):
+        prop, _, raw = part.strip().strip("()").partition(":")
+        prop, raw = prop.strip().lower(), raw.strip()
+        if prop not in ("max-width", "min-width"):
+            raise ValueError(f"unsupported media feature: {prop}")
+        bound = length_px(raw)
+        matched = matched and (width <= bound if prop == "max-width"
+                               else width >= bound)
+    return matched
+
+
+def declarations_for(rules, selector, width):
+    """The declarations `selector` ends up with at viewport width `width`,
+    in cascade order (later rules win, so the order is the resolution)."""
+    out = []
+    for media, sel, declarations in rules:
+        if sel == selector and media_matches(media, width):
+            out.extend(declarations)
+    return out
+
+
+def length_px(value, viewport_height=None):
+    """A CSS length in pixels.
+
+    `vh` needs a viewport height to mean anything; a length whose pixel size
+    depends on a font or on a percentage raises, because guessing it would turn
+    a layout check into a check of the guess.
+    """
+    match = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*(px|vh)", value.strip().lower())
+    if not match:
+        raise ValueError(f"this is not a length the checks can resolve: {value!r}")
+    amount, unit = float(match.group(1)), match.group(2)
+    if unit == "vh":
+        if viewport_height is None:
+            raise ValueError("a vh length needs a viewport height")
+        return amount / 100.0 * viewport_height
+    return amount
+
+
+def expand_flex(value):
+    """The `flex` shorthand as its three longhands (grow, shrink, basis)."""
+    if value == "none":
+        return 0.0, 0.0, "auto"
+    if value == "initial":
+        return 0.0, 1.0, "auto"
+    if value == "auto":
+        return 1.0, 1.0, "auto"
+    parts = value.split()
+    if len(parts) != 3:
+        # Every `flex` on this page is written in the three-value form. A
+        # shorthand whose defaults differ per form is not worth resolving by
+        # guesswork: write it out and let the checks read it.
+        raise ValueError(f"write flex in its three-value form: {value!r}")
+    return float(parts[0]), float(parts[1]), parts[2]
+
+
+def flex_factors(declarations):
+    """(grow, shrink, basis) as the cascade resolves them for one element.
+
+    The initial values are the whole point of this helper: an element with no
+    `flex` declaration at all is `0 1 auto`, and that default shrink of 1 is
+    what let a tall pane above the token view collapse it.
+    """
+    grow, shrink, basis = 0.0, 1.0, "auto"
+    for prop, value in declarations:
+        value = value.strip().lower()
+        if prop == "flex":
+            grow, shrink, basis = expand_flex(value)
+        elif prop == "flex-grow":
+            grow = float(value)
+        elif prop == "flex-shrink":
+            shrink = float(value)
+        elif prop == "flex-basis":
+            basis = value
+    return grow, shrink, basis
 
 
 class TestBPE(unittest.TestCase):
@@ -454,6 +683,12 @@ class TestWebServer(CheckpointFixture):
         self.assertNotIn("http://cdn", body)
         self.assertNotIn("https://cdn", body)
 
+    def test_the_served_page_is_the_document_the_layout_checks_read(self):
+        """TestPageLayout resolves the stylesheet of `serve.PAGE`; this is what
+        makes that the page a browser is actually given."""
+        _, body, _ = self.get("/")
+        self.assertEqual(body, serve.PAGE)
+
     def test_info_describes_the_loaded_checkpoint(self):
         status, body, _ = self.get("/api/info")
         self.assertEqual(status, 200)
@@ -679,6 +914,134 @@ class TestWebServer(CheckpointFixture):
         params = serve.validate({"prompt": "hi", "top_p": 0, "stop": ""})
         self.assertIsNone(params["top_p"])
         self.assertIsNone(params["stop"])
+
+
+class TestPageLayout(unittest.TestCase):
+    """serve.py: the page's geometry, resolved without a browser.
+
+    The token view is the answer to "what does the model actually read", and it
+    was once invisible: as a shrinkable flex item it gave its height up to the
+    transcript pane above it and collapsed to 12px, with all 350 chips in the
+    DOM and 12px of them on screen. Nothing in the suite noticed, because a
+    passing HTTP test says nothing about a box.
+
+    So this reads the stylesheet the server sends and resolves it: who shrinks,
+    who caps, who yields. It is deliberately a contract rather than a
+    measurement — a browser would measure, and the suite has no browser — and
+    the one test that matters most is the one that removes the current
+    declaration and shows the check would have caught the old layout.
+    """
+
+    WIDE = 1200      # two columns
+    NARROW = 800     # stacked, where the page scrolls instead of squeezing
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = serve.PAGE
+        cls.rules = stylesheet_rules(cls.html)
+        cls.paths = element_paths(cls.html)
+
+    def declarations(self, selector, width):
+        return declarations_for(self.rules, selector, width)
+
+    def props(self, selector, width):
+        return dict(self.declarations(selector, width))
+
+    # ------------------------------------------------------- the parse itself
+    def test_the_stylesheet_was_actually_parsed(self):
+        """Guard the guard: a resolver that returned nothing would make the
+        tests below fail loudly, but a resolver that dropped one rule would not."""
+        selectors = {sel for _, sel, _ in self.rules}
+        for needed in ("body", "main", ".doc-scroll", ".tokens", "aside"):
+            self.assertIn(needed, selectors)
+        self.assertGreater(len(self.rules), 20)
+
+    def test_every_media_query_is_understood(self):
+        """A condition the resolver cannot evaluate would hide rules from these
+        checks rather than fail them, so an unknown one has to be an error."""
+        conditions = {media for media, _, _ in self.rules if media}
+        self.assertTrue(conditions, "no media queries were parsed at all")
+        for condition in conditions:
+            for width in (self.WIDE, self.NARROW):
+                media_matches(condition, width)
+
+    def test_the_rules_this_file_asserts_on_really_switch_at_the_breakpoint(self):
+        """Otherwise the two viewports below would be the same viewport, and the
+        stacked-layout test would be asserting nothing about a stacked layout."""
+        self.assertNotEqual(self.props("main", self.WIDE),
+                            self.props("main", self.NARROW))
+
+    # ------------------------------------------------- the token view's height
+    def test_the_token_view_cannot_be_shrunk(self):
+        """`flex-shrink: 0` is the whole defence, and it is not the initial
+        value: it is what turns "squeezed by a taller sibling" into "keeps its
+        height, and the sibling scrolls instead"."""
+        grow, shrink, _ = flex_factors(self.declarations(".tokens", self.WIDE))
+        self.assertEqual(shrink, 0.0, "the token view can be squeezed again")
+        self.assertEqual(grow, 0.0, "the token view should not grow either")
+
+    def test_the_check_catches_the_layout_that_squeezed_it(self):
+        """The check above is only worth having if it would have failed before
+        the fix. The old rule carried no `flex` declaration at all, so it
+        resolved to the initial `0 1 auto` — shrink 1 — which is the bug."""
+        without_flex = [
+            (media, sel, [d for d in decls if d[0] != "flex"])
+            for media, sel, decls in self.rules
+        ]
+        _, shrink, _ = flex_factors(declarations_for(without_flex, ".tokens", self.WIDE))
+        self.assertEqual(shrink, 1.0)
+        self.assertNotEqual(shrink, 0.0, "this check would pass a shrinkable panel")
+
+    def test_the_token_view_keeps_room_for_chips(self):
+        """Unshrinkable is not the same as usable: a cap of its own could still
+        starve the panel, so the cap has to leave room for a few rows and the
+        rest has to be reachable by scrolling."""
+        props = self.props(".tokens", self.WIDE)
+        self.assertGreaterEqual(length_px(props["max-height"], 600), 120.0)
+        self.assertEqual(props.get("overflow-y"), "auto")
+
+    # ------------------------------------------------------ who yields instead
+    def test_the_token_view_shares_a_flex_column_with_the_pane_above_it(self):
+        """A flex factor only means something between siblings. If the token
+        view moved out of `section.doc`, the tests above would keep passing
+        while the panel went back to living inside a different box."""
+        section = self.paths["tokens"][-2]
+        self.assertEqual(section[0], "section")
+        self.assertIn("doc", section[2])
+        self.assertEqual(self.paths["doc"][-2], section,
+                         "the transcript pane is no longer a sibling")
+        props = self.props("section.doc", self.WIDE)
+        self.assertEqual(props.get("display"), "flex")
+        self.assertEqual(props.get("flex-direction"), "column")
+
+    def test_the_pane_above_is_the_one_that_gives_up_space(self):
+        """Someone has to give: with the token view fixed, the transcript pane
+        must be the item that shrinks, and it must scroll its own content rather
+        than pushing the panel off the bottom of the column."""
+        declarations = self.declarations(".doc-scroll", self.WIDE)
+        grow, shrink, _ = flex_factors(declarations)
+        self.assertGreaterEqual(grow, 1.0)
+        self.assertEqual(shrink, 1.0, "nothing would absorb the shortfall")
+        props = dict(declarations)
+        self.assertEqual(props.get("overflow-y"), "auto")
+        self.assertGreaterEqual(length_px(props["min-height"], 600), 100.0)
+
+    # -------------------------------------------------------- stacked layout
+    def test_stacked_layout_grows_instead_of_squeezing(self):
+        """Below the breakpoint there is no second column to move work into, so
+        the page itself has to scroll: rows sized to their content, a fixed
+        share of the viewport for the transcript, and the panel still unable to
+        be shrunk by either."""
+        main = self.props("main", self.NARROW)
+        self.assertEqual(main.get("grid-template-columns"), "1fr")
+        self.assertEqual(main.get("align-content"), "start")
+        self.assertEqual(self.props("body", self.NARROW).get("overflow"), "auto")
+        _, pane_shrink, pane_basis = flex_factors(
+            self.declarations(".doc-scroll", self.NARROW))
+        self.assertEqual(pane_shrink, 0.0, "the transcript pane must keep its share")
+        self.assertIn("vh", pane_basis)
+        _, panel_shrink, _ = flex_factors(self.declarations(".tokens", self.NARROW))
+        self.assertEqual(panel_shrink, 0.0)
 
 
 class TestAbandonedStream(unittest.TestCase):

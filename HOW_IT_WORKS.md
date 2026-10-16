@@ -212,6 +212,20 @@ says so in words, and the token view dims the chips the model can no longer
 attend to — so the window is a visible property of the transcript rather than a
 number you have to interpret.
 
+That token view also has to survive being on screen. It once did not: as a flex
+item that was allowed to shrink, it gave its height up to the transcript pane
+above it and collapsed to about twelve pixels, with hundreds of chips still in
+the DOM and none of them visible. `flex: 0 0 auto` is the fix — the panel keeps
+its height and the pane above gives up its own instead — and because no HTTP test
+can see a box, `test_all.py` resolves the served stylesheet and asserts the
+contract: who shrinks, who caps, and that the panel and the pane above it really
+are items of the same flex column. One of those tests removes the declaration
+and shows the check would have caught the old layout. The breakpoint block lives
+at the end of the stylesheet for a related reason: a `@media` rule that appears
+before the rule it means to override loses to it at equal specificity, which is
+what once kept the stacked layout's transcript pane from ever getting the height
+it asked for.
+
 [`chat.py`](chat.py) is this same loop with a prompt in front of it: the knobs
 above are commands, the running text is kept as context, and each sampled token
 is written as it arrives so you can watch a sentence form.

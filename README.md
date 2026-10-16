@@ -326,6 +326,10 @@ and would quietly invalidate the results if it broke again:
 - the window arithmetic the page reports is exact: a prompt of exactly
   `block_size` tokens drops nothing and one token more drops one, with the counts
   cross-checked against an independent `/api/tokens` encode
+- the token view cannot be squeezed out of its own height: the layout contract
+  that keeps it visible is resolved from the stylesheet the server actually
+  sends — who shrinks, who caps, who yields — and the check is shown to fail on
+  the layout that once collapsed the panel to about twelve pixels
 
 ## Fetching the corpus again
 

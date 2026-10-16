@@ -474,14 +474,6 @@ PAGE = """<!doctype html>
     flex: 1 1 auto; min-height: 0; display: grid;
     grid-template-columns: minmax(0, 1fr) 322px; gap: 0;
   }
-  @media (max-width: 900px) {
-    /* Stacked: let the whole page scroll rather than squeezing two panes. The
-       rows are sized to their content instead of being stretched to fit, or
-       the token view is squeezed to nothing by the transcript above it. */
-    body { overflow: auto; }
-    main { grid-template-columns: 1fr; align-content: start; }
-    .doc-scroll { flex: 0 0 38vh; }
-  }
   section.doc {
     padding: 16px 22px 18px; min-width: 0; min-height: 0;
     display: flex; flex-direction: column;
@@ -520,7 +512,6 @@ PAGE = """<!doctype html>
     border-left: 1px solid var(--line); padding: 16px 18px 26px;
     background: var(--panel); min-height: 0; overflow-y: auto;
   }
-  @media (max-width: 900px) { aside { border-left: 0; border-top: 1px solid var(--line); } }
   aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .9px;
              color: var(--dim); margin: 0 0 12px; font-weight: 600; }
   .field { margin-bottom: 13px; }
@@ -557,6 +548,19 @@ PAGE = """<!doctype html>
   .tokens .chip.dropped { opacity: .4; border-style: dashed; }
   code { background: #202634; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
   .err { color: var(--danger); font-size: 12.5px; margin-top: 8px; }
+  /* Breakpoints go last, and it matters: a media block that appears before the
+     rule it means to override loses to it, since both have the same specificity
+     and the later declaration wins. This block used to sit above `.doc-scroll`,
+     so the stacked 38vh transcript pane it asks for never once applied. */
+  @media (max-width: 900px) {
+    /* Stacked: let the whole page scroll rather than squeezing two panes. The
+       rows are sized to their content instead of being stretched to fit, or
+       the token view is squeezed to nothing by the transcript above it. */
+    body { overflow: auto; }
+    main { grid-template-columns: 1fr; align-content: start; }
+    .doc-scroll { flex: 0 0 38vh; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
 </style>
 </head>
 <body>
