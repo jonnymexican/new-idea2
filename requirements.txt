@@ -1,0 +1,7 @@
+# CPU-only build of PyTorch: this machine has no CUDA device, and the training
+# run is small enough that CPU inference is comfortably fast.
+#
+# Install with:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+torch>=2.14

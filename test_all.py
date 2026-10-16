@@ -1,0 +1,925 @@
+#!/usr/bin/env python3
+"""
+The repo's test suite: the invariants this project actually depends on.
+
+These are not smoke tests. Each one pins a property that has either broken
+before or that the numbers in the README would become wrong without:
+
+- a BPE round-trip is lossless, deterministic, and leaves no merge unapplied
+- a checkpoint's tokenizer rebuilds the exact vocabulary the weights were
+  trained against, including checkpoints written before tokenizers were pluggable
+- `sample_next` behaves as documented (top-k, top-p, temperature, top_k <= 0)
+  and `generate` is exactly the loop around it
+- the bigram floor is measured on the same validation split as the model, so the
+  two can honestly be plotted on one axis
+- resuming writes no duplicate point at the seam step
+- the web server streams NDJSON chunks over chunked encoding, rejects bad
+  settings with a reason, and stops sampling when the client walks away
+
+Standard library only, on purpose: this project has one dependency (torch) and
+the tests should not add a second.
+
+    .venv/bin/python test_all.py               # everything
+    .venv/bin/python test_all.py TestBPE       # one class
+    .venv/bin/python test_all.py TestWebServer # just the server
+"""
+
+import http.client
+import json
+import math
+import os
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from bpe import BYTE_VOCAB, BPETokenizer
+from bpe import train as train_bpe
+import chat
+import serve
+from model import GPT, sample_next
+from train import CharTokenizer, tokenizer_from_state
+
+CORPUS = "data/input.txt"
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def read_corpus(limit=None):
+    with open(os.path.join(HERE, CORPUS), "r", encoding="utf-8") as f:
+        text = f.read()
+    return text[:limit] if limit else text
+
+
+class TestBPE(unittest.TestCase):
+    """Byte-level BPE: the properties the tokenizer work rests on."""
+
+    VOCAB = 384          # 128 merges over the 256 bytes
+    SLICE = 30_000       # enough repetition to learn real merges, and fast
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = read_corpus(cls.SLICE)
+        cls.merges = train_bpe(cls.text, cls.VOCAB)
+        cls.tok = BPETokenizer(cls.merges)
+
+    def test_round_trip_is_lossless(self):
+        """Every corpus byte survives encode then decode."""
+        self.assertEqual(self.tok.decode(self.tok.encode(self.text)), self.text)
+
+    def test_round_trip_survives_non_ascii(self):
+        """Bytes, not characters, are the unit — so non-ASCII must round-trip."""
+        for sample in ("héllo wörld", "世界 and back", "emoji 🙂 inside",
+                       "mixed — dashes… and 'quotes'", ""):
+            with self.subTest(sample=sample):
+                self.assertEqual(
+                    self.tok.decode(self.tok.encode(sample)), sample
+                )
+
+    def test_vocab_size_is_exactly_what_was_asked_for(self):
+        self.assertEqual(self.tok.vocab_size, self.VOCAB)
+        self.assertEqual(len(self.merges), self.VOCAB - BYTE_VOCAB)
+
+    def test_vocab_size_at_or_below_bytes_is_rejected(self):
+        for size in (0, 100, BYTE_VOCAB):
+            with self.subTest(size=size):
+                with self.assertRaises(ValueError):
+                    train_bpe(self.text, size)
+
+    def test_training_is_deterministic(self):
+        """Same corpus, same vocabulary — no reliance on dict/set ordering."""
+        self.assertEqual(train_bpe(self.text, 300), train_bpe(self.text, 300))
+
+    def test_encoding_leaves_no_mergeable_pair(self):
+        """The greedy encoder must not stop with a known pair still adjacent."""
+        for sample in (self.text[:500], "the king shall speak", "thou art here"):
+            with self.subTest(sample=sample[:30]):
+                ids = self.tok.encode(sample)
+                for a, b in zip(ids, ids[1:]):
+                    self.assertNotIn(
+                        (a, b), self.tok.ranks,
+                        f"pair {(a, b)} was mergeable but left in place",
+                    )
+
+    def test_tokens_expand_to_the_bytes_they_stand_for(self):
+        """A merged id decodes to exactly the concatenation of its two halves."""
+        for i in range(BYTE_VOCAB, self.tok.vocab_size):
+            a, b = self.tok.merges[i - BYTE_VOCAB]
+            with self.subTest(token=i):
+                self.assertEqual(
+                    self.tok.decode([i]),
+                    self.tok.decode([a]) + self.tok.decode([b]),
+                )
+
+    def test_longest_tokens_are_whole_words(self):
+        """If this fails, the pretokeniser or the merge loop is broken."""
+        longest = sorted(
+            (self.tok.decode([i]) for i in range(BYTE_VOCAB, self.tok.vocab_size)),
+            key=len,
+        )
+        self.assertGreaterEqual(len(longest[-1]), 5)
+        self.assertIn(longest[-1], self.text)
+
+    def test_compression_beats_one_token_per_character(self):
+        ratio = len(self.text) / len(self.tok.encode(self.text))
+        self.assertGreater(ratio, 1.5,
+                           f"only {ratio:.2f} characters per token")
+
+    def test_save_and_load_reproduce_the_tokenizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "tokenizer.json")
+            self.tok.save(path)
+            reloaded = BPETokenizer.load(path)
+            self.assertEqual(reloaded.merges, self.tok.merges)
+            self.assertEqual(reloaded.encode(self.text), self.tok.encode(self.text))
+
+    def test_state_rebuilds_through_tokenizer_from_state(self):
+        """This is the path a checkpoint takes; it must be lossless."""
+        rebuilt = tokenizer_from_state(self.tok.state())
+        self.assertEqual(rebuilt.name, "bpe")
+        self.assertEqual(rebuilt.vocab_size, self.tok.vocab_size)
+        self.assertEqual(rebuilt.encode(self.text), self.tok.encode(self.text))
+
+    def test_show_agrees_with_encode(self):
+        """`/tokens` in chat.py is built on this, so it must match exactly."""
+        for sample in ("the king", "GLOUCESTER: I am here", ""):
+            with self.subTest(sample=sample):
+                pieces = self.tok.show(sample)
+                self.assertEqual([i for i, _ in pieces], self.tok.encode(sample))
+                self.assertEqual("".join(p for _, p in pieces), sample)
+
+
+class TestCharTokenizerState(unittest.TestCase):
+    """The character tokenizer and the legacy checkpoint format."""
+
+    def test_round_trip_and_state(self):
+        tok = CharTokenizer(text="the quick brown fox")
+        self.assertEqual(tok.decode(tok.encode("the quick")), "the quick")
+        rebuilt = tokenizer_from_state(tok.state())
+        self.assertEqual(rebuilt.vocab_size, tok.vocab_size)
+        self.assertEqual(rebuilt.encode("the fox"), tok.encode("the fox"))
+
+    def test_legacy_itos_dict_is_accepted(self):
+        """checkpoints from before tokenizers were pluggable stored itos as a dict."""
+        tok = CharTokenizer(text="abcabc")
+        state = {"name": "char", "itos": [tok.itos[i] for i in sorted(tok.itos)]}
+        rebuilt = tokenizer_from_state(state)
+        self.assertEqual(rebuilt.itos, tok.itos)
+        self.assertEqual(rebuilt.vocab_size, tok.vocab_size)
+
+
+class TestSampling(unittest.TestCase):
+    """`sample_next` and `generate` — documented behaviour, pinned."""
+
+    @staticmethod
+    def reference_sample(logits, temperature=1.0, top_k=None, top_p=None):
+        """An independent implementation of the documented sampling rules.
+
+        Written from the description rather than by calling the code under test,
+        so that a change in `sample_next` shows up as a mismatch here.
+        """
+        logits = logits / max(temperature, 1e-8)
+        if top_k is not None and top_k > 0:
+            cutoff = torch.topk(logits, min(top_k, logits.size(-1)))[0][..., [-1]]
+            logits = logits.masked_fill(logits < cutoff, float("-inf"))
+        if top_p is not None:
+            sorted_logits, order = torch.sort(logits, descending=True, dim=-1)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(probs, dim=-1)
+            sorted_logits = sorted_logits.masked_fill(
+                cumulative - probs > top_p, float("-inf")
+            )
+            logits = logits.scatter(-1, order, sorted_logits)
+        return torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.logits = torch.randn(1, 40)
+
+    def test_matches_the_reference_implementation(self):
+        """Same seed, same cutoffs, same token — for every documented control."""
+        configs = [
+            {},
+            {"temperature": 0.5},
+            {"temperature": 2.0},
+            {"top_k": 1},
+            {"top_k": 3},
+            {"top_k": 0},              # documented as "disables it"
+            {"top_k": 40},
+            {"top_p": 0.5},
+            {"top_p": 0.9},
+            {"top_k": 5, "top_p": 0.8, "temperature": 1.3},
+        ]
+        for kwargs in configs:
+            with self.subTest(**kwargs):
+                torch.manual_seed(1234)
+                got = sample_next(self.logits.clone(), **kwargs)
+                torch.manual_seed(1234)
+                want = self.reference_sample(self.logits.clone(), **kwargs)
+                self.assertTrue(torch.equal(got, want))
+
+    def test_top_k_zero_and_negative_disable_the_cutoff(self):
+        """The bug this guards: top_k=0 used to crash inside sample_next."""
+        for top_k in (0, -1, -5):
+            with self.subTest(top_k=top_k):
+                torch.manual_seed(7)
+                got = sample_next(self.logits.clone(), top_k=top_k)
+                torch.manual_seed(7)
+                want = sample_next(self.logits.clone(), top_k=None)
+                self.assertTrue(torch.equal(got, want))
+                self.assertTrue(0 <= int(got) < self.logits.size(-1))
+
+    def test_top_k_one_is_greedy(self):
+        for _ in range(20):
+            token = sample_next(self.logits.clone(), top_k=1)
+            self.assertEqual(int(token), int(self.logits.argmax(dim=-1)))
+
+    def test_top_p_keeps_the_nucleus(self):
+        """With one dominant logit, a small nucleus has to select it."""
+        peaked = torch.full((1, 10), -20.0)
+        peaked[0, 4] = 20.0
+        for _ in range(20):
+            self.assertEqual(int(sample_next(peaked.clone(), top_p=0.5)), 4)
+
+    def test_temperature_zero_is_finite_and_greedy(self):
+        """0 would divide by zero; the floor in sample_next must hold."""
+        token = sample_next(self.logits.clone(), temperature=0.0, top_k=1)
+        self.assertEqual(int(token), int(self.logits.argmax(dim=-1)))
+
+    def test_sampling_is_deterministic_under_a_seed(self):
+        torch.manual_seed(99)
+        first = [int(sample_next(self.logits.clone())) for _ in range(5)]
+        torch.manual_seed(99)
+        second = [int(sample_next(self.logits.clone())) for _ in range(5)]
+        self.assertEqual(first, second)
+        torch.manual_seed(100)
+        third = [int(sample_next(self.logits.clone())) for _ in range(5)]
+        self.assertNotEqual(first, third)
+
+    def test_generate_is_exactly_a_loop_over_sample_next(self):
+        """Pins the refactor that let chat.py and train.py share one sampler."""
+        torch.manual_seed(0)
+        model = GPT(vocab_size=17, n_embd=16, n_head=2, n_layer=1,
+                    block_size=8, dropout=0.0)
+        model.eval()
+        prompt = torch.tensor([[3, 4, 5, 6]], dtype=torch.long)
+
+        torch.manual_seed(42)
+        generated = model.generate(prompt.clone(), max_new_tokens=5,
+                                   temperature=0.9, top_k=4)
+
+        torch.manual_seed(42)
+        idx = prompt.clone()
+        with torch.no_grad():
+            for _ in range(5):
+                logits, _ = model(idx[:, -model.block_size:])
+                nxt = sample_next(logits[:, -1, :], 0.9, 4)
+                idx = torch.cat((idx, nxt), dim=1)
+
+        self.assertTrue(torch.equal(generated, idx))
+
+    def test_generate_crops_context_to_block_size(self):
+        """A prompt longer than the window must not trip the forward assert."""
+        torch.manual_seed(0)
+        model = GPT(vocab_size=11, n_embd=8, n_head=2, n_layer=1,
+                    block_size=4, dropout=0.0)
+        model.eval()
+        out = model.generate(torch.tensor([[1, 2, 3, 4, 5, 6]]), max_new_tokens=3)
+        self.assertEqual(out.shape, (1, 9))
+
+
+class CheckpointFixture(unittest.TestCase):
+    """Shared helper: write a checkpoint the way train.py would."""
+
+    def write_checkpoint(self, path, legacy=False, bpe=None):
+        tok = bpe if bpe is not None else CharTokenizer(text="abcdef")
+        cfg = {"n_embd": 16, "n_head": 2, "n_layer": 1, "block_size": 8,
+               "dropout": 0.0}
+        torch.manual_seed(0)
+        model = GPT(vocab_size=tok.vocab_size, **cfg)
+        payload = {"model_state": model.state_dict(), "config": cfg, "step": 12}
+        if legacy:
+            # As written before the tokenizer became pluggable.
+            payload["stoi"] = dict(tok.stoi)
+            payload["itos"] = dict(tok.itos)
+        else:
+            payload["tokenizer"] = tok.state()
+        torch.save(payload, path)
+        return tok
+
+
+class TestChatLoading(CheckpointFixture):
+    """chat.py rebuilds a model from what the checkpoint actually carries."""
+
+    def test_modern_char_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pt")
+            tok = self.write_checkpoint(path)
+            model, rebuilt, ckpt = chat.load_model(path)
+            self.assertEqual(rebuilt.name, "char")
+            self.assertEqual(rebuilt.vocab_size, tok.vocab_size)
+            self.assertEqual(rebuilt.encode("abc"), tok.encode("abc"))
+            self.assertEqual(model.block_size, 8)
+            self.assertEqual(ckpt["step"], 12)
+
+    def test_bpe_checkpoint_carries_its_vocabulary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tok = BPETokenizer(train_bpe(read_corpus(20_000), 300))
+            path = os.path.join(tmp, "model.pt")
+            self.write_checkpoint(path, bpe=tok)
+            _, rebuilt, _ = chat.load_model(path)
+            self.assertEqual(rebuilt.name, "bpe")
+            self.assertEqual(rebuilt.vocab_size, tok.vocab_size)
+            self.assertEqual(rebuilt.encode("the king"), tok.encode("the king"))
+
+    def test_legacy_checkpoint_without_a_tokenizer_block(self):
+        """runs_v3/model.pt predates the tokenizer work and must still load."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pt")
+            tok = self.write_checkpoint(path, legacy=True)
+            _, rebuilt, _ = chat.load_model(path)
+            self.assertEqual(rebuilt.name, "char")
+            self.assertEqual(rebuilt.vocab_size, tok.vocab_size)
+
+    def test_missing_checkpoint_exits_with_a_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as ctx:
+                chat.load_model(os.path.join(tmp, "nope.pt"))
+            self.assertIn("no checkpoint at", str(ctx.exception))
+
+    def test_checkpoint_without_any_tokenizer_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pt")
+            torch.save({"model_state": {}, "config": {}}, path)
+            with self.assertRaises(SystemExit) as ctx:
+                chat.load_model(path)
+            self.assertIn("no tokenizer", str(ctx.exception))
+
+
+class TestWebServer(CheckpointFixture):
+    """serve.py: the browser's contract with the model.
+
+    A real server on a real socket, because the point of the module is the
+    streaming, and a mocked handler would prove nothing about it.
+    """
+
+    HOST = "127.0.0.1"
+
+    @classmethod
+    def setUpClass(cls):
+        import serve
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.checkpoint = os.path.join(cls.tmp.name, "model.pt")
+        fixture = CheckpointFixture("setUpClass")
+        cls.tokenizer = fixture.write_checkpoint(
+            cls.checkpoint, bpe=BPETokenizer(train_bpe(read_corpus(20_000), 300))
+        )
+        cls.server = serve.build_server(cls.checkpoint, cls.HOST, 0)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    # ------------------------------------------------------------- helpers
+    def connect(self, timeout=60):
+        return http.client.HTTPConnection(self.HOST, self.port, timeout=timeout)
+
+    def stream(self, body, stop_after=None):
+        conn = self.connect()
+        conn.request("POST", "/api/generate", json.dumps(body),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        headers = dict(resp.getheaders())
+        events = []
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            events.append(json.loads(line.decode()))
+            if stop_after and len(events) >= stop_after:
+                break
+        conn.close()
+        return events, headers
+
+    def post(self, path, payload=None, raw=None):
+        conn = self.connect()
+        conn.request("POST", path,
+                     raw if raw is not None else json.dumps(payload),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        status = resp.status
+        conn.close()
+        return status, body
+
+    def get(self, path):
+        conn = self.connect()
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body, headers = resp.read().decode(), dict(resp.getheaders())
+        status = resp.status
+        conn.close()
+        return status, body, headers
+
+    # ----------------------------------------------------------------- page
+    def test_page_is_served_with_its_controls(self):
+        status, body, headers = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        for control in ("temperature", "top_k", "top_p", "rep",
+                        "max_new_tokens", "stop", "seed"):
+            self.assertIn(f'id="{control}"', body, f"{control} missing from the page")
+
+    def test_page_is_honest_about_what_the_model_is(self):
+        _, body, _ = self.get("/")
+        self.assertIn("not an assistant", body)
+
+    def test_page_is_self_contained(self):
+        """No build step: styles and script are in the document itself."""
+        _, body, _ = self.get("/")
+        self.assertIn("<style>", body)
+        self.assertIn("<script>", body)
+        self.assertNotIn("http://cdn", body)
+        self.assertNotIn("https://cdn", body)
+
+    def test_info_describes_the_loaded_checkpoint(self):
+        status, body, _ = self.get("/api/info")
+        self.assertEqual(status, 200)
+        info = json.loads(body)
+        # Counts, not values: tests must not depend on the order they run in.
+        self.assertIn("abandoned_replies", info)
+        self.assertIn("last_abandoned_chunks", info)
+        self.assertEqual(info["checkpoint"], self.checkpoint)
+        self.assertEqual(info["tokenizer"], "bpe")
+        self.assertEqual(info["vocab_size"], self.tokenizer.vocab_size)
+        self.assertGreater(info["num_params"], 0)
+        self.assertEqual(info["block_size"], 8)
+
+    # ------------------------------------------------------------- generate
+    def test_generate_streams_ndjson_chunks(self):
+        events, headers = self.stream(
+            {"prompt": "KING:\n", "max_new_tokens": 12, "seed": 1}
+        )
+        kinds = [e["t"] for e in events]
+        chunks = [e["text"] for e in events if e["t"] == "chunk"]
+        done = [e for e in events if e["t"] == "done"]
+
+        self.assertEqual(headers["Content-Type"], "application/x-ndjson")
+        self.assertEqual(headers["Transfer-Encoding"].lower(), "chunked")
+        self.assertEqual(kinds[0], "meta")
+        self.assertEqual(kinds[-1], "done")
+        self.assertNotIn("error", kinds)
+        self.assertEqual(len(done), 1)
+        self.assertEqual("".join(chunks), done[0]["text"])
+        self.assertEqual(done[0]["steps"], len(chunks))
+        self.assertEqual(done[0]["block_size"], 8)
+        self.assertGreater(done[0]["in_context"], done[0]["prompt_tokens"])
+
+    def test_same_seed_reproduces_the_reply(self):
+        body = {"prompt": "KING:\n", "max_new_tokens": 8, "seed": 5}
+        first, _ = self.stream(body)
+        second, _ = self.stream(body)
+        self.assertEqual([e["text"] for e in first if e["t"] == "chunk"],
+                         [e["text"] for e in second if e["t"] == "chunk"])
+
+    def test_different_seed_gives_a_different_reply(self):
+        text = []
+        for seed in (6, 7):
+            events, _ = self.stream(
+                {"prompt": "KING:\n", "max_new_tokens": 8, "seed": seed}
+            )
+            text.append("".join(e["text"] for e in events if e["t"] == "chunk"))
+        self.assertNotEqual(text[0], text[1])
+
+    def test_stop_string_never_reaches_the_stream(self):
+        events, _ = self.stream(
+            {"prompt": "KING:\n", "max_new_tokens": 40, "seed": 2, "stop": "\n"}
+        )
+        chunks = "".join(e["text"] for e in events if e["t"] == "chunk")
+        done = [e for e in events if e["t"] == "done"][0]
+        self.assertNotIn("\n", chunks)
+        self.assertEqual(done["text"], chunks)
+
+    def test_documented_controls_are_accepted(self):
+        cases = [
+            {"top_k": 0},                    # documented as “disables it”
+            {"top_k": 1},
+            {"top_p": 0.5},
+            {"top_p": 0},                    # 0 means off, not an error
+            {"temperature": 0},
+            {"repetition_penalty": 1.3},
+            {"penalty_window": 4},
+        ]
+        for extra in cases:
+            with self.subTest(**extra):
+                body = {"prompt": "KING:\n", "max_new_tokens": 6, "seed": 1}
+                body.update(extra)
+                events, _ = self.stream(body)
+                self.assertEqual(events[-1]["t"], "done", events[-1])
+
+    # ----------------------------------------------------------- validation
+    def test_bad_requests_are_rejected_with_a_reason(self):
+        cases = [
+            {"prompt": ""},
+            {},
+            {"prompt": 5},
+            {"prompt": "a", "top_k": 2.5},
+            {"prompt": "a", "temperature": 9},
+            {"prompt": "a", "max_new_tokens": 0},
+            {"prompt": "a", "max_new_tokens": 99999},
+            {"prompt": "a", "top_p": 1.5},
+            {"prompt": "a", "seed": "abc"},
+            {"prompt": "a", "seed": -3},
+            [1, 2, 3],
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                status, body = self.post("/api/generate", payload)
+                self.assertEqual(status, 400, body[:80])
+                self.assertIn("error", json.loads(body))
+
+    def test_malformed_json_is_rejected(self):
+        status, body = self.post("/api/generate", None, raw=b"{not json")
+        self.assertEqual(status, 400)
+        self.assertIn("not valid JSON", body)
+
+    def test_unknown_routes_are_404(self):
+        status, _, _ = self.get("/nope")
+        self.assertEqual(status, 404)
+        status, _ = self.post("/nope", {})
+        self.assertEqual(status, 404)
+
+    # --------------------------------------------------------------- tokens
+    def test_tokens_endpoint_matches_the_tokenizer(self):
+        status, body = self.post("/api/tokens", {"text": "the king"})
+        self.assertEqual(status, 200)
+        info = json.loads(body)
+        self.assertEqual(info["count"], len(info["tokens"]))
+        self.assertEqual(info["chars"], len("the king"))
+        self.assertEqual("".join(t["text"] for t in info["tokens"]), "the king")
+        self.assertEqual([t["id"] for t in info["tokens"]],
+                         self.tokenizer.encode("the king"))
+
+    def test_non_string_tokens_input_is_rejected(self):
+        status, body = self.post("/api/tokens", {"text": 42})
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    # ------------------------------------------------------- stopping work
+    def test_server_survives_a_client_walking_away(self):
+        """Abandoning a reply must not take the server down with it.
+
+        Whether the *sampling* stops promptly is not decidable at this level: on
+        loopback with a small model the kernel can buffer a whole reply, so the
+        write never fails and there is nothing to notice. That path is tested
+        directly in TestAbandonedStream; this one is about survival.
+        """
+        conn = self.connect()
+        conn.request("POST", "/api/generate",
+                     json.dumps({"prompt": "a\n", "max_new_tokens": 40,
+                                 "seed": 4}),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.readline()
+        resp.readline()                      # walk away mid-reply
+        conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                             struct.pack("ii", 1, 0))
+        conn.sock.close()
+
+        events, _ = self.stream({"prompt": "b\n", "max_new_tokens": 4, "seed": 5})
+        self.assertEqual(events[-1]["t"], "done")
+
+    def test_info_survives_a_page_reload(self):
+        first = json.loads(self.get("/api/info")[1])
+        second = json.loads(self.get("/api/info")[1])
+        self.assertEqual(first, second)
+        self.assertEqual(first["checkpoint"], self.checkpoint)
+
+    def test_concurrent_requests_all_complete(self):
+        """The lock serialises generation without deadlocking or dropping one."""
+        results = []
+
+        def worker(seed):
+            events, _ = self.stream(
+                {"prompt": f"line {seed}\n", "max_new_tokens": 4, "seed": seed}
+            )
+            results.append(events[-1]["t"])
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, ["done"] * 3)
+
+    # ------------------------------------------------------------ validate()
+    def test_validate_applies_defaults(self):
+        import serve
+
+        params = serve.validate({"prompt": "hi"})
+        self.assertEqual(params["temperature"], 0.8)
+        self.assertEqual(params["top_k"], 200)
+        self.assertIsNone(params["top_p"])       # nucleus off by default
+        self.assertEqual(params["repetition_penalty"], 1.0)
+        self.assertEqual(params["max_new_tokens"], 160)
+        self.assertIsNone(params["stop"])
+        self.assertIsNone(params["seed"])        # no seed means a fresh draw
+
+    def test_validate_treats_zero_nucleus_and_empty_stop_as_off(self):
+        import serve
+
+        params = serve.validate({"prompt": "hi", "top_p": 0, "stop": ""})
+        self.assertIsNone(params["top_p"])
+        self.assertIsNone(params["stop"])
+
+
+class TestAbandonedStream(unittest.TestCase):
+    """The cancellation path, driven directly.
+
+    A socket is the wrong instrument for this: the kernel buffers, so on a fast
+    model a whole reply can be written without a single error and the code under
+    test is never reached. A stand-in writer that fails on demand reaches it.
+    """
+
+    class Wfile:
+        """Stands in for the socket: records writes, then fails like a reset."""
+
+        def __init__(self, fail_after=None):
+            self.fail_after = fail_after
+            self.writes = []
+
+        def write(self, data):
+            if self.fail_after is not None and len(self.writes) >= self.fail_after:
+                raise BrokenPipeError("the client went away")
+            self.writes.append(data)
+
+        def flush(self):
+            pass
+
+    class FakeSession:
+        checkpoint = "fake/model.pt"
+
+        def __init__(self):
+            self.tokenizer = SimpleNamespace(name="fake", vocab_size=7)
+            self.abandoned = []
+
+        def note_abandoned(self, tokens):
+            self.abandoned.append(tokens)
+
+        def generate(self, params, emit):
+            for i in range(10):
+                emit(f"word{i} ")
+            return {"text": "word0 ", "steps": 10, "seconds": 0.1,
+                    "prompt_tokens": 1, "in_context": 11, "block_size": 8}
+
+    def make_handler(self, wfile):
+        import serve
+
+        handler = serve.Handler.__new__(serve.Handler)   # no socket, no parsing
+        handler.wfile = wfile
+        handler.close_connection = False
+        handler.start_stream = lambda: None
+        return handler
+
+    def test_events_are_written_as_chunked_frames(self):
+        """http.server does not chunk for you, so the framing is verified here."""
+        wfile = self.Wfile()
+        handler = self.make_handler(wfile)
+
+        event = {"t": "chunk", "text": "hi"}
+        handler.stream_event(event)
+
+        payload = (json.dumps(event) + "\n").encode("utf-8")
+        expected = b"%x\r\n" % len(payload) + payload + b"\r\n"
+        self.assertEqual(wfile.writes, [expected])
+        self.assertFalse(handler.close_connection)
+
+    def test_stream_ends_with_a_terminating_chunk(self):
+        wfile = self.Wfile()
+        handler = self.make_handler(wfile)
+        handler.end_stream()
+        self.assertEqual(wfile.writes, [b"0\r\n\r\n"])
+
+    def test_a_failed_write_becomes_client_gone(self):
+        """A dead socket must surface as ClientGone, not as a socket error."""
+        wfile = self.Wfile(fail_after=2)
+        handler = self.make_handler(wfile)
+        handler.stream_event({"t": "chunk", "text": "one"})
+        handler.stream_event({"t": "chunk", "text": "two"})
+        with self.assertRaises(serve.ClientGone):
+            handler.stream_event({"t": "chunk", "text": "three"})
+        self.assertTrue(handler.close_connection,
+                        "the connection should be dropped")
+
+    def test_abandoned_reply_is_counted_and_not_terminated(self):
+        """The contract: stop emitting, note how far it got, send no terminator.
+
+        The count includes the chunk whose write failed — it was attempted, and
+        whether the client's kernel kept it is not knowable from here.
+        """
+        wfile = self.Wfile(fail_after=3)      # meta + two chunks, then the pipe dies
+        handler = self.make_handler(wfile)
+        session = self.FakeSession()
+        # `session` is a read-only property on the handler, so supply the server.
+        handler.server = SimpleNamespace(session=session)
+
+        handler.stream_generate({"prompt": "a"})     # returns quietly
+
+        self.assertEqual(session.abandoned, [3], "should record how far it got")
+        self.assertNotIn(b"0\r\n\r\n", wfile.writes,
+                         "a half-finished stream must not be terminated")
+        self.assertEqual(len(wfile.writes), 3)
+
+    def test_a_complete_reply_is_terminated_and_not_counted(self):
+        wfile = self.Wfile()
+        handler = self.make_handler(wfile)
+        session = self.FakeSession()
+        handler.server = SimpleNamespace(session=session)
+
+        handler.stream_generate({"prompt": "a"})
+
+        self.assertEqual(session.abandoned, [])
+        self.assertEqual(wfile.writes[-1], b"0\r\n\r\n")
+
+        def payload(frame):
+            _, _, body = frame.partition(b"\r\n")
+            return json.loads(body[:-2].decode("utf-8"))
+
+        kinds = [payload(w)["t"] for w in wfile.writes[:-1]]
+        self.assertEqual(kinds[0], "meta")
+        self.assertEqual(kinds[-1], "done")
+        self.assertEqual(kinds.count("chunk"), 10)
+
+
+class TestBigramFloor(unittest.TestCase):
+    """The floor has to be measured the same way the model is."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        with open(os.path.join(cls.tmp.name, "corpus.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write(read_corpus(40_000))
+        cls.data = os.path.join(cls.tmp.name, "corpus.txt")
+        cls.tok = BPETokenizer(train_bpe(read_corpus(40_000), 384))
+        cls.tok_path = os.path.join(cls.tmp.name, "tokenizer.json")
+        cls.tok.save(cls.tok_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def run_bigram(self, out_name, extra):
+        out = os.path.join(self.tmp.name, out_name)
+        proc = subprocess.run(
+            [sys.executable, "bigram.py", "--data", self.data, "--out", out]
+            + extra,
+            cwd=HERE, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(out, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_character_floor_is_per_character(self):
+        m = self.run_bigram("char.json", [])
+        self.assertEqual(m["tokenizer"], "char")
+        self.assertEqual(m["chars_per_token"], 1.0)
+        self.assertIsNone(m["val_bits_per_char"])
+        self.assertAlmostEqual(m["uniform_loss"], math.log(m["vocab_size"]), places=4)
+        self.assertAlmostEqual(m["bigram_val_perplexity"],
+                               math.exp(m["val_loss"]), places=2)
+        self.assertLess(m["val_loss"], m["uniform_loss"])
+
+    def test_bpe_floor_uses_the_validation_split(self):
+        """The bug this guards: chars/token measured on the training split.
+
+        It has to be the validation split, because that is where the model
+        measures it — otherwise the two floors are not on the same footing.
+        """
+        m = self.run_bigram("bpe.json", ["--tokenizer", "bpe",
+                                         "--bpe-tokenizer", self.tok_path])
+        self.assertEqual(m["tokenizer"], "bpe")
+        self.assertEqual(m["vocab_size"], self.tok.vocab_size)
+
+        ids = self.tok.encode(read_corpus(40_000))
+        n = int(0.9 * len(ids))
+        expected = len(self.tok.decode(ids[n:])) / len(ids[n:])
+        self.assertAlmostEqual(m["chars_per_token"], round(expected, 4), places=4)
+
+        # And the bits/char quote is that loss on that axis, nothing else.
+        # The file stores loss and chars/token rounded to 4 places, so the
+        # recomputed ratio can sit one rounding unit away from the stored one.
+        self.assertAlmostEqual(
+            m["val_bits_per_char"],
+            round((m["val_loss"] / math.log(2)) / m["chars_per_token"], 4),
+            delta=2e-4,
+        )
+
+
+class TestResumeSeam(unittest.TestCase):
+    """A resumed run continues the curve instead of restarting or doubling it.
+
+    Training is slow on this CPU, so the two runs under test — a fresh one and
+    the same model resumed — are trained once for the whole class and shared.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.data = os.path.join(cls.tmp.name, "corpus.txt")
+        with open(cls.data, "w", encoding="utf-8") as f:
+            f.write(read_corpus(20_000))
+        cls.run1 = os.path.join(cls.tmp.name, "first")
+        cls.run2 = os.path.join(cls.tmp.name, "second")
+        cls.first = cls.train(cls.run1, [])
+        cls.second = cls.train(
+            cls.run2, ["--resume", os.path.join(cls.run1, "model.pt")]
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @classmethod
+    def train(cls, out_dir, extra):
+        cmd = [
+            sys.executable, "train.py",
+            "--data", cls.data, "--out-dir", out_dir,
+            "--max-iters", "2", "--eval-interval", "1", "--eval-iters", "2",
+            "--log-interval", "1", "--checkpoint-interval", "1",
+            "--sample-tokens", "16", "--max-seconds", "300",
+            "--warmup-iters", "2",
+            "--n-layer", "1", "--n-embd", "32", "--n-head", "2",
+            "--block-size", "8", "--batch-size", "4",
+            "--dropout", "0.0", "--seed", "0",
+        ] + extra
+        proc = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        with open(os.path.join(out_dir, "metrics.json"), "r",
+                  encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_fresh_run_records_every_evaluated_step(self):
+        steps = [h["step"] for h in self.first["history"]]
+        self.assertEqual(steps, [0, 1, 2])
+
+    def test_resume_does_not_double_count_the_seam_step(self):
+        steps = [h["step"] for h in self.second["history"]]
+
+        # The defect: the step it resumed from appeared twice at one x.
+        self.assertEqual(len(steps), len(set(steps)), f"duplicate steps: {steps}")
+        self.assertEqual(steps, sorted(steps))
+        self.assertEqual(steps, [0, 1, 2, 3, 4])
+
+        # History carried over, not restarted from zero: everything before the
+        # seam survives the round-trip through the checkpoint untouched.
+        self.assertEqual(self.second["prior_steps"], 2)
+        self.assertEqual(self.second["history"][:2], self.first["history"][:2])
+        self.assertEqual(self.second["final"]["steps_completed"], 4)
+
+        # The seam step itself is re-measured on resume, so its losses may
+        # differ from the first run's; what must hold is that it is one point
+        # at one x, on the same schedule position.
+        seam, original = self.second["history"][2], self.first["history"][2]
+        self.assertEqual(seam["step"], original["step"])
+        self.assertEqual(seam["lr"], original["lr"])
+        self.assertGreater(seam["val_loss"], 0.0)
+
+    def test_learning_rate_continues_rather_than_restarting(self):
+        """A resumed run is already warm; it must not jump back to the peak."""
+        peak = max(h["lr"] for h in self.first["history"])
+        self.assertLessEqual(self.second["history"][0]["lr"], peak)
+
+    def test_metrics_are_self_consistent(self):
+        text = read_corpus(20_000)
+        m = self.first
+        self.assertEqual(m["corpus_tokens"], len(CharTokenizer(text=text).encode(text)))
+        self.assertEqual(m["final"]["chars_per_token"], 1.0)
+        self.assertAlmostEqual(
+            m["final"]["val_bits_per_char"],
+            round((m["final"]["val_loss"] / math.log(2)), 4), places=4,
+        )
+        self.assertEqual(m["final"]["steps_completed"], 2)
+        with open(os.path.join(self.run1, "loss_curve.csv"), "r",
+                  encoding="utf-8") as f:
+            rows = f.read().strip().splitlines()
+        self.assertEqual(rows[0], "step,train_loss,val_loss")
+        self.assertEqual(len(rows) - 1, len(m["history"]))
+
+
+if __name__ == "__main__":
+    if not os.path.exists(os.path.join(HERE, CORPUS)):
+        sys.exit(f"missing corpus at {CORPUS}; the tests need it")
+    unittest.main(verbosity=2)

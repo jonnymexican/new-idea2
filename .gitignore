@@ -3,12 +3,24 @@
 
 # Dependencies
 node_modules/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Build output
 dist/
 build/
 .output/
 .wrangler/
+
+# Training artifacts (regenerate with train.py / render_curve.py)
+runs/
+runs_*/
+*.pid
 
 # Environment / secrets
 .env
