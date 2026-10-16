@@ -762,6 +762,14 @@ keeps count of how much has gone.</span></div>
   };
   const fail = (message) => { errEl.textContent = message; };
   const clearFail = () => { errEl.textContent = ""; };
+  // The token view is a view of *this* transcript, so it goes when the
+  // transcript does: chips left over from the previous one describe text that
+  // is no longer on screen.
+  const clearTokens = () => {
+    const box = $("tokens");
+    box.hidden = true;
+    box.innerHTML = "";
+  };
 
   function append(kind, text) {
     const span = document.createElement("span");
@@ -796,7 +804,7 @@ keeps count of how much has gone.</span></div>
     const base = $("keep").checked ? transcript : "";
     const prompt = base + line + "\\n";
 
-    if (base === "") { doc.innerHTML = ""; transcript = ""; }
+    if (base === "") { doc.innerHTML = ""; transcript = ""; clearTokens(); }
     append("said", line + "\\n");
     live = append("reply live", "");
     transcript = prompt;
@@ -892,6 +900,7 @@ keeps count of how much has gone.</span></div>
     doc.innerHTML = '<span class="hint">cleared.</span>';
     statusEl.textContent = "idle";
     clearFail();
+    clearTokens();
     lastStats = { tokens: 0, seconds: 0, in_context: 0, block_size: 0,
                   prompt_tokens: 0, dropped_tokens: 0, dropped_prompt_tokens: 0 };
     renderWindow(lastStats);
