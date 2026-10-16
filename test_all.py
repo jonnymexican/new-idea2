@@ -19,6 +19,9 @@ before or that the numbers in the README would become wrong without:
   contract that keeps it visible is resolved from the stylesheet the server
   actually sends, and the check is shown to catch the layout that once
   collapsed it
+- the edge of the model's window is a real character offset, not an
+  approximation: it is cross-checked two ways, works for both tokenizers, and
+  goes before the character when a byte-level token cuts one in half
 
 Standard library only, on purpose: this project has one dependency (torch) and
 the tests should not add a second.
@@ -748,6 +751,41 @@ class TestWebServer(CheckpointFixture):
         self.assertGreaterEqual(done["dropped_tokens"],
                                 done["dropped_prompt_tokens"])
 
+    def test_done_says_where_the_window_begins_not_only_how_much_it_dropped(self):
+        """The counts say how much fell out of the window; this says where it
+        opens, so the page can draw the edge of the model's memory in the place
+        it actually falls rather than at an approximation of it."""
+        prompt = "KING HENRY:\n" + read_corpus(600)
+        events, _ = self.stream({"prompt": prompt, "max_new_tokens": 8,
+                                 "seed": 11})
+        done = [e for e in events if e["t"] == "done"][0]
+        full = prompt + done["text"]
+        ids = self.tokenizer.encode(full)
+        block = done["block_size"]
+        self.assertEqual(done["in_context"], len(ids))
+        self.assertEqual(done["dropped_tokens"], max(0, len(ids) - block))
+
+        offset = done["boundary_chars"]
+        self.assertIsNotNone(offset)
+        self.assertGreater(offset, 0)          # something is above the line
+        self.assertLess(offset, len(full))
+        # Pinned against a second computation of the same definition, so the
+        # payload cannot drift from the arithmetic it claims to report.
+        self.assertEqual(offset,
+                         len(full) - len(self.tokenizer.decode(ids[-block:])))
+        # And it is a real place in the text: below it is the window's text.
+        self.assertEqual(full[offset:], self.tokenizer.decode(ids[-block:]))
+        # (The offset is relative to the transcript as *characters*, which is what
+        # the page has: the JSON round trip preserves the same code points, so
+        # the line lands where the browser's own text puts it.)
+
+    def test_a_window_that_drops_nothing_has_no_boundary_to_draw(self):
+        events, _ = self.stream({"prompt": "a\n", "max_new_tokens": 2,
+                                 "seed": 12})
+        done = [e for e in events if e["t"] == "done"][0]
+        self.assertEqual(done["dropped_tokens"], 0)
+        self.assertEqual(done["boundary_chars"], 0)
+
     def test_page_accounts_for_the_context_it_drops(self):
         """A window that quietly forgets the beginning is the failure mode; the
         page has somewhere to say so and marks what fell out."""
@@ -916,6 +954,103 @@ class TestWebServer(CheckpointFixture):
         self.assertIsNone(params["stop"])
 
 
+class TestWindowBoundary(unittest.TestCase):
+    """serve.py: where the model's window opens, as a place in the text.
+
+    The page draws the edge of the model's memory into the transcript, so this
+    offset has to be a real character position rather than a close one. Two
+    things make that delicate: it is measured from the visible tail, because
+    slicing from the other end counts differently when a token cuts a character
+    in half — and a byte-level token can, since a token is a run of bytes.
+    """
+
+    BLOCK = 40
+
+    @classmethod
+    def setUpClass(cls):
+        text = read_corpus(20_000)
+        cls.text = text[:400]
+        cls.tokenizer = BPETokenizer(train_bpe(text, 300))
+
+    def boundary(self, text, block, tokenizer=None):
+        tok = tokenizer or self.tokenizer
+        return serve.window_boundary_chars(tok, text, tok.encode(text), block)
+
+    def test_a_window_that_holds_everything_drops_nothing(self):
+        self.assertEqual(self.boundary(self.text[:20], self.BLOCK), 0)
+
+    def test_the_offset_is_measured_in_characters_not_bytes(self):
+        """The page places the line by character, so a multi-byte corpus must
+        not be counted in the bytes under it."""
+        text = "héllo wörld, héllo"
+        offset = self.boundary(text, 4)
+        self.assertEqual(text[offset:],
+                         self.tokenizer.decode(self.tokenizer.encode(text)[-4:]))
+        self.assertLess(offset, len(text.encode("utf-8")))
+
+    def test_the_offset_is_where_the_window_actually_opens(self):
+        ids = self.tokenizer.encode(self.text)
+        offset = self.boundary(self.text, self.BLOCK)
+        self.assertEqual(self.text[offset:],
+                         self.tokenizer.decode(ids[-self.BLOCK:]))
+
+    def test_two_ways_of_slicing_the_same_text_agree(self):
+        """Sliced from the visible side and from the dropped side, the boundary
+        is the same place.
+
+        Only for text that decodes cleanly, which is the point of keeping this
+        separate from the test above: a byte-level tokenisation can hold a run of
+        bytes that is not valid UTF-8 — an untrained checkpoint emits them — and
+        decoding such a run one token at a time splits it into more replacement
+        characters than decoding it whole. That is a property of the display,
+        not of the boundary, so the boundary is measured from the visible side.
+        """
+        text = self.text.encode("ascii", "ignore").decode()[:200]
+        ids = self.tokenizer.encode(text)
+        block = 30
+        offset = serve.window_boundary_chars(self.tokenizer, text, ids, block)
+        pieces = self.tokenizer.show(text)
+        self.assertEqual(len(pieces), len(ids))
+        self.assertEqual(sum(len(p) for _, p in pieces[:len(ids) - block]),
+                         offset)
+
+    def test_a_character_tokenizer_needs_no_special_case(self):
+        """One character per token: the arithmetic has to work for the other
+        tokenizer too, not just the one with bytes under it."""
+        char = CharTokenizer(text=self.text)
+        offset = self.boundary(self.text, self.BLOCK, tokenizer=char)
+        self.assertEqual(offset, len(self.text) - self.BLOCK)
+        self.assertEqual(self.text[offset:], self.text[-self.BLOCK:])
+
+    def test_a_boundary_inside_a_character_goes_before_it(self):
+        """With one token per byte, a window can open in the middle of a
+        character. The line then goes before that character: the model read
+        part of it, and nothing above the line is claimed as readable."""
+        byte_only = BPETokenizer([])          # no merges: every token is a byte
+        text = "é" * 3
+        ids = byte_only.encode(text)
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(byte_only.decode(ids[-1:]), "\ufffd")
+        offset = serve.window_boundary_chars(byte_only, text, ids, 1)
+        # The window holds one byte: the second half of the last character, so
+        # the line goes before it. Two whole é above the line, and the third one
+        # split — which is the honest thing to show, since the model has read
+        # half of it and the page cannot draw half a character.
+        self.assertEqual(offset, 2)
+        self.assertEqual(text[offset:], "é")
+
+    def test_an_offset_that_cannot_be_placed_is_refused(self):
+        """The fallback is None and not a guess: the page then draws nothing,
+        since a line in the wrong place is worse than no line at all."""
+        class Liar:
+            def decode(self, ids):
+                return "not the tail of this text"
+
+        self.assertIsNone(
+            serve.window_boundary_chars(Liar(), "some text", [1, 2, 3, 4], 2)
+        )
+
+
 class TestPageLayout(unittest.TestCase):
     """serve.py: the page's geometry, resolved without a browser.
 
@@ -991,6 +1126,26 @@ class TestPageLayout(unittest.TestCase):
         _, shrink, _ = flex_factors(declarations_for(without_flex, ".tokens", self.WIDE))
         self.assertEqual(shrink, 1.0)
         self.assertNotEqual(shrink, 0.0, "this check would pass a shrinkable panel")
+
+    def test_the_pages_own_line_cannot_become_part_of_the_transcript(self):
+        """The window's edge carries a label, and the document's text is the
+        transcript the next prompt is built from and that Copy copies — so the
+        label has to come from a pseudo-element, never from a text node."""
+        self.assertEqual(self.props(".cut::after", self.WIDE).get("content"),
+                         "attr(data-label)")
+
+    def test_the_window_edge_takes_a_line_of_its_own(self):
+        """Inline would put it in the middle of a sentence, which is not a
+        boundary a reader can see."""
+        self.assertEqual(self.props(".cut", self.WIDE).get("display"), "block")
+
+    def test_text_above_the_window_is_dimmed(self):
+        self.assertLess(float(self.props(".unread", self.WIDE)["opacity"]), 1.0)
+
+    def test_the_page_consumes_the_boundary_the_server_reports(self):
+        """The offset is worth nothing if nothing reads it."""
+        self.assertIn("boundary_chars", self.html)
+        self.assertIn('marker.className = "cut"', self.html)
 
     def test_the_token_view_keeps_room_for_chips(self):
         """Unshrinkable is not the same as usable: a cap of its own could still

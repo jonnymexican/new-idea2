@@ -272,6 +272,13 @@ and `dropped_prompt_tokens` is how many of the prompt alone never reached it. A
 prompt longer than the window is the quiet case — without those numbers the page
 would look as though the model had read all of it.
 
+`boundary_chars` is the third piece of the same story: where that window begins,
+as a character offset into the transcript the model was given, or `null` when the
+offset cannot be placed in the text. It is measured from the visible tail rather
+than from the dropped prefix, because a byte-level token can cut a multi-byte
+character in half and the two ways of slicing then disagree by exactly that
+character.
+
 **The controls are the sampling controls**, wired to the same names the CLI uses:
 temperature, top-k (0 disables it), top-p with an on/off toggle, repetition
 penalty and its window, max new tokens, a stop string, and a seed. Four presets
@@ -291,6 +298,18 @@ longer than the model can read: `the last 64 tokens are what the model reads —
 in words — the opening of what you typed was never read. In the token view the
 chips that have fallen out of the window are dimmed and dashed, so "what does
 the model actually see" is something you can look at rather than infer.
+
+The transcript carries the boundary itself. Once the window overflows, a dashed
+rule appears where the model's memory begins — `outside the model's window · 730
+tokens above` — and everything above it is dimmed, so the line between what the
+model reads and what it has forgotten is a place on the page rather than a number
+to hold in your head while reading. The offset is exact: the characters below the
+line tokenise to precisely `block_size` tokens. Two things it deliberately does
+not do. It is drawn only for a *completed* reply, because an abandoned one leaves
+no boundary that was ever computed — and a line in the wrong place is worse than
+no line. And its label is a CSS pseudo-element rather than text, because the
+document's text is the transcript the next prompt is built from and that Copy
+puts on the clipboard.
 
 It binds to `127.0.0.1` by default. It serves whatever checkpoint you point it at
 to anyone who can reach the port, so the flag is there if you want it elsewhere.
@@ -330,6 +349,13 @@ and would quietly invalidate the results if it broke again:
   that keeps it visible is resolved from the stylesheet the server actually
   sends — who shrinks, who caps, who yields — and the check is shown to fail on
   the layout that once collapsed the panel to about twelve pixels
+- the edge of the model's window is a real place in the text, not a close one:
+  the offset is cross-checked by slicing the same tokenisation two ways, holds
+  for both tokenizers, and lands before the character when a byte-level token
+  cuts one in half — and an offset that cannot be placed is refused, not guessed
+- the label on that line cannot join the transcript: it comes from a
+  pseudo-element, so the document's text stays exactly what the next prompt is
+  built from and what Copy copies
 
 ## Fetching the corpus again
 

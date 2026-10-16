@@ -35,6 +35,11 @@ model, because `stream_reply` crops to the last `block_size` tokens). A prompt
 longer than the window is the quiet case: without that count, the page would
 look as though the model had read all of it.
 
+`boundary_chars` is where that window begins, as a character offset into the
+transcript the model was given (`prompt + text`), so the page can draw the edge
+of its memory in the place it actually falls. It is null when the offset cannot
+be placed in the text — see `window_boundary_chars`.
+
 It is deliberately an NDJSON stream over chunked transfer encoding rather than
 Server-Sent Events: EventSource cannot POST, and 40 lines of fetch plus a
 TextDecoder is a smaller cost than marshalling the request through a query
@@ -71,6 +76,34 @@ class ClientGone(Exception):
 
 
 # --------------------------------------------------------------------- model
+
+
+def window_boundary_chars(tokenizer, text, ids, block):
+    """Where the model's window begins in `text`, as a character offset.
+
+    The window holds the last `block` tokens of `ids`, so what it cannot read is
+    precisely what the text of those tokens does not cover. Measured from the
+    visible tail rather than from the dropped prefix, because those two count
+    differently when a tokenisation cuts a character in half — and a byte-level
+    one can, since a token is a run of bytes and not a run of characters.
+
+    Returns None rather than a guess if the boundary cannot be placed in the
+    text: a line drawn in the wrong place is worse than no line.
+    """
+    if len(ids) <= block:
+        return 0                      # the whole thing is inside the window
+    visible = tokenizer.decode(ids[-block:])
+    if text.endswith(visible):
+        return len(text) - len(visible)
+    if visible.startswith("\ufffd") and text.endswith(visible[1:]):
+        # The window opens inside a multi-byte character: `visible` is the
+        # dropped bytes of that character as one replacement character, followed
+        # by the rest. Counting that replacement character as the single
+        # character it belongs to is what puts the line *before* it, which is
+        # the honest side to err on — the model read part of one character, and
+        # nothing above the line can claim to have been read.
+        return len(text) - len(visible)
+    return None
 
 
 class Session:
@@ -134,6 +167,7 @@ class Session:
         file-like object that writes each flushed chunk to the browser.
         """
         out = _EmitterStream(emit)
+        block = self.model.block_size
         args = argparse.Namespace(
             temperature=params["temperature"],
             top_k=params["top_k"],
@@ -153,12 +187,20 @@ class Session:
             prompt_tokens = len(ids)
             text, steps, seconds = stream_reply(self.model, self.tokenizer,
                                                 ids, args, out)
-            in_context = len(self.tokenizer.encode(params["prompt"] + text))
+            # The transcript the model was given, and the tokens it made of it.
+            # `in_context` is that whole sequence: every token written.
+            full = params["prompt"] + text
+            full_ids = self.tokenizer.encode(full)
+            in_context = len(full_ids)
+            # Inside the lock as well: decoding walks the tokenizer's cache.
+            boundary_chars = window_boundary_chars(self.tokenizer, full,
+                                                   full_ids, block)
 
         # `stream_reply` keeps the last block_size tokens, so everything before
         # them is invisible to the model. Counted and reported rather than left
-        # for the reader to infer from a running total.
-        block = self.model.block_size
+        # for the reader to infer from a running total — and located, as an
+        # offset into the transcript, so the page can draw the edge of the
+        # window where it actually falls instead of at some approximation.
         return {
             "text": text,
             "steps": steps,
@@ -167,6 +209,7 @@ class Session:
             "dropped_prompt_tokens": max(0, prompt_tokens - block),
             "in_context": in_context,
             "dropped_tokens": max(0, in_context - block),
+            "boundary_chars": boundary_chars,
             "block_size": block,
         }
 
@@ -491,6 +534,22 @@ PAGE = """<!doctype html>
   }
   @keyframes blink { 50% { opacity: 0; } }
   .hint { color: var(--dim); }
+  /* The edge of the model's window, drawn into the transcript where it falls.
+     The label is a pseudo-element on purpose: text here would join the
+     document's text, and the document's text is the transcript that the next
+     prompt is built from and that Copy puts on the clipboard. */
+  .cut {
+    display: block; position: relative; height: 0;
+    border-top: 1px dashed var(--accent); margin: 20px 0 12px;
+  }
+  .cut::after {
+    content: attr(data-label); position: absolute; top: -9px; left: 2px;
+    padding: 0 7px; background: var(--panel); color: var(--accent);
+    font: 11.5px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    white-space: nowrap;
+  }
+  /* What the model can no longer read stays legible, and recedes. */
+  .unread { opacity: .45; }
   textarea {
     width: 100%; margin-top: 12px; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px;
@@ -774,6 +833,52 @@ keeps count of how much has gone.</span></div>
     box.hidden = true;
     box.innerHTML = "";
   };
+  // The counts under the title say how much of the transcript the model can no
+  // longer read. This says *where* the reading stops: a rule drawn into the
+  // text at the offset the server reports, with what is above it dimmed.
+  const cutOut = () => {
+    for (const el of [...doc.querySelectorAll(".cut")]) el.remove();
+    for (const child of doc.childNodes) child.classList.remove("unread");
+  };
+  const drawCut = (mark) => {
+    cutOut();
+    if (!mark) return;
+    const marker = document.createElement("span");
+    marker.className = "cut";
+    marker.dataset.label =
+      `outside the model's window · ${mark.dropped} tokens above`;
+    marker.title = `everything above this line is further back than`
+      + ` ${mark.block} tokens, so the model no longer reads it`;
+    // Land it between characters: split whichever span the offset falls inside,
+    // so every sibling is wholly above the line or wholly below it.
+    let seen = 0, placed = false;
+    for (const child of [...doc.childNodes]) {
+      const len = child.textContent.length;
+      if (seen + len >= mark.offset) {
+        const at = mark.offset - seen;
+        if (at === 0) {
+          doc.insertBefore(marker, child);
+        } else {
+          const tail = child.cloneNode(false);   // same kind of span
+          tail.textContent = child.textContent.slice(at);
+          child.textContent = child.textContent.slice(0, at);
+          doc.insertBefore(marker, child.nextSibling);
+          doc.insertBefore(tail, marker.nextSibling);
+        }
+        placed = true;
+        break;
+      }
+      seen += len;
+    }
+    // The offset is not in the document on screen — a stale reply, say. No line
+    // is better than one in the wrong place.
+    if (!placed) { cutOut(); return; }
+    let above = true;
+    for (const child of doc.childNodes) {
+      if (child === marker) { above = false; continue; }
+      child.classList.toggle("unread", above);
+    }
+  };
 
   function append(kind, text) {
     const span = document.createElement("span");
@@ -812,6 +917,9 @@ keeps count of how much has gone.</span></div>
     append("said", line + "\\n");
     live = append("reply live", "");
     transcript = prompt;
+    // The line described the transcript as it stood before this line was added,
+    // so it goes now and comes back once the reply has moved the window again.
+    cutOut();
 
     const body = settings();
     body.prompt = prompt;
@@ -825,7 +933,7 @@ keeps count of how much has gone.</span></div>
     $("send").disabled = true;
     $("stop").disabled = false;
     statusEl.textContent = "sampling…";
-    let count = 0, closing = "";
+    let count = 0, closing = "", cut = null;
 
     try {
       const response = await fetch("/api/generate", {
@@ -867,6 +975,13 @@ keeps count of how much has gone.</span></div>
               dropped_tokens: event.dropped_tokens,
               dropped_prompt_tokens: event.dropped_prompt_tokens,
             };
+            // Where the window begins, if the server could place it: null means
+            // it could not, and then nothing is drawn.
+            cut = event.dropped_tokens && event.boundary_chars !== null
+                  && event.boundary_chars !== undefined
+              ? { offset: event.boundary_chars, dropped: event.dropped_tokens,
+                  block: event.block_size }
+              : null;
           } else if (event.t === "error") {
             throw new Error(event.message);
           }
@@ -889,6 +1004,10 @@ keeps count of how much has gone.</span></div>
       controller = null;
       $("send").disabled = false;
       $("stop").disabled = true;
+      // Drawn once the reply is finished: mid-stream the window is a moving
+      // target, and an abandoned reply leaves no line at all, because the text
+      // it would have described is no longer the text on screen.
+      drawCut(cut);
       if (closing) statusEl.textContent = closing; else setStatus();
       scrollDown();
     }

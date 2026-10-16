@@ -212,6 +212,17 @@ says so in words, and the token view dims the chips the model can no longer
 attend to — so the window is a visible property of the transcript rather than a
 number you have to interpret.
 
+The page also says *where* the reading stops, not only how much has fallen out.
+`done` reports the window's opening as a character offset, and the transcript
+gets a dashed rule at that offset with the text above it dimmed — so the model's
+memory has an edge you can point at, and the characters below the line tokenise
+to exactly `block_size` tokens. The offset is measured from the visible tail
+rather than from the dropped prefix on purpose: a byte-level token can cut a
+multi-byte character in half, and the two ways of slicing then disagree by
+exactly that character. A reply that was stopped part-way leaves no line at all,
+because its boundary was never computed, and a line in the wrong place is worse
+than none.
+
 That token view also has to survive being on screen. It once did not: as a flex
 item that was allowed to shrink, it gave its height up to the transcript pane
 above it and collapsed to about twelve pixels, with hundreds of chips still in
