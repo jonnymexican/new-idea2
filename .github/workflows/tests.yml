@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Two pushes in quick succession would otherwise leave two runs racing, and
+# only the newer commit's result is worth reading. Cancelling the superseded
+# one keeps that result and spends the minutes on nothing else.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # The interpreter the checkpoint was trained and served under.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install torch (CPU build)
+        # The index URL is the one requirements.txt documents. PyPI's Linux
+        # torch wheel is the CUDA build — gigabytes of driver runtime for a
+        # job with no GPU to run it on.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Report the environment
+        # When a test fails here and not locally, the versions are the first
+        # thing worth reading, so print them before anything that can fail.
+        run: |
+          python -c "import sys; print(sys.version)"
+          python -c "import torch; print('torch', torch.__version__)"
+
+      # Two steps rather than one command: a failure then names the project it
+      # came from without opening the log.
+      - name: Training, tokeniser and web server
+        run: python -m unittest test_all -v
+
+      - name: WiFi radar
+        run: python -m unittest wifi_radar.test_radar -v
