@@ -397,7 +397,7 @@ the natural next step is reimplementing this in NumPy alone, with no autograd.
 # the same prompt, in a browser (open http://127.0.0.1:8765/)
 .venv/bin/python serve.py
 
-# train (about 10 minutes on this CPU)
+# train (a 10-minute session: --max-seconds stops it there, wherever it has got to)
 .venv/bin/python train.py --max-iters 2000
 
 # the comparison floor

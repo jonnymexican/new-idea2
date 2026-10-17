@@ -22,6 +22,7 @@ the tokenizer and the training loop are all written here; only the backward pass
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
 | `runs/` | Generated output: metrics, checkpoint, sample, loss curve (not committed) |
+| [`wifi_radar/`](wifi_radar/) | A separate project in the same repo: WiFi CSI motion sensing, no hardware needed — [its own README](wifi_radar/README.md) |
 
 ## Architecture
 
@@ -174,7 +175,7 @@ Loads `runs_tok_bpe/model.pt` by default and drops you into a prompt. A
 checkpoint carries its own tokenizer, so any run can be used:
 
 ```bash
-.venv/bin/python chat.py --checkpoint runs_v3/model.pt
+.venv/bin/python chat.py --checkpoint runs/model.pt          # the long run
 .venv/bin/python chat.py --prompt "KING HENRY:" --max-new-tokens 200
 .venv/bin/python chat.py --context 24        # hand the model a shorter window
 .venv/bin/python chat.py --prompt "KING:" --stop $'\n' --stats
@@ -233,12 +234,13 @@ repeated. `--compare path` overlays another run's validation curve:
 
 ```bash
 .venv/bin/python render_curve.py \
-    --metrics runs_v3/metrics.json \
+    --metrics runs/metrics.json \
     --baselines runs/bigram_baseline.json \
     --compare runs_baseline/metrics.json --compare-label "816K baseline" \
     --run "816K, 4 layers=runs_baseline/metrics.json" \
-    --run "2.7M, constant lr=runs/metrics.json" \
-    --run "2.7M, resumed with cosine decay=runs_v3/metrics.json"
+    --run "2.7M, constant lr=runs_larger/metrics.json" \
+    --run "2.7M, + cosine decay=runs_v3/metrics.json" \
+    --run "2.7M, + 2 h in one run=runs/metrics.json"
 ```
 
 ## Talk to it in a browser
@@ -388,40 +390,68 @@ curl -sSL -o data/input.txt \
 
 ## Results
 
-Trained on this machine — CPU only, no GPU, no pretrained weights. Three runs,
-same corpus, same context window and same batch size:
+Trained on this machine — CPU only, no GPU, no pretrained weights. Four runs,
+same corpus, same context window and same model; the fourth is the third one
+continued:
 
-| Run | Params | Steps | Wall clock | Val loss | Perplexity |
-| --- | --- | --- | --- | --- | --- |
-| Baseline | 816,128 | 1,534 | 600 s | 2.0495 | 7.76 |
-| Larger | 2,702,208 | 2,673 | 2,400 s | 1.8249 | 6.20 |
-| **Larger, resumed with cosine decay** | **2,702,208** | **4,206** | **4,801 s** | **1.7018** | **5.48** |
+| Run | Params | Steps | Tokens seen | Wall clock | Val loss | Perplexity |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline | 816,128 | 1,534 | 1.6 M | 600 s | 2.0495 | 7.76 |
+| Larger | 2,702,208 | 2,673 | 2.7 M | 2,400 s | 1.8249 | 6.20 |
+| Larger, resumed with cosine decay | 2,702,208 | 4,206 | 4.3 M | 4,801 s | 1.7018 | 5.48 |
+| **Larger, two more hours in one unattended run** | **2,702,208** | **14,706** | **25.8 M** | **11,930 s** | **1.5289** | **4.61** |
 
-Every run stopped at its wall-clock budget rather than converging, so these are
-where each got to in the time available, not the models' limits. Tripling the
-parameters and quadrupling the time bought **0.225 nats**. The third run is the
-second one *continued*: same weights, same batch size, same peak learning rate,
-with the constant rate replaced by a warmup-then-cosine-decay schedule. That
-change alone is worth a further **0.123 nats** — and unlike the first two, it
-finishes with its learning rate at the floor, having actually settled.
+The first three stopped at their wall-clock budget rather than converging, so
+they show where each got to in the time available. The fourth ran out of
+*schedule* instead of time: it completed all 10,500 steps with 71 s of
+its two-hour budget to spare, and the learning rate reached its floor of
+3e-05 exactly as the steps ran out. It is the only run here that
+finished what it set out to do.
+
+```bash
+# the long run: continue the cosine-decay checkpoint for two more hours
+.venv/bin/python train.py --resume runs_v3/model.pt --out-dir runs \
+    --max-iters 10500 --max-seconds 7200 --eval-interval 200 \
+    --checkpoint-interval 1000 --sample-tokens 1200
+```
+
+Tripling the parameters and quadrupling the time bought **0.2246 nats**.
+Replacing the constant rate with a warmup-then-cosine decay bought
+**0.1231** more. Two further hours — 21.5 M tokens at
+the default batch size of 32 — bought **0.1729**:
 
 | What changed | Val loss |
 | --- | --- |
 | 816K params | 2.0495 |
 | 3.3x the parameters | 1.8249 |
-| + cosine decay instead of a constant rate | **1.7018** |
+| + cosine decay instead of a constant rate | 1.7018 |
+| + 2 h in one unattended run (25.8 M tokens) | **1.5289** |
 
-The earlier runs are kept in `runs_baseline/` and `runs/` so all three curves
-can be drawn together.
+Two things to know about that last number. It is the run's *final* evaluation;
+the curve's minimum is 1.4797 at step 14,206, and over the last 2,400 steps
+the validation loss bounced between 1.4797 and 1.5378 with no
+trend left in it — a spread of 0.06 that is mostly
+evaluation noise from scoring 20 sampled batches, so treat differences smaller
+than that as noise and read the curve rather than one number. The batch size also
+changed for this run (16 in the first three, where the flag was passed
+explicitly, and the default 32 here), which is why the table counts tokens rather
+than trusting steps: 21.5 M tokens in two hours against
+4.3 M in the four hours before it, at
+**3,017 tokens/s**.
+
+The earlier runs are kept in `runs_baseline/` (the 816K model), `runs_larger/`
+(the constant-rate 2.7M model) and `runs_v3/` (the same model after cosine
+decay), so the curves can be drawn together; `runs/` holds the long run.
 
 ### How it compares
 
 | Model | Val loss (nats) | Perplexity |
 | --- | --- | --- |
 | Uniform — guess any of the 65 characters | 4.1744 | 65.00 |
-| Bigram — sees only the previous character | 2.4838 | 11.99 || **Transformer** — sees 64 characters | **1.7018** | **5.48** |
+| Bigram — sees only the previous character | 2.4838 | 11.99 |
+| **Transformer** — sees 64 characters | **1.5289** | **4.61** |
 
-Context and attention are worth **0.782 nats** over the bigram floor.
+Context and attention are worth **0.955 nats** over the bigram floor.
 
 ### Character-level vs subword
 
@@ -494,36 +524,62 @@ configuration, so treat the sizes of these effects as indicative, not measured.
 
 ### Sample output
 
-Generated at temperature 0.8, top-k 200, from a single newline seed:
+Generated at temperature 0.8, top-k 200, from a single newline seed, after the
+two-hour run:
 
 ```text
-HENRY BOLINGBROKE:
-Why, and Norfrom, in some such in their for thee
-What would see that strangth nocks of bleasom
-Lick us die theefore of that broth handers' fullina,
-Which thy much fil he requititer with which untor,
-Shall they wirldievent! Came to are crown
-To thing foul infrom Rave.
-Why, here she'st is you like your soul vires!
+I will cunnible sound on born: both helps
+If she were repored? all this is cried,
+Great to whom he prays heart them.
 
-MISAULET:
-On than I deher's quittlaan and no the be?
+First Murderer:
+Believe my needs: but I know with me confess
+Whiles me confined.
 
-FLIDGREY:
-He cause your denour words in where beet upinit.
+ROMEO:
+I do be, and not much this that I can past the
+return of heir wills throne into her slowned
+So with all vies twird and his heart in them
+Of comminments, let's go see her with heaven?
 
-TRANIO:
-Yet of my bide lord?
-I death, when twill in her come rised:
-I speach so me we enee' that may pear, I well
-Then ficears am my willow and feephle
+LADY ady:
+Go sink me be thus would in the lettern do prose.
+As stoolf sweet by his flesh friend,
+And never shall to the before I that for death.
+It is true of my father man be a mouled a
+resign or any foul honour by his poor willingbrows,
+And waw, countenance, that sound it were weat;
+and makes him in my so half fear it our friends,
+And in deathful stand well thy law hold,
+And all slowed them with me and thee and in hell.
+Thy curses sharp and head blackard stow the air,
+And which every hour made foesters than a straight
+In the air the tributs of a brotherhing strunky?
+Or my parlets, the droce of heart and die,
+And women of my charge. It will not shame thy bajest
+Inswerace with earlth all that arm than from you than brazen
+To promiss the very stroke.
+
+Provost:
+No; therefore short canst breath from t
 ```
 
-It has learned speaker names in capitals (`HENRY BOLINGBROKE`, `TRANIO`),
-line breaks, punctuation and the shape of English words — `crown`, `soul`,
-`willow` and `speach` are all recognisable, and `Why,` opens a line the way
-Shakespeare does. It has **not** learned to be coherent — expected for ~2.7 M
-parameters trained for eighty minutes on a CPU.
+The register arrives. `First Murderer`, `ROMEO` and `Provost` are speakers that
+occur in the corpus, the line breaks and punctuation land where Shakespeare puts
+them, and most lines read as English — `Believe my needs: but I know with me
+confess / Whiles me confined.` Two hours moved it from *words that look like
+words* to *lines that read like lines*.
+
+Sense is what did not arrive. `slowned`, `cunnible`, `bajest`, `strunky` and
+`Inswerace` are inventions, and read end to end the sample is pleasant noise
+rather than a scene. Two reasons, both structural rather than accidental: the
+context window is 64 characters, which is not enough to remember who is speaking
+or what was just said, and the model has now read the corpus 23 times,
+so its training loss (1.235) has pulled well clear of its
+validation loss (1.529). It is fitting this corpus rather than the language.
+At this context length another few hours would buy a little more fluency, not
+coherence — read the sample as "the model has learned to sound like Shakespeare",
+not "the model has learned Shakespeare".
 
 The same architecture with the BPE tokenizer, after 1,000 steps:
 
@@ -556,13 +612,15 @@ They are anou cause: by my
 Theraciouser was beav I seght, like out the pard
 ```
 
-The difference is qualitative, not just numerical. The subword run produces whole
-English words — `myself`, `loved`, `thou`, `night`, `sir` — where the
-character-level run is still largely letter-soup, and its speaker names at least
-sit in the right register. That is what 0.4 bits/char looks like on the page, and
-it is the same reason the tokenizer improves the bigram floor too.
+Those two samples are no longer a fair fight and should not be read as one: the
+character-level text above is from the long run (25.8 M tokens) and the subword
+text from a 1,000-step run (1.7 M tokens), so the subword sample is the rougher of
+the two. What the matched pair in *Character-level vs subword* measures is the
+floor at equal steps — about 0.42 bits/char in the subword run's favour — and both
+tokenizers beat their own bigram floor. No tokenizer setting buys coherence: the
+context window and the size of the corpus are what bound it.
 
-Curves are written to `runs_v3/loss_curve.html` (character-level, in nats) and
-`runs_tok_bpe/loss_curve.html`, which overlays both tokenizers on one bits-per-
-character axis. Training mechanics are explained in
+Curves are written to `runs/loss_curve.html` (the long character-level run, in
+nats) and `runs_tok_bpe/loss_curve.html`, which overlays both tokenizers on one
+bits-per-character axis. Training mechanics are explained in
 [HOW_IT_WORKS.md](HOW_IT_WORKS.md).
