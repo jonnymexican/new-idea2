@@ -31,14 +31,19 @@ README depends on:
   the integer precision a real logger would use, because that format is the
   path real hardware will take;
 - the source spec refuses the serial case with a useful message instead of
-  pretending to have hardware.
+  pretending to have hardware;
+- a nexmon packet is decoded from the layout the firmware documents, at all
+  three channel widths and with both header revisions, and frames pushed through
+  a real UDP socket reach the detector as the same walk a simulated source
+  produces — the hardware path, exercised without the hardware.
 
 Run with:  .venv/bin/python -m unittest wifi_radar.test_radar
 """
 
+import socket
 import unittest
 
-from wifi_radar import csi, detect
+from wifi_radar import csi, detect, nexmon
 
 
 def collect(source, detector, limit=None):
@@ -489,6 +494,220 @@ class TestPacing(unittest.TestCase):
         self.assertEqual(len(frames), 10)
 
 
+class TestNexmonPackets(unittest.TestCase):
+    """
+    The parser, held to the firmware's documented layout.
+
+    The payload is built here from the byte layout rather than copied from an
+    implementation, so this is a check against the format and not a check that
+    the parser agrees with itself. The two header revisions are the trap: the
+    fields sit at the same offset *relative to the CSI*, which is why one parser
+    can read both, and a mistake there still yields a frame — just the wrong one.
+    """
+
+    def tones(self, count, scale=1.0):
+        """Distinct, exactly representable values, so any shift is visible."""
+        return [complex(scale * (i + 1), scale * -(i + 1)) for i in range(count)]
+
+    def test_every_width_decodes_exactly_with_either_header(self):
+        for count in (64, 128, 256):
+            for header in (18, 20):
+                values = self.tones(count)
+                packet = nexmon.parse_payload(
+                    nexmon.build_payload(values, header=header))
+                self.assertEqual(packet.values, values, f"{count} tones, {header}B")
+                self.assertEqual(packet.header, header)
+                self.assertEqual(packet.bandwidth_mhz, nexmon.BANDWIDTH_MHZ[count])
+
+    def test_header_fields_are_read_where_the_header_puts_them(self):
+        """A header-length mistake shifts every field, so pin each one."""
+        for header in (18, 20):
+            packet = nexmon.parse_payload(nexmon.build_payload(
+                self.tones(64), sequence=513, core=1, chanspec=0x1006, chip=0x2b55,
+                header=header))
+            self.assertEqual(packet.sequence, 513, f"{header}B header")
+            self.assertEqual(packet.core, 1, f"{header}B header")
+            self.assertEqual(packet.chanspec, 0x1006, f"{header}B header")
+            self.assertEqual(packet.chip, 0x2b55, f"{header}B header")
+
+    def test_int16_values_are_not_rescaled_on_the_way_in(self):
+        """
+        Real CSI is the receiver's own uncalibrated scale, thousands not ones,
+        and the detector normalises per frame. Clipping or normalising here
+        would throw that away before the code that relies on it sees it.
+        """
+        values = self.tones(64, scale=400.0)
+        packet = nexmon.parse_payload(nexmon.build_payload(values))
+        self.assertEqual(packet.values, values)
+
+    def test_the_rssi_fork_is_recognised_and_stock_is_not(self):
+        stock = nexmon.parse_payload(nexmon.build_payload(self.tones(64)))
+        self.assertIsNone(stock.rssi)
+        forked = nexmon.parse_payload(
+            nexmon.build_payload(self.tones(64), rssi=-63))
+        self.assertEqual(forked.rssi, -63)
+        self.assertEqual(forked.values, self.tones(64), "RSSI byte must not shift the CSI")
+
+    def test_an_unknown_length_is_refused_with_the_accepted_sizes(self):
+        """Half-parsing the wrong 256 bytes would report nonsense all session."""
+        with self.assertRaises(ValueError) as caught:
+            nexmon.parse_payload(b"\x11" * 200)
+        message = str(caught.exception)
+        self.assertIn("200", message)
+        self.assertIn("274", message)
+        self.assertIn("1044", message)
+
+    def test_a_hand_written_packet_decodes_the_way_the_documentation_reads(self):
+        """
+        The one check that is not circular: this payload is written out byte by
+        byte from the documented offsets, not through `build_payload`. If the
+        builder and the parser shared a mistaken offset, every other test here
+        would still pass; this one would not.
+
+            0-3   magic            11 11 11 11
+            4-5   extra magic      11 11          (20-byte header only)
+            6-11  source MAC       02 00 00 00 00 01
+            12-13 sequence         02 01          = 258
+            14-15 core             01 00          = 1
+            16-17 chanspec         06 10          = 0x1006
+            18-19 chip             45 43          = 0x4345
+            20-  CSI               64 * (int16 real, int16 imaginary)
+        """
+        header = bytes([0x11] * 6 + [0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+                                     0x02, 0x01, 0x01, 0x00, 0x06, 0x10,
+                                     0x45, 0x43])
+        import struct
+        payload = header + b"".join(struct.pack("<hh", i, -i) for i in range(64))
+        self.assertEqual(len(payload), 276)
+
+        packet = nexmon.parse_payload(payload)
+        self.assertEqual(packet.header, 20)
+        self.assertEqual(packet.sequence, 258)
+        self.assertEqual(packet.core, 1)
+        self.assertEqual(packet.chanspec, 0x1006)
+        self.assertEqual(packet.chip, 0x4345)
+        self.assertIsNone(packet.rssi)
+        self.assertEqual(packet.values[0], 0j)
+        self.assertEqual(packet.values[1], complex(1, -1))
+        self.assertEqual(packet.values[63], complex(63, -63))
+
+    def test_a_payload_without_the_magic_is_refused(self):
+        payload = b"\x00\x00" + nexmon.build_payload(self.tones(64))[2:]
+        with self.assertRaises(ValueError) as caught:
+            nexmon.parse_payload(payload)
+        self.assertIn("magic", str(caught.exception))
+
+
+class TestNexmonSource(unittest.TestCase):
+    """
+    The socket, the timestamps and the refusals — on a real local socket.
+
+    A mocked socket would prove the parser and nothing about the thing that
+    actually goes wrong on a desk: packets that are not CSI, a second core, or
+    silence. So this binds a real port on loopback and sends real datagrams.
+    """
+
+    def loopback(self, **kwargs):
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        address = receiver.getsockname()
+        kwargs.setdefault("timeout", 2.0)
+        source = nexmon.NexmonSource(sock=receiver, **kwargs)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sender.close)
+        self.addCleanup(source.close)
+        return sender, address, source
+
+    def test_a_frame_arrives_over_the_socket_with_its_arrival_time(self):
+        sender, address, source = self.loopback(rate=25.0)
+        sender.sendto(nexmon.build_payload(TestNexmonPackets().tones(64),
+                                           sequence=7), address)
+        frame = next(source)
+        self.assertEqual(len(frame.values), 64)
+        self.assertAlmostEqual(frame.t, 0.0, places=6)
+        self.assertEqual(source.frames, 1)
+        self.assertIn("64 tones", source.describe())
+        self.assertIn("20 MHz", source.describe())
+
+    def test_a_walk_detected_through_the_socket_matches_the_simulator(self):
+        """
+        The claim the whole hardware seam rests on: frames encoded the way the
+        firmware encodes them, sent over UDP, reach the detector as the same
+        walk. Scaled to the receiver's int16 range so quantisation is the real
+        kind, not the simulator's.
+        """
+        simulated = list(csi.SyntheticSource(scenario="walk", seed=37, seconds=20.0))
+        # A clock that ticks one frame per packet: loopback delivers 400 frames
+        # in a few milliseconds, and a detector timestamped by real arrivals
+        # would think the whole walk happened at t=0.
+        ticks = [0.0]
+
+        def clock():
+            now = ticks[0]
+            ticks[0] += 0.05
+            return now
+
+        sender, address, source = self.loopback(clock=clock)
+        detector = detect.MotionDetector(rate=20.0)
+        detections = []
+        for i, frame in enumerate(simulated):
+            # One at a time: a burst of 400 datagrams can overflow the receive
+            # buffer and drop frames, which would be the test failing on the
+            # operating system rather than on the code.
+            sender.sendto(nexmon.build_payload([v * 512 for v in frame.values],
+                                              sequence=i), address)
+            detections.append(detector.update(next(source)))
+        self.assertGreaterEqual(detection_rate(detections, 6.0, 14.5), 0.85)
+        self.assertLessEqual(detection_rate(detections, 0.0, 3.0), 0.15)
+
+    def test_silence_says_what_to_check_instead_of_hanging(self):
+        _, _, source = self.loopback(timeout=0.05)
+        with self.assertRaises(TimeoutError) as caught:
+            next(source)
+        message = str(caught.exception)
+        self.assertIn("nexmon_csi", message)
+        self.assertIn(str(source.port), message)
+
+    def test_other_traffic_on_the_port_is_skipped_and_counted(self):
+        sender, address, source = self.loopback()
+        sender.sendto(b"hello", address)
+        sender.sendto(b"\x11" * 300, address)
+        sender.sendto(nexmon.build_payload(TestNexmonPackets().tones(64)), address)
+        frame = next(source)
+        self.assertEqual(len(frame.values), 64)
+        self.assertEqual(source.rejected, 2)
+        # The first refusal is kept, because that is the one worth showing a
+        # user: later junk is usually the same mistake repeated.
+        self.assertIn("not a nexmon CSI frame", source.rejection or "")
+
+    def test_a_stream_of_nothing_but_junk_fails_loudly(self):
+        """Skipping forever would look exactly like a working radar."""
+        sender, address, source = self.loopback()
+        for _ in range(nexmon.MAX_REJECTED):
+            sender.sendto(b"not csi at all", address)
+        with self.assertRaises(ValueError) as caught:
+            next(source)
+        self.assertIn("none was a nexmon CSI frame", str(caught.exception))
+
+    def test_a_second_core_is_ignored_because_it_is_a_second_channel(self):
+        """
+        Interleaving two cores' frames is not one channel sampled twice — it is
+        two — and it reads as violent motion. The extractor usually runs one
+        core, so the first seen wins and the rest are counted.
+        """
+        sender, address, source = self.loopback()
+        values = TestNexmonPackets().tones(64)
+        sender.sendto(nexmon.build_payload(values, core=0, sequence=1), address)
+        sender.sendto(nexmon.build_payload(values, core=1, sequence=2), address)
+        sender.sendto(nexmon.build_payload(values, core=0, sequence=3), address)
+        first = next(source)
+        second = next(source)
+        self.assertEqual(source.frames, 2)
+        self.assertEqual(source.other_cores, 1)
+        self.assertIn("other cores", source.describe())
+        self.assertLess(first.t, second.t)
+
+
 class TestSourceSpec(unittest.TestCase):
     def test_each_spec_kind_builds_a_source(self):
         import tempfile
@@ -534,6 +753,32 @@ class TestSourceSpec(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("sim:", message)
         self.assertIn("demo", message)
+
+    def test_a_udp_spec_binds_the_port_it_names(self):
+        """A free port is borrowed and released, so CI cannot collide on 5500."""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        source = csi.open_source(f"udp:127.0.0.1:{port}", rate=33.0)
+        self.addCleanup(source.close)
+        self.assertIsInstance(source, nexmon.NexmonSource)
+        self.assertEqual(source.port, port)
+        self.assertEqual(source.host, "127.0.0.1")
+        self.assertEqual(source.rate, 33.0)
+
+    def test_a_udp_spec_without_a_port_uses_nexmons_default(self):
+        # The split is checked directly rather than by binding 5500, which a
+        # real listener on the same machine may already hold.
+        self.assertEqual(csi._udp_spec("udp:", ""), ("0.0.0.0", nexmon.DEFAULT_PORT))
+        self.assertEqual(csi._udp_spec("nexmon:", ""), ("0.0.0.0", nexmon.DEFAULT_PORT))
+        self.assertEqual(csi._udp_spec("udp:", "5501"), ("0.0.0.0", 5501))
+
+    def test_a_udp_spec_with_a_bad_port_says_so(self):
+        with self.assertRaises(ValueError) as caught:
+            csi.open_source("udp:notaport")
+        self.assertIn("numeric port", str(caught.exception))
 
     def test_the_named_scenarios_all_can_be_built(self):
         """Every name in the menu has to work, not just the ones the tests use."""

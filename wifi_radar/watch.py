@@ -92,7 +92,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", default="sim:demo",
-                        help="sim:<scenario>, file:<path> or serial:<port>")
+                        help="sim:<scenario>, file:<path>, udp:[host:]port "
+                             "(nexmon CSI) or serial:<port>")
     parser.add_argument("--seconds", type=float, default=40.0,
                         help="how long to watch, in seconds of session time")
     parser.add_argument("--rate", type=float, default=20.0, help="frames per second")
@@ -127,6 +128,7 @@ def main(argv=None):
     last_line = 0.0
     started = time.time()
     read = 0
+    failed = None
     try:
         for frame in paced:
             if args.seconds and frame.t > args.seconds:
@@ -147,6 +149,13 @@ def main(argv=None):
                     print(line, flush=True)
     except KeyboardInterrupt:
         print("\nstopped")
+    except (TimeoutError, OSError, ValueError) as error:
+        # A hardware source fails in ways a simulated one cannot: nothing
+        # arriving at all, or a packet that is not CSI. Printing the traceback
+        # buries the one line that says which, and the message is written to be
+        # read (see nexmon.NexmonSource).
+        failed = error
+        print(f"\nerror: {error}", file=sys.stderr)
     finally:
         if recorded:
             recorded.close()
@@ -154,7 +163,7 @@ def main(argv=None):
     if interactive:
         sys.stdout.write("\r" + " " * 96 + "\r")
     print(summarise(detections, detector.floor, time.time() - started, read))
-    return 0
+    return 2 if failed else 0
 
 
 if __name__ == "__main__":

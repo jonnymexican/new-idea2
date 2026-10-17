@@ -57,7 +57,6 @@ class RadarSession:
     def __init__(self, source, realtime=True):
         self.source = csi.PacedSource(source, realtime=realtime)
         self.detector = detect.MotionDetector(rate=self.source.rate)
-        self.description = self.source.describe()
         self.lock = threading.Lock()
         self.trace = deque(maxlen=TRACE_FRAMES)
         self.latest = None
@@ -66,6 +65,17 @@ class RadarSession:
         self.finished = False
         self._stop = threading.Event()
         self._thread = None
+
+    @property
+    def description(self):
+        """
+        Asked every time rather than captured once: a live source learns things
+        as it runs — how many tones, which header revision, how fast frames are
+        actually arriving — and a page that still says "waiting for packets"
+        while drawing a trace is the kind of contradiction that makes a reader
+        distrust the trace.
+        """
+        return self.source.describe()
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -393,7 +403,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", default="sim:demo",
-                        help="sim:<scenario>, file:<path> or serial:<port>")
+                        help="sim:<scenario>, file:<path>, udp:[host:]port "
+                             "(nexmon CSI) or serial:<port>")
     parser.add_argument("--seconds", type=float, default=0.0,
                         help="session length in seconds; 0 (the default) runs "
                              "until stopped")

@@ -9,7 +9,7 @@ seam is the point of the design, not a side effect.
 ```bash
 .venv/bin/python -m wifi_radar.watch                    # live trace in the terminal
 .venv/bin/python -m wifi_radar.live                     # live view in a browser
-.venv/bin/python -m unittest wifi_radar.test_radar      # 36 tests, no dependencies
+.venv/bin/python -m unittest wifi_radar.test_radar      # 52 tests, no dependencies
 ```
 
 Nothing here is measured from a real radio yet. Every number below comes from
@@ -130,7 +130,8 @@ choice costs.
 | [`detect.py`](detect.py) | The metric, calibration, presence, the FFT and the Doppler band |
 | [`watch.py`](watch.py) | The terminal trace |
 | [`live.py`](live.py) | The browser view (standard library server, no dependencies) |
-| [`test_radar.py`](test_radar.py) | 36 tests against simulated ground truth |
+| [`nexmon.py`](nexmon.py) | Real frames off the wire: the nexmon packet layout and the UDP source |
+| [`test_radar.py`](test_radar.py) | 52 tests against simulated ground truth |
 
 ## Attaching a real radio
 
@@ -146,7 +147,7 @@ it. So the practical options are:
 | Route | Cost | Bandwidth | What it buys |
 | --- | --- | --- | --- |
 | **ESP32-S3, e.g. [esp-csi](https://github.com/espressif/esp-csi)** | $10–15 per board | 2.4 GHz, 20 MHz | Per-subcarrier CSI over USB; motion and presence exactly as modelled here. The right first purchase |
-| **Raspberry Pi 5 + [nexmon_csi](https://github.com/seemoo-lab/nexmon_csi)** | ~$70–120 | up to 80 MHz | 4x finer range bins (1.9 m), a separate capture appliance |
+| **Raspberry Pi 3B+, 4B or 5 + [nexmon_csi](https://github.com/seemoo-lab/nexmon_csi)** | ~$35–120 | up to 80 MHz | 4x finer range bins (1.9 m) at 80 MHz, a separate capture appliance. Broadcasts CSI as UDP, which `udp:` already reads |
 | **Intel AX210 + [PicoScenes](https://ps.zpj.io/)** | $30–60 | up to 160 MHz | A research rig: ~1 kHz CSI, 0.94 m range bins. Needs native Ubuntu, not WSL |
 
 Range resolution is the reason that column matters: at 20 MHz, two people 3 m
@@ -154,6 +155,51 @@ apart are in the same bin, and no amount of cleverness changes that. If the goal
 is presence and movement — which is where this project is — a $10 ESP32 is
 enough. If the goal is range, no ESP32 will do and the answer is 80–160 MHz and
 a Linux capture host.
+
+### If you already have a Raspberry Pi
+
+The Pi is the one option here that may already be on your desk, and it needs no
+adapter: it broadcasts CSI as UDP and `udp:` reads it directly. Two things decide
+whether it will work.
+
+**The radio.** nexmon_csi patches the **BCM43455c0**, which is the WiFi chip in
+the **Pi 3B+, 4B and 5**. The Pi Zero 2 W (BCM43436) and Pi 400 (BCM43456) have
+different radios with no CSI patch — Nexmon supports them for other features,
+which is not the same thing. Identify the board from the board itself rather
+than from the silkscreen or the box it came in:
+
+```bash
+cat /sys/firmware/devicetree/base/model      # "Raspberry Pi 4 Model B Rev 1.4", etc.
+dmesg | grep -i brcmfmac | head -3           # the chip firmware version it loaded
+```
+
+**The firmware.** The CSI patch is written for firmware **7_45_189**; the newer
+7_45_234 is not supported by it, and picking the wrong one is the standard way
+this fails. The Pi 5 additionally needs the `kernel8.img` (64-bit, 4K pages)
+boot image. Both are in the project's own instructions; the current
+`Makefile.rpi` route also avoids the old modified-driver step that a kernel
+update used to break.
+
+Then, with the Pi patched, on the machine that should process the frames:
+
+```bash
+.venv/bin/python -m wifi_radar.nexmon --port 5500          # is anything arriving?
+.venv/bin/python -m wifi_radar.watch --source udp:5500
+.venv/bin/python -m wifi_radar.watch --source udp:5500 --record real.jsonl
+```
+
+The first command is the one to run first: it prints the first packets' tone
+count, header length, sequence and core, so a working capture is visible before
+the detector is involved. If nothing arrives it says which three things to
+check, because **nexmon extracts one frame per received WiFi frame** — an idle
+channel produces no data at all, and a Pi with stock firmware produces none ever.
+
+Two consequences of the Pi being the sensor: its own `wlan0` is busy capturing,
+so connect to it over Ethernet, and something else on the channel (your access
+point) has to be transmitting for there to be frames to measure. Reported rates
+are around 50 frames/s, comfortably above the 20 the views are tuned for;
+`--rate` sets the number the Doppler axis is scaled by, and `describe()` reports
+what is actually arriving.
 
 **The interface to implement.** A logger should write one JSON object per frame:
 
@@ -170,16 +216,23 @@ Record a session, then:
 .venv/bin/python -m wifi_radar.watch --source file:session.jsonl
 ```
 
+`nexmon.py` is that interface for the Pi: it decodes the packet layout the
+firmware documents — int16 real/imaginary pairs behind an 18- or 20-byte header,
+64/128/256 tones for 20/40/80 MHz — and hands the detector frames with only the
+timestamp added. Payload length fingerprints the header revision, so a packet is
+either decoded exactly or refused with the accepted sizes; misreading 256 bytes
+silently would report confident nonsense for the rest of the session.
+
 `open_source("serial:...")` deliberately raises rather than inventing frames —
 there is no CSI on a USB port until something on the other end produces it.
-When there is, the adapter belongs in `csi.py` next to the other sources, and it
-should emit exactly that JSON shape. The round-trip through that format is
-already tested at the integer precision a real logger uses, including that
-quantisation does not break detection.
+When an ESP32 is attached, its adapter belongs in `csi.py` next to the other
+sources, and it should emit exactly that JSON shape. The round-trip through that
+format is already tested at the integer precision a real logger uses, including
+that quantisation does not break detection.
 
 ## The tests
 
-`python -m unittest wifi_radar.test_radar` — 36 tests, standard library only,
+`python -m unittest wifi_radar.test_radar` — 52 tests, standard library only,
 under a minute. They can be strict because the simulator knows the answer:
 it knows when the person is walking, at what cadence, and when the room is
 empty.
@@ -193,7 +246,20 @@ wander not registering as movement; a frame-wide gain change measuring *exactly*
 zero; a session surviving the recording round trip; and the source spec refusing
 the serial case with a message that points somewhere.
 
-Four bugs were found by these tests before any of it was wired to a view, and
+The hardware path is tested without the hardware. A payload builder writes the
+byte layout the firmware documents, so the parser is checked against the format
+rather than against itself: all three channel widths, both header revisions,
+int16 values passed through unchanged, the RSSI fork's extra byte not shifting
+the CSI, and unknown lengths and missing magic refused instead of half-parsed.
+Then frames are pushed through a **real loopback UDP socket** into the detector —
+97.6% of the walking frames flagged, 0% of the quiet ones, the same 1.72 Hz peak
+as the simulated source — plus the things that actually go wrong on a desk: junk
+on the port skipped and counted, a stream of nothing but junk failing loudly
+rather than looking like a quiet room, a second core ignored before it can
+interleave two channels into fake motion, and silence producing a message that
+names the three things to check.
+
+Five bugs were found by these tests before any of it was wired to a view, and
 worth naming because each would have been comfortable to believe: the simulator
 originally omitted the carrier phase term (leaving a channel almost inert to
 motion, which would have validated the detector on a signal with no Doppler in
@@ -201,4 +267,8 @@ it); `power_spectrum` windowed its own zero-padding, which put a large
 low-frequency spike under a perfectly constant input; the metric's claimed
 gain-invariance was false as first written, and is exact now; and the simulated
 walker's torso sway initially outweighed their stride, so their path speed
-crossed zero mid-walk and a correctly-working detector reported nothing.
+crossed zero mid-walk and a correctly-working detector reported nothing. The
+nexmon parser added one of its own: the first version of the walk test fed
+frames over a real socket but timestamped them from the real clock, so 400
+frames arrived in a few milliseconds, every frame sat at `t≈0`, and the test
+reported zero detections — the frames were fine, the clock was wrong.

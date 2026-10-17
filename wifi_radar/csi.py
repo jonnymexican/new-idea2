@@ -485,16 +485,20 @@ def open_source(spec, **kwargs):
     """
     Build a source from a one-line spec, which is how the tools choose one:
 
-        sim:demo           a simulated room (any name in SCENARIOS)
-        file:session.jsonl a recorded session
-        serial:/dev/ttyUSB0  a receiver (not implemented — see below)
+        sim:demo             a simulated room (any name in SCENARIOS)
+        file:session.jsonl   a recorded session
+        udp:5500             CSI packets off the wire (nexmon_csi on a Pi)
+        udp:10.0.0.5:5500    ... on a specific address
+        serial:/dev/ttyUSB0  a USB receiver (not implemented — see below)
 
     The serial case raises rather than pretending. CSI does not come out of a
     laptop's own WiFi card: Windows exposes RSSI and nothing else, and a Linux
-    monitor-mode capture needs a specific chip and a patched driver. The
-    practical first receiver is an ESP32, which streams frames over USB; when one
-    is attached, the adapter belongs here, emitting the same JSON Lines shape
-    that `read_recording` already reads, so nothing downstream changes.
+    monitor-mode capture needs a specific chip and a patched driver. The two
+    practical receivers are an ESP32, which streams frames over USB, and a
+    Raspberry Pi running nexmon_csi, which broadcasts them as UDP and is what
+    `udp:` speaks. When a USB receiver is attached, its adapter belongs here,
+    emitting the same JSON Lines shape that `read_recording` already reads, so
+    nothing downstream changes.
     """
     kind, _, rest = spec.partition(":")
     if kind == "sim":
@@ -506,14 +510,48 @@ def open_source(spec, **kwargs):
         # a rate flag that silently contradicted a recording would be a quiet
         # way to get every frequency in the view wrong.
         return RecordingSource(rest)
+    if kind in ("udp", "nexmon"):
+        # Imported here so csi.py stays importable on its own: nexmon.py imports
+        # this module for Frame, and the cycle only works at call time.
+        from wifi_radar import nexmon
+
+        host, port = _udp_spec(spec, rest)
+        # `seconds` is the caller's business — watch.py stops on frame time —
+        # but the rate is the detector's Doppler scale, so it is honoured.
+        return nexmon.NexmonSource(host=host, port=port,
+                                   rate=kwargs.get("rate", 20.0))
     if kind == "serial":
         raise ValueError(
             f"serial source {rest!r} is not implemented yet. Pump frames from the "
             "device into the JSON Lines format read_recording() accepts, then "
-            "replay them with file:<path>. See README.md in this directory for the "
-            "hardware options and what each one can and cannot measure."
+            "replay them with file:<path>; a Raspberry Pi running nexmon_csi "
+            "needs no adapter at all — use udp:<port>. See README.md in this "
+            "directory for the hardware options and what each one can and cannot "
+            "measure."
         )
     raise ValueError(
-        f"unknown source {spec!r}: expected sim:<scenario>, file:<path> or "
-        f"serial:<port>. Scenarios: {', '.join(sorted(SCENARIOS))}"
+        f"unknown source {spec!r}: expected sim:<scenario>, file:<path>, "
+        f"udp:[host:]port or serial:<port>. "
+        f"Scenarios: {', '.join(sorted(SCENARIOS))}"
     )
+
+
+def _udp_spec(spec, rest):
+    """Split the tail of a `udp:` spec into host and port."""
+    host = "0.0.0.0"
+    if not rest:
+        port = 5500
+    elif ":" in rest:
+        host, _, port = rest.rpartition(":")
+        host = host or "0.0.0.0"
+    else:
+        port = rest
+    try:
+        port = int(port)
+    except ValueError:
+        raise ValueError(
+            f"source {spec!r} needs a numeric port, got {port!r}; write "
+            f"udp:5500 or udp:<host>:5500") from None
+    if not 0 < port < 65536:
+        raise ValueError(f"source {spec!r} has port {port}, outside 1-65535")
+    return host, port
