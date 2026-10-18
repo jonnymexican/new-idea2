@@ -45,6 +45,64 @@ def sample_next(logits, temperature=1.0, top_k=None, top_p=None):
     return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
 
 
+class KVCache:
+    """The keys and values already computed for a prefix, so a new token only
+    needs its own query.
+
+    Attention is causal, so a token's key and value never change once computed:
+    position t's key depends on the token at t and nothing after it. The only
+    thing generation needs from the past is therefore these tensors, and
+    recomputing them for every new token — which is what an uncached loop does —
+    is the same arithmetic repeated T times for no new information.
+
+    `length` is how many positions the entries cover. Truncating is how a
+    speculative round discards the guesses the target rejected: their entries
+    were computed, and then found to be about text that is not going to exist.
+    """
+
+    def __init__(self, n_layers):
+        self.entries = [None] * n_layers
+        self.length = 0
+
+    def __len__(self):
+        return self.length
+
+    def get(self, layer):
+        return self.entries[layer]
+
+    def set(self, layer, k, v):
+        self.entries[layer] = (k, v)
+
+    def copy_prefix(self, n_layers):
+        """A cache covering the same positions using only the first layers.
+
+        The first k layers of a truncated model compute exactly the same hidden
+        states as the first k layers of the full one, so a draft model can start
+        from the target's own work instead of re-reading the prefix.
+        """
+        cache = KVCache(n_layers)
+        cache.length = self.length
+        for layer in range(n_layers):
+            entry = self.entries[layer]
+            if entry is not None:
+                cache.set(layer, entry[0].clone(), entry[1].clone())
+        return cache
+
+    def truncate(self, length):
+        """Forget every position at or after `length`."""
+        length = max(0, int(length))
+        for layer, entry in enumerate(self.entries):
+            if entry is not None:
+                self.entries[layer] = (entry[0][:, :, :length, :],
+                                       entry[1][:, :, :length, :])
+        self.length = min(self.length, length)
+
+    def memory_bytes(self):
+        return sum(e[0].numel() * e[0].element_size()
+                   + e[1].numel() * e[1].element_size()
+                   for e in self.entries if e is not None)
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head masked self-attention over a fixed-size context window.
 
@@ -72,7 +130,14 @@ class CausalSelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, x):
+    def forward(self, x, cache=None, layer=0, pos_offset=0):
+        """Attend over the new tokens, and over the cache of everything before.
+
+        Without a cache this is the original full-window attention. With one,
+        the new keys and values are appended to what is already there, so a
+        single-token call attends over the whole prefix instead of recomputing
+        it.
+        """
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
 
@@ -81,9 +146,26 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
+        if cache is not None:
+            past = cache.get(layer)
+            if past is not None:
+                k = torch.cat((past[0], k), dim=2)
+                v = torch.cat((past[1], v), dim=2)
+            cache.set(layer, k, v)
+        Tk = k.size(2)
+
         # Scaled dot-product attention with the causal mask applied.
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        if T > 1:
+            if pos_offset == 0 and T == Tk:
+                # The prefill path, unchanged: the same mask, the same shapes.
+                att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+            else:
+                # Query i is absolute position pos_offset + i and may see every
+                # key up to and including itself.
+                keys = torch.arange(Tk, device=x.device)[None, :]
+                queries = torch.arange(T, device=x.device)[:, None] + pos_offset
+                att = att.masked_fill(keys > queries, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.dropout(att)
 
@@ -118,8 +200,9 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = FeedForward(n_embd, dropout)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, cache=None, layer=0, pos_offset=0):
+        x = x + self.attn(self.ln1(x), cache=cache, layer=layer,
+                          pos_offset=pos_offset)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -130,6 +213,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, n_embd, n_head, n_layer, block_size, dropout):
         super().__init__()
         self.block_size = block_size
+        self.n_layer = n_layer
         self.token_emb = nn.Embedding(vocab_size, n_embd)
         self.pos_emb = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
@@ -150,16 +234,32 @@ class GPT(nn.Module):
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx, targets=None):
+    def new_cache(self, n_layers=None):
+        return KVCache(self.n_layer if n_layers is None else n_layers)
+
+    def forward(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None):
+        """Run the model on `idx`, which starts at absolute position `pos_offset`.
+
+        `n_layers` stops after that many blocks and still applies the final norm
+        and head. That is a smaller model sharing the target's bottom layers, and
+        it is what a speculative draft is: not a separately trained model, just
+        the cheap prefix of this one.
+        """
         B, T = idx.shape
-        assert T <= self.block_size, (
-            f"sequence length {T} exceeds block_size {self.block_size}"
+        assert pos_offset + T <= self.block_size, (
+            f"positions {pos_offset}..{pos_offset + T - 1} exceed block_size "
+            f"{self.block_size}"
         )
-        pos = torch.arange(T, device=idx.device)
+        pos = torch.arange(pos_offset, pos_offset + T, device=idx.device)
         x = self.token_emb(idx) + self.pos_emb(pos)[None, :, :]
-        x = self.blocks(x)
+        for layer, block in enumerate(self.blocks):
+            if n_layers is not None and layer >= n_layers:
+                break
+            x = block(x, cache=cache, layer=layer, pos_offset=pos_offset)
         x = self.ln_f(x)
         logits = self.lm_head(x)                        # (B, T, vocab_size)
+        if cache is not None:
+            cache.length = pos_offset + T
 
         loss = None
         if targets is not None:
@@ -170,7 +270,13 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
-        """Sample tokens one at a time, cropping context to block_size."""
+        """Sample tokens one at a time, cropping context to block_size.
+
+        Deliberately the slow, obvious loop: every token re-reads the window.
+        `infer.decode` is the fast path, and this is the reference it is checked
+        against — the one a reader can verify by eye. Training calls it once per
+        run, for the sample it prints, where a few seconds do not matter.
+        """
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size :]
             logits, _ = self(idx_cond)

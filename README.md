@@ -16,8 +16,10 @@ the tokenizer and the training loop are all written here; only the backward pass
 | [`render_curve.py`](render_curve.py) | Renders the loss curve as SVG/HTML using only the standard library |
 | [`bigram.py`](bigram.py) | Bigram counting model — the simplest possible LM, used as a comparison floor |
 | [`bpe.py`](bpe.py) | Byte-level BPE tokenizer, trained from scratch on the corpus |
+| [`infer.py`](infer.py) | Decoding: the KV cache, the window policy, and speculative drafts |
 | [`chat.py`](chat.py) | Interactive prompt for a trained checkpoint |
 | [`serve.py`](serve.py) | Local web prompt: a stdlib server that streams tokens into the browser |
+| [`bench_decode.py`](bench_decode.py) | What the cache and the speculation actually buy, measured |
 | [`test_all.py`](test_all.py) | The test suite (standard library only) — run it after any change |
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
@@ -190,10 +192,10 @@ type text, it continues it, and the running conversation stays in context for th
 next turn. A blank line starts over from a newline, the same seed training uses.
 
 Sampling is streamed token by token, and Ctrl-C stops a reply without leaving.
-On this CPU it generates at roughly 58-113 tokens/second (the range measured
-across replies here), so a 160-token reply takes a couple of seconds. Very short
-replies report a lower rate: starting up costs about as much as the next twenty
-tokens.
+On this CPU the cached decoder runs the BPE model at about **330 tokens/second**
+with a full 64-token window, against **105** for the loop that re-reads the window
+on every token — see [Making it faster](#making-it-faster). Very short replies
+report a lower rate: starting up costs about as much as the next twenty tokens.
 `--stop <text>` ends a reply when that text appears, which is the practical way
 to get one speaker's turn and nothing else.
 
@@ -217,6 +219,48 @@ moves: a smaller number is a handicap you choose, and the model keeps writing
 with less to go on.
 There is a browser front end for the same prompt — see
 [Talk to it in a browser](#talk-to-it-in-a-browser) below.
+
+### Making it faster
+
+Generation used to re-read the whole window for every token, which is the same
+arithmetic repeated 64 times for no new information: attention is causal, so a
+position's key and value never change once computed. [`infer.py`](infer.py) keeps
+them, and `.venv/bin/python bench_decode.py` measures what that is worth rather
+than asserting it:
+
+```
+mode                    tokens/s  speedup   detail
+uncached                     105     1.00x   re-reads the window
+cached refresh=1             122     1.16x   81 window reads for 80 tokens
+cached refresh=8             280     2.67x   11 window reads for 80 tokens
+cached refresh=16            333     3.19x   6 window reads for 80 tokens
+cached refresh=32            334     3.19x   4 window reads for 80 tokens
+spec 2L/2 ahead              304     2.91x   71% of guesses accepted, 1.38 tokens/round
+```
+
+**The obvious cache does not work, and that is the interesting part.** The
+positional embeddings are absolute and trained to 64, so a cache holding a full
+window has nowhere to put the next token: `refresh=1` re-reads the window on
+every step and lands within 16% of the uncached loop, which is noise plus saved
+allocation. What makes it pay is re-anchoring in chunks — read the window once,
+write 15 tokens into it, re-read — so the model always sees between 49 and 64
+tokens and 80 tokens cost 6 window reads instead of 81. The saving saturates near
+`refresh=16`; `--refresh 1` restores the old, exactly-equivalent behaviour.
+
+**Speculative decoding was implemented, measured, and lost.** The model's own
+first two layers guess two tokens ahead and the target checks both in one pass,
+which is exact (the acceptance rule reproduces the target's distribution for
+any draft — the suite verifies that with ten thousand rounds against
+mismatched distributions) but not faster here. On this CPU a one-token pass
+costs about 2 ms and a four-token pass about 2.5 ms, so a batch of four is worth
+far more than one token but the draft's serial guesses cost more than the
+verification saves: best 304 tokens/s against 333 for plain caching. On hardware
+where a batched pass is much cheaper than N single steps it should win, which is
+why `--spec` exists — but the honest result on a laptop is that the cache is the
+whole speedup and speculation is not.
+
+`--refresh <n>` and `--spec <n>` are chat flags; the browser gets the cached
+decoder automatically.
 
 ## View the loss curve
 
@@ -351,6 +395,11 @@ and would quietly invalidate the results if it broke again:
 - `sample_next` matches an independently written reference of its documented
   rules for every control, `top_k <= 0` disables the cutoff instead of crashing,
   and `generate` is exactly a loop over `sample_next`
+- the cached decoder is the same function as the uncached one: `refresh=1`
+  reproduces the reference loop's tokens exactly, no call ever reads a position
+  past the window, and the speculative path reproduces the greedy sequence while
+  the acceptance rule reproduces the target distribution (checked by histogram
+  over 10,000 rounds, against a draft that disagrees with it)
 - the bigram floor is measured on the same validation split as the model, so the
   two can honestly share one bits-per-character axis
 - a resumed run keeps its history, records no duplicate point at the seam step,

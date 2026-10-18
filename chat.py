@@ -13,6 +13,8 @@ and it is what makes the prompt box the most interesting way to look at one.
     .venv/bin/python chat.py --checkpoint runs_v3/model.pt
     .venv/bin/python chat.py --prompt "KING HENRY:" --max-new-tokens 200
     .venv/bin/python chat.py --context 24        # a deliberately smaller window
+    .venv/bin/python chat.py --refresh 1         # re-read the window every token
+    .venv/bin/python chat.py --spec 2            # the lower layers guess ahead
     echo "To be or not" | .venv/bin/python chat.py
 
 In the prompt, an empty line generates from a fresh start, and anything else is
@@ -22,6 +24,14 @@ appended to the running context and continued. /help lists the controls.
 the model is given. It cannot exceed the checkpoint's `block_size`, which is what
 the positional embeddings were trained for; below that, it is a handicap you can
 choose, and a useful one — the model keeps writing, but with less to go on.
+
+The replies come from `infer.py`, which keeps the attention cache: the window is
+read once and the next tokens are written into it. `--refresh` is how many tokens
+that lasts before the window moves on and is re-read; the default (a quarter of
+the window) is about three times faster than re-reading on every token, and
+`--refresh 1` is the old behaviour, token for token. `--spec` adds speculative
+drafts — exact, because the acceptance rule corrects for the draft — which is
+interesting to watch and, on this CPU, slower than the cache alone.
 """
 
 import argparse
@@ -31,6 +41,7 @@ import time
 
 import torch
 
+import infer
 from model import GPT, sample_next
 from train import tokenizer_from_state
 
@@ -88,52 +99,54 @@ def context_window(model, requested=None):
     return min(int(requested), model.block_size)
 
 
-def stream_reply(model, tokenizer, ids, args, out, context=None):
+def stream_reply(model, tokenizer, ids, args, out, context=None, refresh=None,
+                 spec=0, draft_layers=2, guesses=4):
     """Generate a continuation of `ids`, printing it as it arrives.
 
     `context` is how much of the *end* of `ids` the model gets to see. It
     defaults to the model's own `block_size`; passing less is how the window is
     shortened deliberately, and it is the reason the crop below is not written
     as `-block` any more.
+
+    The token loop itself lives in `infer.py`, where the cache and the optional
+    speculation are; this function is the part that knows about text, stopping
+    and the caller's stream.
     """
     window = context_window(model, context)
-    idx = torch.tensor(ids[-window:], dtype=torch.long)[None, ...]
-    base = tokenizer.decode(idx[0].tolist())
+    prompt = [int(t) for t in ids[-window:]]
+    base = tokenizer.decode(prompt)
     started = time.time()
 
-    def penalise(logits):
-        if args.repetition_penalty == 1.0:
-            return logits
-        recent = set(idx[0, -args.penalty_window:].tolist())
-        for token in recent:
-            if logits[0, token] > 0:
-                logits[0, token] /= args.repetition_penalty
-            else:
-                logits[0, token] *= args.repetition_penalty
-        return logits
+    sampler = infer.Sampler(
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        penalty_window=args.penalty_window,
+    )
+    if spec:
+        decoder = infer.SpeculativeDecoder(model, prompt, window, sampler,
+                                           draft_layers=draft_layers,
+                                           guesses=guesses, refresh=refresh)
+    else:
+        decoder = infer.Decoder(model, prompt, window, sampler, refresh=refresh)
 
     steps, shown, text = 0, 0, ""
-    with torch.no_grad():
-        for _ in range(args.max_new_tokens):
-            logits, _ = model(idx[:, -window:])
-            nxt = sample_next(penalise(logits[:, -1, :].clone()),
-                              args.temperature, args.top_k, args.top_p)
-            idx = torch.cat((idx, nxt), dim=1)
-            steps += 1
-
-            text = tokenizer.decode(idx[0].tolist())[len(base):]
-            if args.stop and args.stop in text:
-                # Cut before the stop string, and print only what was kept, so
-                # the streamed output matches what is returned.
-                text = text[:text.index(args.stop)]
-                if len(text) > shown:
-                    out.write(text[shown:])
-                    out.flush()
-                break
+    for _ in decoder.tokens(args.max_new_tokens):
+        steps += 1
+        text = tokenizer.decode(decoder.ids)[len(base):]
+        if args.stop and args.stop in text:
+            # Cut before the stop string, and print only what was kept, so
+            # the streamed output matches what is returned.
+            text = text[:text.index(args.stop)]
             if len(text) > shown:
                 out.write(text[shown:])
                 out.flush()
-                shown = len(text)
+            break
+        if len(text) > shown:
+            out.write(text[shown:])
+            out.flush()
+            shown = len(text)
 
     return text, steps, time.time() - started
 
@@ -256,9 +269,10 @@ def repl(model, tokenizer, args):
             prompt_text = context + line + "\n"
 
         try:
-            reply, _, seconds = stream_reply(
+            reply, steps, seconds = stream_reply(
                 model, tokenizer, tokenizer.encode(prompt_text), args, sys.stdout,
-                context=args.context,
+                context=args.context, refresh=args.refresh, spec=args.spec,
+                draft_layers=args.draft_layers,
             )
         except KeyboardInterrupt:
             print("\n(stopped)")
@@ -273,7 +287,8 @@ def repl(model, tokenizer, args):
                   f" · temp {args.temperature}"
                   f" · {args.max_new_tokens} max new")
         if args.stats:
-            status += f" · {seconds:.1f}s"
+            status += (f" · {steps} in {seconds:.1f}s"
+                       f" ({steps / max(seconds, 1e-9):.0f} tok/s)")
         print(f"\n{status}]\n")
 
 
@@ -303,7 +318,16 @@ def main():
                     help="stop generating when this string appears")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--stats", action="store_true",
-                    help="report seconds per reply")
+                    help="report seconds and tokens/s per reply")
+    ap.add_argument("--refresh", type=int, default=None,
+                    help="tokens generated before the cached window is re-read "
+                         "(default: a quarter of the window; 1 re-reads on every "
+                         "token, which is exactly the old uncached behaviour)")
+    ap.add_argument("--spec", type=int, default=0,
+                    help="tokens the model's own lower layers guess ahead each "
+                         "round; 0 (the default) disables speculation")
+    ap.add_argument("--draft-layers", type=int, default=2,
+                    help="how many of the model's layers the draft keeps")
     args = ap.parse_args()
 
     if args.seed is not None:
@@ -314,7 +338,8 @@ def main():
     if args.prompt is not None:
         _, steps, seconds = stream_reply(
             model, tokenizer, tokenizer.encode(args.prompt), args, sys.stdout,
-            context=args.context,
+            context=args.context, refresh=args.refresh, spec=args.spec,
+            draft_layers=args.draft_layers,
         )
         print()
         if args.stats:
@@ -327,7 +352,8 @@ def main():
         text = sys.stdin.read()
         _, steps, seconds = stream_reply(
             model, tokenizer, tokenizer.encode(text), args, sys.stdout,
-            context=args.context,
+            context=args.context, refresh=args.refresh, spec=args.spec,
+            draft_layers=args.draft_layers,
         )
         print()
         if args.stats:

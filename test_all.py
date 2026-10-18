@@ -58,6 +58,7 @@ import torch
 from bpe import BYTE_VOCAB, BPETokenizer
 from bpe import train as train_bpe
 import chat
+import infer
 import serve
 from model import GPT, sample_next
 from train import CharTokenizer, tokenizer_from_state
@@ -533,23 +534,33 @@ class TestSampling(unittest.TestCase):
 
 
 class ModelSpy:
-    """A model wrapper that records the shape of every input it is handed.
+    """A model wrapper that records the shape and position of every input.
 
     Sampling from a randomly initialised model is close to RNG-dominated: with
     the same seed, two different windows can produce the same characters by
     coincidence, so comparing *outputs* is a weak way to show that the crop
     happened. The input tensor is not subject to that — it either has the
-    window's width or it does not.
+    window's width or it does not. Now that decoding keeps a cache, the
+    **position** a call claims matters as much as its width: a call that reads
+    one token at position 63 is reading a full window, and one at position 0 is
+    an honest re-read.
     """
 
     def __init__(self, model):
         self.model = model
         self.block_size = model.block_size
+        self.n_layer = model.n_layer
         self.shapes = []
+        self.offsets = []
 
-    def __call__(self, idx):
+    def new_cache(self, n_layers=None):
+        return self.model.new_cache(n_layers)
+
+    def __call__(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None):
         self.shapes.append(tuple(idx.shape))
-        return self.model(idx)
+        self.offsets.append(pos_offset)
+        return self.model(idx, targets=targets, cache=cache,
+                          pos_offset=pos_offset, n_layers=n_layers)
 
 
 class TestContextWindow(unittest.TestCase):
@@ -576,11 +587,11 @@ class TestContextWindow(unittest.TestCase):
                                repetition_penalty=1.0, penalty_window=64,
                                max_new_tokens=max_new_tokens, stop=None)
 
-    def reply(self, context=None, max_new_tokens=6, seed=3, model=None):
+    def reply(self, context=None, max_new_tokens=6, seed=3, model=None, **kwargs):
         torch.manual_seed(seed)
         return chat.stream_reply(model or self.model, self.tokenizer, self.ids,
                                  self.args(max_new_tokens), io.StringIO(),
-                                 context=context)[0]
+                                 context=context, **kwargs)[0]
 
     def test_the_default_is_what_the_checkpoint_was_trained_for(self):
         self.assertEqual(chat.context_window(self.model), 8)
@@ -601,19 +612,48 @@ class TestContextWindow(unittest.TestCase):
     def test_the_model_is_handed_the_window_and_nothing_older(self):
         """The crop is the whole feature, and a randomly initialised model makes
         sampled text a poor witness for it, so it is measured where it cannot be
-        masked: on the width of the tensors the model is actually handed."""
+        masked: on the width of the tensors the model is actually handed.
+
+        `refresh=1` is the undiluted form — every token re-reads the whole
+        window, which is what this did before there was a cache — so the widths
+        are the window's, every time, and the positions never leave it.
+        """
         for asked, expected in ((1, 1), (2, 2), (5, 5), (8, 8), (99, 8), (None, 8)):
             spy = ModelSpy(self.model)
-            self.reply(context=asked, max_new_tokens=4, model=spy)
-            self.assertEqual([shape[1] for shape in spy.shapes], [expected] * 4,
+            self.reply(context=asked, max_new_tokens=4, model=spy, refresh=1)
+            widths = [shape[1] for shape in spy.shapes]
+            self.assertEqual(widths, [expected] * len(widths),
                              f"asked for {asked}, the model got {spy.shapes}")
+            self.assertEqual(spy.offsets, [0] * len(spy.shapes))
+            self.assertEqual(len(widths), 5, "one prefill and one re-read per token")
+
+    def test_the_default_policy_writes_into_the_window_instead_of_rereading_it(self):
+        """The point of the cache, stated as a count.
+
+        With an 8-token window refreshing 4 at a time, a re-read covers 5 tokens
+        and leaves 3 free positions, so 24 tokens cost 1 prefill + 6 re-reads +
+        18 one-token calls, instead of 24 full windows. Nothing is read past the
+        window's width.
+        """
+        spy = ModelSpy(self.model)
+        self.reply(context=8, max_new_tokens=24, model=spy, refresh=4)
+        widths = [shape[1] for shape in spy.shapes]
+        self.assertEqual(len(widths), 25)
+        self.assertEqual(widths.count(1), 18)
+        self.assertEqual([w for w in widths if w != 1], [8] + [5] * 6)
+        self.assertTrue(all(w <= 8 for w in widths))
+        self.assertTrue(all(offset + w <= 8
+                            for offset, w in zip(spy.offsets, widths)))
 
     def test_the_reply_is_measured_from_the_cropped_prompt(self):
         """What this pins is the bookkeeping rather than the crop: the text
         returned excludes the part of the prompt the model never saw. Written out
         by hand, since `stream_reply` is the only place the two meet."""
         window, steps = 2, 6
-        text = self.reply(context=window, max_new_tokens=steps)
+        # refresh=1 keeps the window exactly as the reference loop below builds
+        # it; the chunked policy is a different, deliberately coarser window and
+        # is pinned by its own test.
+        text = self.reply(context=window, max_new_tokens=steps, refresh=1)
 
         torch.manual_seed(3)
         idx = torch.tensor(self.ids[-window:], dtype=torch.long)[None, ...]
@@ -1668,6 +1708,173 @@ class TestResumeSeam(unittest.TestCase):
             rows = f.read().strip().splitlines()
         self.assertEqual(rows[0], "step,train_loss,val_loss")
         self.assertEqual(len(rows) - 1, len(m["history"]))
+
+
+class TestCachedDecoding(unittest.TestCase):
+    """infer.py: the cache, the window policy and the exactness claims.
+
+    Every claim here is checked against the slow loop rather than against the
+    cache itself, because the cache's whole argument is that it computes the
+    same thing more cheaply. A test that compared the cache to the cache would
+    pass no matter what it computed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        cls.model = GPT(vocab_size=13, n_embd=16, n_head=2, n_layer=3,
+                        block_size=12, dropout=0.0)
+        cls.model.eval()
+        cls.ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    @staticmethod
+    def uncached(model, ids, count, sampler, window):
+        """The obvious loop: re-read the window for every token."""
+        idx = torch.tensor([ids], dtype=torch.long)
+        out = []
+        with torch.no_grad():
+            for _ in range(count):
+                logits, _ = model(idx[:, -window:])
+                token = sampler.sample(logits[:, -1, :], idx[0].tolist())
+                out.append(token)
+                idx = torch.cat((idx, torch.tensor([[token]])), dim=1)
+        return out
+
+    @staticmethod
+    def greedy():
+        return infer.Sampler(temperature=1e-8, top_k=1)
+
+    def test_the_cache_is_the_same_function_of_the_prefix(self):
+        """Prefill in one pass, then extend one position at a time.
+
+        The tolerance is not laziness: a 12-position attention matmul and a
+        1-position one are different shapes, so BLAS sums them in a different
+        order and the last bits differ. What is being claimed is that the
+        function is the same, and 1e-6 is far below any logit that could change
+        a decision — the observed difference is around 1e-8.
+        """
+        with torch.no_grad():
+            full, _ = self.model(torch.tensor([self.ids]))
+            cache = self.model.new_cache()
+            prefill, _ = self.model(torch.tensor([self.ids]), cache=cache)
+            # Same pass, same shapes: this one is exact, not approximate.
+            self.assertTrue(torch.equal(prefill, full))
+
+            for step in range(3):
+                token = 10 + step
+                one, _ = self.model(torch.tensor([[token]]), cache=cache,
+                                   pos_offset=len(cache))
+                ref, _ = self.model(torch.tensor([self.ids + list(range(10, 11 + step))]))
+                gap = (one[:, -1] - ref[:, -1]).abs().max().item()
+                self.assertLess(gap, 1e-6, f"step {step} drifted by {gap:.2e}")
+
+    def test_a_cached_decode_produces_the_uncached_text(self):
+        """refresh=1 is the strict sliding window, and must be invisible."""
+        torch.manual_seed(5)
+        want = self.uncached(self.model, self.ids, 30, self.greedy(), 12)
+        torch.manual_seed(5)
+        got = list(infer.Decoder(self.model, self.ids, 12, self.greedy(),
+                                 refresh=1).tokens(30))
+        self.assertEqual(got, want)
+
+    def test_the_window_is_never_read_past_its_end(self):
+        """The failure mode a cache invites: a position off the end of the
+        trained embeddings. Checked on every call, at a chunk size that does not
+        divide the window evenly."""
+        spy = ModelSpy(self.model)
+        list(infer.Decoder(spy, self.ids, 12, self.greedy(), refresh=5).tokens(40))
+        for shape, offset in zip(spy.shapes, spy.offsets):
+            self.assertLessEqual(offset + shape[1], 12,
+                                 f"read {shape[1]} at {offset}")
+        self.assertGreater(spy.shapes.count((1, 1)), 20,
+                           "most tokens should be one position, not a window")
+
+    def test_a_window_smaller_than_the_prompt_still_crops(self):
+        torch.manual_seed(3)
+        want = self.uncached(self.model, self.ids[-5:], 8, self.greedy(), 5)
+        torch.manual_seed(3)
+        got = list(infer.Decoder(self.model, self.ids, 5, self.greedy(),
+                                 refresh=1).tokens(8))
+        self.assertEqual(got, want)
+
+    def test_an_empty_prompt_is_refused(self):
+        with self.assertRaises(ValueError):
+            infer.Decoder(self.model, [], 8, self.greedy())
+
+    def test_the_sampler_draws_what_sample_next_draws(self):
+        """The sampler is the sampling rules, so it has to be the same rules."""
+        torch.manual_seed(0)
+        logits = torch.randn(1, 40)
+        for kwargs in ({}, {"temperature": 0.5}, {"top_k": 10},
+                       {"top_p": 0.9}, {"top_k": 5, "top_p": 0.8,
+                                      "temperature": 1.3}):
+            with self.subTest(**kwargs):
+                sampler = infer.Sampler(**kwargs)
+                torch.manual_seed(7)
+                got = sampler.sample(logits.clone(), [1, 2, 3])
+                torch.manual_seed(7)
+                want = sample_next(logits.clone(), kwargs.get("temperature", 1.0),
+                                   kwargs.get("top_k"), kwargs.get("top_p"))
+                self.assertEqual(got, int(want))
+
+    def test_the_repetition_penalty_bites_both_ways_without_mutating(self):
+        sampler = infer.Sampler(repetition_penalty=2.0, penalty_window=4)
+        row = torch.tensor([[2.0, -2.0, 1.0]])
+        out = sampler.penalise(row, [0, 1])
+        self.assertEqual(float(out[0, 0]), 1.0)      # positive: divided
+        self.assertEqual(float(out[0, 1]), -4.0)     # negative: multiplied
+        self.assertEqual(float(out[0, 2]), 1.0)      # untouched
+        self.assertEqual(float(row[0, 0]), 2.0)      # the caller's logits are not
+
+    def test_speculation_produces_exactly_the_greedy_tokens(self):
+        """With top_k=1 the acceptance rule is equality, so a speculative run
+        has to be the same sequence, token for token — not merely similar text."""
+        torch.manual_seed(5)
+        want = self.uncached(self.model, self.ids, 30, self.greedy(), 12)
+        torch.manual_seed(5)
+        spec = infer.SpeculativeDecoder(self.model, self.ids, 12, self.greedy(),
+                                        draft_layers=2, guesses=3, refresh=1)
+        self.assertEqual(list(spec.tokens(30)), want)
+        self.assertEqual(spec.rounds, spec.target_passes)
+        self.assertLessEqual(spec.accepted, spec.proposed)
+
+    def test_a_round_can_return_several_tokens(self):
+        """The saving, as an identity: a round costs one target pass and returns
+        at least one token, and when the draft agrees with the target it returns
+        more than one."""
+        torch.manual_seed(0)
+        spec = infer.SpeculativeDecoder(self.model, self.ids, 12, self.greedy(),
+                                        draft_layers=2, guesses=4, refresh=4)
+        produced = list(spec.tokens(40))
+        self.assertEqual(len(produced), 40)
+        self.assertLessEqual(spec.rounds, 40)
+        per_round = spec.accepted / max(spec.rounds, 1)
+        self.assertGreater(per_round, 0.0, "the draft never once agreed")
+
+    def test_the_acceptance_rule_reproduces_the_target_distribution(self):
+        """The theorem, on distributions rather than on a model.
+
+        If the rule were wrong — accepting without correcting, or resampling
+        from q — the histogram would follow q, which is deliberately nothing
+        like p here. Ten thousand rounds is enough to see that at four sigma.
+        """
+        p = torch.tensor([[0.05, 0.45, 0.02, 0.33, 0.15]])
+        q = torch.tensor([[0.30, 0.05, 0.30, 0.05, 0.30]])
+        trials = 10_000
+        counts = [0] * 5
+        torch.manual_seed(11)
+        for _ in range(trials):
+            token = int(torch.multinomial(q, 1)[0, 0])
+            if infer.accepted(p, q, token):
+                counts[token] += 1
+            else:
+                counts[int(torch.multinomial(infer.residual(p, q), 1)[0, 0])] += 1
+
+        for index, expected in enumerate(p[0].tolist()):
+            sigma = math.sqrt(expected * (1 - expected) / trials)
+            observed = counts[index] / trials
+            self.assertLess(abs(observed - expected), 4 * sigma,
+                            f"token {index}: {observed:.4f} vs {expected:.2f}")
 
 
 if __name__ == "__main__":

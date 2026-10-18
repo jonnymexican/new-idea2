@@ -186,7 +186,9 @@ the decay had already bought. That is why `train.py` plans against
 
 `GPT.generate` runs the model, takes the final position's probability
 distribution, samples one token from it, appends it, and repeats — feeding its own
-output back in. The knobs all live in `sample_next`:
+output back in. It is deliberately the slow, obvious version, written to be read
+and checked by eye; [`infer.py`](infer.py) is the fast one, and the tests hold it
+to exactly this output. The knobs all live in `sample_next`:
 
 - **temperature** divides the logits before softmax. Below 1.0 sharpens the
   distribution (safer, more repetitive); above 1.0 flattens it (more surprising,
@@ -206,6 +208,33 @@ Note the context is cropped to the last `block_size` tokens: 64 characters for a
 character-level model, around 124 characters for the BPE one. That is the model's
 entire memory, and it is why a long session in `chat.py` eventually pushes the
 start of the conversation out of view.
+
+That crop is also why the obvious cache does not work. Attention is causal, so
+the key and value a position contributes never change once computed, and keeping
+them instead of recomputing them is the cleanest speedup a transformer has — except
+that the positional embeddings here are **absolute** and trained up to
+`block_size`. A cache holding a full window has no index left for the next token,
+so it cannot be extended at all; the naive version re-reads the entire window on
+every step and saves nothing measurable (measured: 1.16x, which is mostly saved
+allocations). What makes it pay is re-anchoring a chunk at a time: read the
+window, write `refresh - 1` tokens into the free positions, then move the window
+on and read again. The model then sees between `window - refresh + 1` and `window`
+tokens — the same kind of context, with its left edge moving in steps rather than
+one token at a time — and the re-read is amortised over `refresh` tokens. At 64
+and `refresh=16`, 80 tokens cost 6 window reads instead of 81, and 105
+tokens/second becomes 333. `refresh=1` is the un-chunked behaviour and reproduces
+the old output exactly, which is what lets the tests compare against it.
+
+The other way to buy speed is to do more work per pass: a draft guesses several
+tokens, and the target checks them all at once, which it can because checking a
+guess is just running the model on it. The draft does not have to be any good,
+which is why it is the model's own first two layers. If the draft proposes token
+`x` with probability `q(x)` and the target assigns it `p(x)`, accepting with
+probability `min(1, p(x)/q(x))` and otherwise sampling from the leftover
+`(p - q)` mass makes the result distributed exactly as `p` — the draft's mistakes
+cost speed, never accuracy. Here it cost speed as well: on this CPU a batched
+pass is not cheap enough to pay for the draft's serial guesses, so the cache is
+the whole speedup and speculation is an option, not a default.
 
 The page does not leave that implicit. It counts how much has fallen out and
 says so in words, and the token view dims the chips the model can no longer
