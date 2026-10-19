@@ -1,0 +1,302 @@
+# Provenance survival lab
+
+What happens to a C2PA credential when a file is edited and re-shared?
+
+Two arms, one verifier:
+
+- **local** ([lab.py](lab.py)) — sign a real manifest, push the image through
+  ten transformations in three editing modes, verify every output. No network,
+  about three seconds.
+- **platform** ([platforms.py](platforms.py)) — upload the signed fixture to a
+  real service, fetch back exactly what it serves, and verify *those* bytes.
+
+Both verify with the same C2PA SDK and the same test CA, so rows from the two
+arms are directly comparable.
+
+## Why measure this now
+
+- **EU AI Act Article 50 applies from 2 August 2026** and requires
+  machine-readable marking of synthetic media. California's SB 942 (as amended
+  by AB 853) became operative the same day.
+- **C2PA 2.4** (April 2026) added an AI Disclosure Assertion and crJSON;
+  `c2pa-python` 0.38 ships the 0.91 SDK, and `c2patool` 0.28.2 is current.
+- Camera and generator support is real (Leica M11-P, Nikon Z6III, Pixel 10,
+  OpenAI images carry C2PA + SynthID), but platforms commonly resize and
+  re-encode uploads.
+- There is **no public, reproducible, cross-platform measurement** of what
+  survives. Vendor notes admit credentials can be stripped or invalidated;
+  nobody publishes the rate.
+
+## The three arms
+
+| arm | what the editing tool does |
+|---|---|
+| `as_is` | re-encodes and drops metadata (Pillow's default behaviour) |
+| `preserve` | carries the original manifest through unchanged — the interesting failure: present, readable, stale |
+| `rebind` | a C2PA-aware editor signs a new manifest with the original as a parent ingredient |
+
+`preserve` is implemented by moving the original APP11 segments into the new
+JPEG byte-for-byte, which is exactly what a metadata-preserving editor does
+when it forgets to re-hash.
+
+## Run it
+
+```bash
+cd provenance_lab
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+
+.venv/bin/python -m unittest -v          # 91 tests
+.venv/bin/python lab.py run --out out/full
+```
+
+Outputs `out/full/report.md` (readable) and `out/full/report.json` (raw rows),
+plus every generated file under `out/full/assets/`.
+
+Other commands:
+
+```bash
+.venv/bin/python lab.py run --transforms jpeg_q75,crop_10pct   # subset
+.venv/bin/python lab.py run --modes as_is,rebind               # skip an arm
+.venv/bin/python lab.py verify out/full/assets/signed.jpg --ca out/full/certs/ca.cert.pem
+```
+
+## Measured result
+
+960×640 JPEG fixture, signed as `TrainedAlgorithmicMedia`, c2pa-python 0.38.0
+(SDK 0.91.0), Pillow 13.0.0, whole matrix 2.2–2.8 s across runs. File sizes move by 1–2 bytes
+between runs: ECDSA signatures are variable length, so the manifest is not a
+fixed size.
+
+| transform | pixels unchanged | as_is | preserve | rebind |
+|---|---|---|---|---|
+| `jpeg_q95` | no | gone | INVALID | valid |
+| `jpeg_q75` | no | gone | INVALID | valid |
+| `jpeg_q50` | no | gone | INVALID | valid |
+| `resize_50` | n/a | gone | INVALID | valid |
+| `crop_10pct` | n/a | gone | INVALID | valid |
+| `rotate_90` | n/a | gone | INVALID | valid |
+| `screenshot_1080p` | n/a | gone | INVALID | valid |
+| `cdn_w800_q70` | n/a | gone | INVALID | valid |
+| `double_share` | no | gone | INVALID | valid |
+| `strip_rewrite` | yes | gone | n/a | valid |
+
+Counts: **10/10 credentials gone** under a normal re-encode, **9/9 present but
+invalid** when metadata is preserved, **10/10 valid** when re-signed with a
+parent ingredient.
+
+### The failure mode worth naming
+
+Every `preserve` output failed on exactly one code: `assertion.dataHash.mismatch`.
+The claim still parsed. The `c2pa.actions.v2` assertion still said the image was
+`TrainedAlgorithmicMedia`. So a reader that displays the claim without checking
+the binding would still call this file AI-generated — and a reader that checks
+would call the credential broken. Both are "present", neither is trustworthy.
+
+Even `jpeg_q95` breaks the binding: a JPEG round trip is lossy at any quality,
+so the hash never matches. `strip_rewrite` is the control — every pixel
+identical, credential gone — which is why "no credential found" carries no
+information at all.
+
+### What provenance costs
+
+| file | bytes | vs. unsigned |
+|---|---:|---:|
+| unsigned fixture | 25,049 | — |
+| signed once | 60,635 | +35,586 (+142%) |
+| `jpeg_q75`, metadata dropped | 18,709 | −25% |
+| `jpeg_q75`, manifest preserved | 54,295 | +117% |
+| `jpeg_q75`, re-signed with parent | 125,261 | 5.0× |
+
+The only arm that validates is also the only one that **grows** the file: the
+parent credential is embedded as a full ingredient, thumbnail included, so a
+single re-share goes from 60,635 to 125,261 bytes — 2.07× its own signed input,
+5.0× the unsigned image. Any pipeline that re-signs on every edit inherits that
+growth per generation.
+
+## The platform arm
+
+`platforms.py` measures the half the local matrix cannot: what a *service* does
+to the file between upload and the bytes a viewer actually downloads.
+
+```bash
+.venv/bin/python platforms.py list                       # what each adapter needs
+.venv/bin/python platforms.py chats                      # chat ids the bot has seen
+.venv/bin/python platforms.py run --platforms local      # no account, no network
+.venv/bin/python platforms.py run --platforms catbox     # real third party
+.venv/bin/python platforms.py reuse --from out/platforms/platforms.json
+```
+
+Every adapter is reduced to the same shape — an upload that yields served
+URLs — so the measurement is identical everywhere:
+
+    upload  ->  fetch each served URL  ->  verify the fetched bytes
+
+### Adapters
+
+| name | what it reaches | needs |
+|---|---|---|
+| `local` | local HTTP re-encoder, four policies | nothing |
+| `catbox` | anonymous host, stores bytes verbatim | nothing |
+| `0x0` | anonymous host, currently rejecting uploads | nothing |
+| `discord` | attachment URL plus the media proxy | webhook URL |
+| `telegram` | `sendPhoto` (recompressed) vs `sendDocument` (stored) | bot token, chat id |
+| `mastodon` | `/api/v2/media`, polls until processed | instance URL, token |
+| `bluesky` | `uploadBlob` + `cdn.bsky.app` feed_fullsize/thumbnail | handle, app password |
+| `facebook` | Page photo, every `images` and `webp_images` rendition | page id, page token |
+
+X was removed deliberately: its API is credit-based (about $0.015 per post, no
+free tier), so the arm could not be run without spending money. Every adapter
+left is free to call — anonymous hosts, a Discord webhook, a Telegram bot, a
+Mastodon instance, Bluesky, and the Facebook Graph API for your own Page.
+
+Credentials come from `platforms.json`, copied from
+[platforms.example.json](platforms.example.json), or from equivalently named
+environment variables — so a token never has to be pasted into a chat:
+
+```bash
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+  .venv/bin/python platforms.py run --platforms telegram
+```
+
+`platforms.py list` prints the variable name for each missing key, and
+`platforms.py check` validates credentials with a read-only call before anything
+is published (exit status 1 if any of them fails). The config file is gitignored
+and the run never prints either source. Reports and `uploads/*.json` carry redacted URLs only, so a
+Telegram bot token or Discord webhook secret cannot leak into an artifact you
+might share — but `reuse` still needs the real URLs, so they are written once
+to a separate owner-only file and its path is recorded in `platforms.json`.
+
+That second file is `refetch.json`, and creating it with mode 0600 can silently
+fail: Windows-mounted workspaces (9p/drvfs, which is what `/mnt/c` is) accept
+`chmod` and then ignore it. The lab checks the resulting mode, and if it did not
+tighten it moves the file to `~/.local/state/provenance-lab/` rather than leave
+token-bearing URLs world-readable inside the project. If no location is safe it
+says so in the report instead of pretending.
+
+A platform can expose several renditions of one upload, and the arm measures
+each. That is the point of the `telegram` and `discord` shapes: the same bytes
+uploaded twice land on two different pipelines with different outcomes.
+
+### Getting credentials
+
+#### Facebook
+
+1. Create a Meta app at developers.facebook.com and leave it in Development
+   mode with your account holding an app role. Standard Access covers your own
+   Page, so no App Review is needed.
+2. In the Graph API Explorer, select the app and request a user token with
+   `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`.
+3. Call `GET /me/accounts`, then copy your Page's `id` and `access_token`.
+4. Put them in `platforms.json` as `facebook_page_id` and `facebook_token`.
+5. For a token that does not expire on a timer, exchange the user token for a
+   long-lived one (`?grant_type=fb_exchange_token` with the app id and secret)
+   and take the Page token from `/me/accounts` again.
+
+The upload uses `published=false`, so the fixture never reaches the Page
+timeline, and Meta discards the unpublished photo after about 24 hours.
+
+#### Telegram chat ids
+
+`platforms.py chats` asks the bot which chats it has already seen, so the id can
+be discovered instead of hunted for in a client. It needs only the token:
+
+```bash
+TELEGRAM_BOT_TOKEN=... .venv/bin/python platforms.py chats
+```
+
+It reads `getUpdates` without an `offset`, so pending updates are neither
+confirmed nor consumed — the bot's backlog is left exactly as it was and the
+command can be repeated. Two limits are reported rather than hidden: a 409 means
+a webhook is set, which makes `getUpdates` unavailable until `deleteWebhook`, and
+a chat the bot has not been messaged in for about 24 hours is no longer
+returned. Exit status is 1 when discovery fails.
+
+### Facebook: one upload, several renditions
+
+`facebook` needs no post: a Page photo uploaded with `published=false` stays off
+the timeline and is readable through `GET /{photo-id}?fields=images,webp_images`,
+which returns every rendition the CDN stores. Meta does not document an order
+for that list, so the arm sorts by pixel area and measures all of them — the
+answer can differ between the largest and the smallest.
+
+It has not been run live: that needs a Page token, and it publishes a photo
+(unpublished, so off the timeline). What *was* checked is that the endpoint
+is where the code thinks it is — `GET graph.facebook.com/v26.0/me` answers an
+OAuth error rather than an unknown-version error.
+
+### The local harness is not decoration
+
+The `local` adapter runs a real HTTP server that re-encodes with Pillow under
+four policies, which lets the whole arm — upload, fetch, verify, report — be
+tested without posting anything anywhere:
+
+| policy | what it serves | result |
+|---|---|---|
+| `copy` | the stored bytes | **valid**, Trusted, byte-identical |
+| `strip` | decoded, re-encoded q80 | **gone** |
+| `segments` | re-encoded, original APP11 carried over | **INVALID** — `assertion.dataHash.mismatch` |
+| `webp` | transcoded to WebP | **gone**, and the format changed |
+
+That is the same three-way split the local matrix found, reproduced across a
+network boundary. Without it, a third-party row saying "gone" would be
+indistinguishable from a bug in this lab's transport.
+
+### Measured so far
+
+| platform | variant | served | credential |
+|---|---|---|---|
+| `catbox` | direct | byte-identical, 60,635 B | **valid**, Trusted |
+
+`catbox` is the control that makes the rest interpretable: a real third party
+can store and serve a C2PA-signed JPEG unchanged, so a credential vanishing at
+a social platform is that platform's transcode, not this code's.
+
+`0x0.st` now answers HTTP 503 — "uploads disabled because it's been almost
+nothing but AI botnet spam" — and the run records it under **Not measured**
+rather than dropping it silently.
+
+### Re-fetching instead of re-uploading
+
+`reuse` resolves the recorded refetch file, fetches the same URLs again and
+measures them. That answers the question a single run cannot: does the
+credential survive until the platform's cache or transcode budget expires?
+
+```bash
+.venv/bin/python platforms.py reuse --from out/platforms/platforms.json
+```
+
+If the refetch file is missing it falls back to the redacted record and warns
+in the report — an anonymous-host URL still works, a token-bearing one will not.
+
+## What this does not prove
+
+- The signing CA is generated locally, so `trusted` means trusted against that
+  throwaway anchor, not against a public trust list. Signature and binding
+  checks are real; the trust decision is ours.
+- `screenshot_1080p` re-renders onto a white canvas. It models the metadata
+  behaviour of a screenshot, not a real compositor or display pipeline.
+- One transformation per file; `double_share` is the only chained case.
+- JPEG and PNG only — no video, PDF, HEIF, or HTML embedding.
+- The five social adapters (Discord, Telegram, Mastodon, Bluesky, Facebook) are
+  implemented and unit-tested against a stub transport, but have **not** been
+  run against the live services: each needs an account, and most publish the
+  fixture. Their rows appear only when a credential is supplied; nothing in the
+  report claims otherwise.
+
+## Files
+
+- `lab.py` — signing, segment surgery, transforms, verification, report
+- `platforms.py` — platform adapters, served-rendition fetch, local CDN
+  harness, redaction, platform report
+- `tests.py` — 16 tests: credential validity and trust, APP11 round-trip,
+  each arm, verdict classification, summary counts, matrix integration and
+  mode filtering
+- `test_platforms.py` — 75 tests: format sniffing, URL/token redaction, config
+  and environment handling, each adapter's response parsing against a stub,
+  Facebook rendition ordering and duplication, the read-only credential checks,
+  Telegram chat discovery and its non-consuming update read, refetch handling
+  including the ignored-`chmod` fallback, summarisation, HTTP failures, and the
+  full upload → fetch → verify path against the local harness
+- `platforms.example.json` — credential template (the real file is gitignored)
+- `requirements.txt` — pinned c2pa-python, Pillow, cryptography, requests

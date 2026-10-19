@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to platforms.json (gitignored). Fill in only the platforms you want to measure; anything blank is reported as 'not measured' rather than failing the run. Every adapter here is free to call.",
+  "discord_webhook": "",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "mastodon_instance": "",
+  "mastodon_token": "",
+  "bluesky_handle": "",
+  "bluesky_app_password": "",
+
+  "_facebook_comment": "Page access token with pages_manage_posts; the photo is uploaded with published=false and read back through its images list.",
+  "facebook_page_id": "",
+  "facebook_token": "",
+  "facebook_graph_version": "v26.0"
+}

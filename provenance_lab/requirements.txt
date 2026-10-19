@@ -1,0 +1,4 @@
+c2pa-python==0.38.0
+Pillow==13.0.0
+cryptography==50.0.2
+requests==2.34.2
