@@ -49,3 +49,36 @@ jobs:
 
       - name: WiFi radar
         run: python -m unittest wifi_radar.test_radar -v
+
+  firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The sketch is the only part of the project a test cannot exercise: it
+      # needs a compiler and a board. The compiler is ordinary software, so it
+      # is worth pinning that the firmware at least builds for the chip it
+      # claims, in the configuration the README tells people to select.
+      - name: Install arduino-cli and the AVR core
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz \
+            | tar -xz -C "$HOME/.local/bin" arduino-cli
+          # $GITHUB_PATH only takes effect from the next step, so the rest of
+          # this one needs the binary on its own PATH.
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          arduino-cli version
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+
+      - name: Compile the Mega channel node
+        # --warnings all reports trouble in the sketch itself; the core's own
+        # warnings are noise and do not fail the step.
+        run: |
+          arduino-cli compile --fqbn arduino:avr:mega --warnings all \
+            --build-path "$RUNNER_TEMP/mega-build" \
+            wifi_radar/arduino/mega_channel_node
+
