@@ -394,6 +394,17 @@ class PacedSource(Source):
         pacing = "paced to real time" if self.realtime else "as fast as possible"
         return f"{self.inner.describe()} ({pacing})"
 
+    @property
+    def doppler(self):
+        """
+        Whether this source can report speed at all, asked each time.
+
+        A serial source cannot know until its first line whether the thing on
+        the other end is sending CSI or sensor channels, so the answer is read
+        from the inner source rather than copied at construction.
+        """
+        return getattr(self.inner, "doppler", True)
+
     def __iter__(self):
         return self
 
@@ -489,16 +500,21 @@ def open_source(spec, **kwargs):
         file:session.jsonl   a recorded session
         udp:5500             CSI packets off the wire (nexmon_csi on a Pi)
         udp:10.0.0.5:5500    ... on a specific address
-        serial:/dev/ttyUSB0  a USB receiver (not implemented — see below)
+        serial:COM3          lines on a USB serial port (see serial_node.py)
+        serial:COM3:9600     ... at a baud rate other than 115200
 
-    The serial case raises rather than pretending. CSI does not come out of a
-    laptop's own WiFi card: Windows exposes RSSI and nothing else, and a Linux
-    monitor-mode capture needs a specific chip and a patched driver. The two
-    practical receivers are an ESP32, which streams frames over USB, and a
-    Raspberry Pi running nexmon_csi, which broadcasts them as UDP and is what
-    `udp:` speaks. When a USB receiver is attached, its adapter belongs here,
-    emitting the same JSON Lines shape that `read_recording` already reads, so
-    nothing downstream changes.
+    CSI does not come out of a laptop's own WiFi card: Windows exposes RSSI and
+    nothing else, and a Linux monitor-mode capture needs a specific chip and a
+    patched driver. The two practical receivers are an ESP32, which streams
+    frames over USB, and a Raspberry Pi running nexmon_csi, which broadcasts them
+    as UDP and is what `udp:` speaks. An ESP32 on USB speaks `serial:` as long as
+    it prints one `C,<millis>,<re>,<im>,...` line per frame.
+
+    `serial:` also accepts a board that has no radio at all — an Arduino — as
+    long as that board is honest about what it measures: its `S,` lines carry a
+    profile of sensor channels rather than CSI, and `serial_node.SerialSource`
+    marks that stream as having no Doppler axis. Pretending an ATmega's ADC is a
+    radio would produce a speed number with nothing behind it.
     """
     kind, _, rest = spec.partition(":")
     if kind == "sim":
@@ -521,14 +537,26 @@ def open_source(spec, **kwargs):
         return nexmon.NexmonSource(host=host, port=port,
                                    rate=kwargs.get("rate", 20.0))
     if kind == "serial":
-        raise ValueError(
-            f"serial source {rest!r} is not implemented yet. Pump frames from the "
-            "device into the JSON Lines format read_recording() accepts, then "
-            "replay them with file:<path>; a Raspberry Pi running nexmon_csi "
-            "needs no adapter at all — use udp:<port>. See README.md in this "
-            "directory for the hardware options and what each one can and cannot "
-            "measure."
-        )
+        # Imported at call time for the same reason as nexmon, and because
+        # pyserial is only needed once a real port is opened.
+        from wifi_radar import serial_node
+
+        port, baud = serial_node.parse_spec(rest)
+        if port.strip().lower() == "auto":
+            # The board is whatever is plugged in, and asking a person which COM
+            # port it got is the step where a first run usually stops.
+            chosen = serial_node.choose_port(serial_node.available_ports())
+            if chosen is None:
+                raise OSError(
+                    "serial:auto found no serial port. Plug the board in and "
+                    "check that a COM port appears (Windows needs the CH340 "
+                    "driver for Elegoo boards); "
+                    "`python -m wifi_radar.serial_node --list` shows what was "
+                    "found.")
+            port = chosen.device
+        stream = serial_node.open_serial(port, baud)
+        return serial_node.SerialSource(stream, port=port, baud=baud,
+                                        rate=kwargs.get("rate", 20.0))
     raise ValueError(
         f"unknown source {spec!r}: expected sim:<scenario>, file:<path>, "
         f"udp:[host:]port or serial:<port>. "

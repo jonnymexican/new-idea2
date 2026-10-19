@@ -9,11 +9,15 @@ seam is the point of the design, not a side effect.
 ```bash
 .venv/bin/python -m wifi_radar.watch                    # live trace in the terminal
 .venv/bin/python -m wifi_radar.live                     # live view in a browser
-.venv/bin/python -m unittest wifi_radar.test_radar      # 52 tests, no dependencies
+.venv/bin/python -m unittest wifi_radar.test_radar      # 89 tests, no dependencies
 ```
 
 Nothing here is measured from a real radio yet. Every number below comes from
 the simulator or from arithmetic, and is labelled as such.
+
+If the board on your desk is an Arduino rather than a radio, it cannot see the
+channel at all — see [If you already have an Arduino](#if-you-already-have-an-arduino)
+for why, and for the sensor node it can be instead.
 
 ## What you are looking at
 
@@ -39,6 +43,22 @@ panels: the **trace** with the calibrated floor and the detection threshold
 drawn on it, the **Doppler spectrum**, and a **waterfall** of the same movement
 per subcarrier — which shows whether the whole channel moved or one subcarrier
 glitched, the difference between a body and a bad packet.
+
+A source with no radio gets a fourth panel, the **pins** one: a row per analog
+pin — all sixteen of a Mega's A0–A15, with the canvas growing to keep every row
+legible rather than squeezing the font — and three columns per row. `pin` is the
+label, `swing` is the range that row has covered over the visible window
+(max − min, in ADC counts), `level` is what it reads now. The pin currently
+standing out is highlighted, and named underneath with its level and swing. It
+is the wiring view: put a sensor on A3, disturb it, and A3 is the row that
+answers.
+
+`swing` exists because every row is scaled to its own range, which is both the
+point and the trap: a pin carrying six counts of ADC noise fills its row as
+convincingly as a sensor with a 283-count swing does. Read the swing and the
+level, not the height of the line — a noise row says `6`, a pin with a hand
+waving past it says `283`. When several pins move together and none
+leads, the panel says so rather than picking one.
 
 | Number | Means |
 | --- | --- |
@@ -131,7 +151,9 @@ choice costs.
 | [`watch.py`](watch.py) | The terminal trace |
 | [`live.py`](live.py) | The browser view (standard library server, no dependencies) |
 | [`nexmon.py`](nexmon.py) | Real frames off the wire: the nexmon packet layout and the UDP source |
-| [`test_radar.py`](test_radar.py) | 52 tests against simulated ground truth |
+| [`serial_node.py`](serial_node.py) | Frames off a USB serial port: CSI lines, and sensor-channel lines from a board with no radio |
+| [`arduino/mega_channel_node`](arduino/mega_channel_node/mega_channel_node.ino) | The Mega 2560 sketch that prints those channel lines |
+| [`test_radar.py`](test_radar.py) | 89 tests against simulated ground truth |
 
 ## Attaching a real radio
 
@@ -201,6 +223,95 @@ are around 50 frames/s, comfortably above the 20 the views are tuned for;
 `--rate` sets the number the Doppler axis is scaled by, and `describe()` reports
 what is actually arriving.
 
+### If you already have an Arduino
+
+It cannot do this, and it is worth being exact about why. An ATmega2560 — the
+chip on an Arduino Mega 2560, including Elegoo's clone — has no radio at all: no
+WiFi, no Bluetooth, and no way to observe the channel state of anything. The
+2.4 GHz module that comes with most Arduino kits does not rescue it. An
+nRF24L01 is a packet radio whose entire received-power output is one bit meaning
+"something above −64 dBm is on the air"; that is one bit per packet, not 64
+complex numbers per frame, and no firmware turns it into CSI.
+
+What the board does have is a 10-bit analog-to-digital converter on sixteen pins,
+and that is enough to be a *sensor node* — a different instrument with the same
+output shape. Upload
+[`arduino/mega_channel_node/mega_channel_node.ino`](arduino/mega_channel_node/mega_channel_node.ino)
+(select **Arduino Mega or Mega 2560**; the Elegoo uses a CH340 USB chip, so
+Windows needs that driver before a COM port appears at all), close the Arduino
+IDE's serial monitor — it holds the port open — then:
+
+```bash
+.venv/bin/python -m pip install pyserial                 # the one optional dependency
+.venv/bin/python -m wifi_radar.serial_node --list        # which port is the board?
+.venv/bin/python -m wifi_radar.serial_node               # is it talking?
+.venv/bin/python -m wifi_radar.watch --source serial:auto      # terminal trace
+.venv/bin/python -m wifi_radar.live  --source serial:auto      # browser view
+```
+
+In the browser, `serial:auto` also adds the pins panel described above — the
+same command for wiring that the CSI path uses for walking.
+
+`--port` and `serial:` both accept `auto`, which is what they default to, and
+which is the point: `COM3` or `COM4` is the question a first bring-up stops on,
+before anyone suspects the sketch. The choice is made from the USB vendor ID —
+`1A86` is the CH340 on Elegoo and most clone boards, and it is emphatically not
+an Arduino ID, so matching on the word "Arduino" alone would find nothing on the
+board in the picture above. Ties break on the port name, so two boards are chosen
+between the same way twice rather than at random, and the port it picked is
+printed with the reason. `--list` shows every port and marks the one `auto` would
+open; when nothing is plugged in it names the CH340 driver, which is the actual
+cause on Windows more often than not.
+
+The sketch samples A0–A7 twenty times a second and prints one line per sample:
+
+```text
+# mega_channel_node 8 channels 20 Hz
+S,1204,512,498,733,501,455,610,521,487
+S,1254,513,499,731,503,452,612,519,488
+```
+
+Each line becomes a frame of eight channel amplitudes, and everything downstream
+runs unchanged: the same calibration, the same measured noise floor, the same
+hysteresis, the same presence flag, and the same waterfall with one row per
+channel instead of one per subcarrier. What a channel *is* depends on what you
+wired to it: light on an LDR, sound on a piezo, distance from an HC-SR04, or the
+mains hum that a bare 10 cm wire in A0 couples out of the air — which shifts
+measurably when a hand comes near it, and needs no parts at all. That last one is
+the one to try first.
+
+**What it cannot report is speed.** For CSI the metric's spectrum peaks at
+`speed / wavelength`, so 1.88 Hz means 23 cm/s. For a channel profile the same
+spectrum measures how fast the *profile* changed, which depends on where each
+sensor points and how much of the room it sees, not on how fast anyone walked.
+So the source reports `doppler = False`, the terminal prints `peak = n/a`, and
+the browser labels that panel "Doppler — not on this source" and draws nothing
+in it. The numbers that survive are real ones: with a hand waving in front of
+four of the eight channels, the metric goes from `0.0019` to `0.024` — thirteen
+times the calibrated floor, `z` around 50 — while a still room stays under the
+threshold. That is a test, not a claim: a simulated Mega's output goes through
+the real detector, and it asserts no detections before the hand appears and over
+90% of frames after.
+
+Two things it does that the CSI path does not. A hand that appears and then
+holds still changes the profile *once*, so the moment it arrived is marked even
+though nothing moves afterwards. And an unplugged channel reads a constant, which
+the detector now survives: a floor and a spread of exactly zero used to make `z`
+undefined and the event invisible, and calibration can no longer divide by
+nothing.
+
+**What it also cannot do:** tell you where anything is (one amplitude per sensor
+is not a range profile), see through a wall, or separate a person from a cat, a
+curtain, or a lamp switched on. It is a set of light, sound and capacitance
+channels; it answers questions about those channels.
+
+The sketch compiles for `arduino:avr:mega` under `--warnings all` with nothing
+from its own file: 2474 bytes of flash and 192 bytes of RAM, on a board with
+253952 and 8192. CI compiles it on every push, so it cannot rot into something
+that only compiles in a screenshot. What CI cannot do is upload it; no board here
+has had it run on real pins, and the output above is what the protocol says, not
+a captured log.
+
 **The interface to implement.** A logger should write one JSON object per frame:
 
 ```json
@@ -223,17 +334,38 @@ timestamp added. Payload length fingerprints the header revision, so a packet is
 either decoded exactly or refused with the accepted sizes; misreading 256 bytes
 silently would report confident nonsense for the rest of the session.
 
-`open_source("serial:...")` deliberately raises rather than inventing frames —
-there is no CSI on a USB port until something on the other end produces it.
-When an ESP32 is attached, its adapter belongs in `csi.py` next to the other
-sources, and it should emit exactly that JSON shape. The round-trip through that
-format is already tested at the integer precision a real logger uses, including
-that quantisation does not break detection.
+`open_source("serial:COM3")` reads a board on a USB port live, and accepts
+either kind of line, because the port does not say what is on the other end:
+
+```text
+S,<millis>,<v0>,<v1>,...        a sensor node: channel values
+C,<millis>,<re0>,<im0>,...      a CSI receiver: int16 real/imaginary pairs
+# anything                        ignored, so firmware can print a banner
+```
+
+An ESP32 running esp-csi printing `C,` lines therefore works through the same
+gate as the Mega, which is the useful property: the cheap board that *can* do CSI
+and the board that cannot are one flag apart, and the flag is set from what
+arrives rather than from what the user claims.
+
+`millis` is the device's own clock, because it is the only one that knows when a
+sample was taken. It is an unsigned 32-bit count that wraps after 49.7 days, so
+the wrap is undone rather than allowed to jump the session backwards. Junk lines
+are counted and skipped; fifty of them before the first sample is a configuration
+error and says so, and ten seconds of silence names the three things that are
+actually wrong on a desk — the sketch is not running, the port is the wrong one,
+or a serial monitor already holds it. A saved capture replayed from a file ends
+at EOF instead, so a log can be read back without pretending it is a live board.
+
+The round-trip through the JSON Lines recording format is tested at the integer
+precision a real logger uses, including that quantisation does not break
+detection.
 
 ## The tests
 
-`python -m unittest wifi_radar.test_radar` — 52 tests, standard library only,
-under a minute. They can be strict because the simulator knows the answer:
+`python -m unittest wifi_radar.test_radar` — 89 tests, standard library only
+(pyserial is needed to open a board, never to test one), well under a minute.
+They can be strict because the simulator knows the answer:
 it knows when the person is walking, at what cadence, and when the room is
 empty.
 
@@ -243,8 +375,9 @@ detections; a walk detected for essentially all of it and none of the rest;
 presence holding for a seated person and releasing after they leave; the Doppler
 peak against `v / wavelength`; breathing staying invisible; phase and gain
 wander not registering as movement; a frame-wide gain change measuring *exactly*
-zero; a session surviving the recording round trip; and the source spec refusing
-the serial case with a message that points somewhere.
+zero; a session surviving the recording round trip; and a serial spec naming a port
+that cannot be opened failing with that port's name and the reason, instead of
+returning a source that would never produce a frame.
 
 The hardware path is tested without the hardware. A payload builder writes the
 byte layout the firmware documents, so the parser is checked against the format
@@ -258,6 +391,15 @@ on the port skipped and counted, a stream of nothing but junk failing loudly
 rather than looking like a quiet room, a second core ignored before it can
 interleave two channels into fake motion, and silence producing a message that
 names the three things to check.
+
+The serial path is tested the same way, on a string instead of a wire. Both
+dialects of the line protocol are checked, along with the ways it goes wrong in
+practice — a wrong baud rate, a stray `println`, a line that arrived without its
+newline — and the 32-bit wrap by feeding a session that crosses it and asserting
+the timestamps keep going forward. Then eight channels of ADC data, with a hand
+waving in front of half of them, go through the detector: no detections while the
+room is still, over 90% while it moves, and `peak_hz` `None` throughout, because
+that is a number this sensor cannot produce.
 
 Five bugs were found by these tests before any of it was wired to a view, and
 worth naming because each would have been comfortable to believe: the simulator

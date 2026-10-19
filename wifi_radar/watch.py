@@ -93,7 +93,8 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", default="sim:demo",
                         help="sim:<scenario>, file:<path>, udp:[host:]port "
-                             "(nexmon CSI) or serial:<port>")
+                             "(nexmon CSI) or serial:<port> (a CSI receiver or "
+                             "a sensor node — see serial_node.py)")
     parser.add_argument("--seconds", type=float, default=40.0,
                         help="how long to watch, in seconds of session time")
     parser.add_argument("--rate", type=float, default=20.0, help="frames per second")
@@ -107,7 +108,9 @@ def main(argv=None):
 
     try:
         source = csi.open_source(args.source, seconds=args.seconds, rate=args.rate)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
+        # A serial port that is not there is an OSError, and its message already
+        # names the port and what to check; a traceback would bury that.
         print(f"error: {error}", file=sys.stderr)
         return 2
 
@@ -126,6 +129,7 @@ def main(argv=None):
 
     detections = []
     last_line = 0.0
+    noted = False
     started = time.time()
     read = 0
     failed = None
@@ -137,10 +141,22 @@ def main(argv=None):
             if recorded:
                 # One place defines the recording format: `Frame.as_record`.
                 recorded.write(json.dumps(frame.as_record()) + "\n")
+            # A serial source can switch from sensor channels to CSI once it
+            # sees the first line, so the detector is told each frame.
+            detector.doppler = paced.doppler
             detection = detector.update(frame)
             detections.append(detection)
             if detection.t - last_line >= args.every:
                 last_line = detection.t
+                if not paced.doppler and not noted:
+                    # Said once, at the first line rather than at startup: a
+                    # serial source only learns from that line whether it is
+                    # talking to a CSI receiver or to a board with no radio, and
+                    # a reader who expects a speed and finds "peak=n/a" will
+                    # otherwise read it as a fault.
+                    noted = True
+                    print("note  : this source measures channel changes, not "
+                          "CSI — there is no speed to report", flush=True)
                 line = draw_line(detection, detector.floor, detector.metrics)
                 if interactive:
                     sys.stdout.write("\r" + line[:96])

@@ -69,6 +69,16 @@ DEFAULT_OFF_SIGMA = 2.0
 #: steps, and short enough that an empty room reads as empty promptly.
 DEFAULT_PRESENCE_HOLD = 2.0
 
+#: Smallest spread the threshold may be a multiple of.
+#:
+#: A transmitter's noise keeps `scale` comfortably away from zero, but an ADC
+#: channel that does not move at all — an unconnected pin, a sensor reading a
+#: constant — gives a calibration of exact zeros, so floor and spread are both
+#: zero and `z` would be undefined. The floor/scale pair must never be allowed to
+#: make a real change unmeasurable: an unplugged sensor whose first sample reads
+#: exactly 0 and whose next reads 512 is the largest event in the room.
+MIN_SCALE = 1e-9
+
 
 # ------------------------------------------------------------------- FFT
 def fft(values):
@@ -209,8 +219,13 @@ class MotionDetector:
     def __init__(self, rate=20.0, window=128, calibrate_frames=None,
                  band=DEFAULT_BAND, on_sigma=DEFAULT_ON_SIGMA,
                  off_sigma=DEFAULT_OFF_SIGMA, presence_hold=DEFAULT_PRESENCE_HOLD,
-                 smoothing=3, calibrate_seconds=2.0):
+                 smoothing=3, calibrate_seconds=2.0, doppler=True):
         self.rate = float(rate)
+        # A channel profile has no speed to report: the metric's spectrum says
+        # how fast the profile changed, not how fast anything moved through the
+        # room, and printing it next to the word "Doppler" would invent a
+        # quantity. Sources that are not CSI set this False (serial_node does).
+        self.doppler = bool(doppler)
         self.window = window
         self.band = band
         self.on_sigma = on_sigma
@@ -267,7 +282,7 @@ class MotionDetector:
             return None
         median = _median(self._calibration)
         mad = _median([abs(v - median) for v in self._calibration])
-        return max(1.4826 * mad, 0.25 * median)
+        return max(1.4826 * mad, 0.25 * median, MIN_SCALE)
 
     # ------------------------------------------------------------- update
     def update(self, frame):
@@ -341,7 +356,7 @@ class MotionDetector:
         spectrum, and reporting one would put a confident-looking number next to
         no evidence.
         """
-        if len(self._recent) < self.window:
+        if not self.doppler or len(self._recent) < self.window:
             return None, None
         freqs, powers = power_spectrum(self._recent, self.rate)
         peak, band_power = dominant_frequency(freqs, powers, self.band)
