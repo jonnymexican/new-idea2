@@ -608,6 +608,50 @@ class TestCredentialCheck(Base):
         self.assertIn("no read-only preflight", out.getvalue())
 
 
+class TestStrictRun(Base):
+    """`--strict` is what lets a scheduled run fail when a token is stale.
+
+    Without it `run` exits 0 whatever happens, because half the adapters may
+    legitimately have no credentials and that is a skip, not an error.
+    """
+
+    def run_cli(self, skipped, *extra):
+        result = {"summary": {}, "rows": [], "skipped": skipped}
+        certs = str(Path(self.certs["ca"]).parent)
+        argv = [
+            "run", "--platforms", "telegram", "--json",
+            "--out", str(self.root / "strict-out"), "--certs", certs,
+            "--config", "none.json", *extra,
+        ]
+        with mock.patch.object(platforms, "run", return_value=result), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = platforms.main(argv)
+        return code, out.getvalue()
+
+    def test_a_configured_platform_that_failed_exits_nonzero(self):
+        code, out = self.run_cli(
+            [{"platform": "telegram", "reason": "upload failed: HTTP 401 Unauthorized"}],
+            "--strict",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("telegram", out)
+        self.assertIn("not measured", out)
+
+    def test_an_adapter_without_credentials_is_still_a_pass(self):
+        code, out = self.run_cli(
+            [{"platform": "telegram", "reason": "needs config: telegram_bot_token"}],
+            "--strict",
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("not measured", out)
+
+    def test_without_the_flag_the_exit_status_is_unchanged(self):
+        code, _ = self.run_cli(
+            [{"platform": "telegram", "reason": "upload failed: HTTP 401 Unauthorized"}],
+        )
+        self.assertEqual(code, 0)
+
+
 class TestCatbox(Base):
     def test_reads_the_url_from_plain_text(self):
         stub = StubHttp([

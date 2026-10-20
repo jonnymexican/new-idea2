@@ -82,3 +82,40 @@ jobs:
             --build-path "$RUNNER_TEMP/mega-build" \
             wifi_radar/arduino/mega_channel_node
 
+  provenance-lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          # Caches the wheel downloads, keyed on the lab's own pin set rather
+          # than the root requirements.txt, which it does not share.
+          cache: pip
+          cache-dependency-path: provenance_lab/requirements.txt
+
+      # The lab pins c2pa-python, Pillow, cryptography and requests, and its
+      # tests sign and verify real manifests. It runs in its own job so those
+      # pins never have to agree with the root requirements.txt — the README's
+      # venv is about keeping the lab off a developer's interpreter, which the
+      # job already does on the runner.
+      - name: Install the lab's pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r provenance_lab/requirements.txt
+
+      - name: Report the environment
+        # A native C2PA library that will not load on the runner is the first
+        # thing to check when a test fails here but not locally.
+        run: |
+          python -c "import sys; print(sys.version)"
+          python -c "from importlib.metadata import version; print('c2pa-python', version('c2pa-python')); print('Pillow', version('Pillow')); print('cryptography', version('cryptography')); print('requests', version('requests'))"
+
+      # The suite signs with a generated test CA and serves the platform arm
+      # from a loopback HTTP server, so nothing here reaches the internet.
+      - name: C2PA provenance lab
+        working-directory: provenance_lab
+        run: python -m unittest -v

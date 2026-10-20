@@ -1341,6 +1341,10 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--variants", default=None,
                        help="comma-separated variant names to keep")
     p_run.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
+    p_run.add_argument(
+        "--strict", action="store_true",
+        help="exit 1 if a platform that had credentials could not be measured",
+    )
 
     p_reuse = sub.add_parser("reuse", help="re-fetch the URLs from a previous run")
     p_reuse.add_argument("--from", dest="source", default="out/platforms/platforms.json")
@@ -1455,6 +1459,19 @@ def main(argv: list[str] | None = None) -> int:
             variants,
         )
         print(json.dumps(result["summary"], indent=2) if args.json else render_markdown(result))
+        if args.strict:
+            # An adapter with no credentials is expected to be skipped; one that
+            # was configured and then failed is the thing a scheduled run needs
+            # to shout about, since the exit status is otherwise 0 either way.
+            failed = [
+                item for item in result.get("skipped", [])
+                if not str(item.get("reason", "")).startswith("needs config: ")
+            ]
+            for item in failed:
+                print(f"{item.get('platform', '?'):10s} not measured: "
+                      f"{item.get('reason', '')}")
+            if failed:
+                return 1
         return 0
 
     parser.print_help()
