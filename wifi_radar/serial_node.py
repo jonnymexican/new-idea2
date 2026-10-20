@@ -53,8 +53,22 @@ from wifi_radar import csi
 #: to, which is the one that has to work without being explained.
 DEFAULT_BAUD = 115200
 
+#: `serial:COM5:auto` and `--baud auto`: find the rate instead of assuming it.
+#: The discovery opens the port once per candidate rate, so it costs a few
+#: seconds and resets the board each time — worth it once per session, not on
+#: every frame.
+AUTO_BAUD = "auto"
+
 #: Give up after this long with nothing readable on the port.
 DEFAULT_TIMEOUT = 10.0
+
+#: How long a reconnecting source keeps trying after the board disappears, in
+#: seconds. Long enough to walk to the cable and plug it back in, short enough
+#: that a session does not wait forever for a board that is not coming back.
+DEFAULT_RECONNECT_SECONDS = 120.0
+
+#: Seconds between reconnect attempts.
+RECONNECT_INTERVAL = 1.0
 
 #: A port that sends nothing but noise is misconfigured, not quiet. Same rule as
 #: the nexmon source: stop after this many rejected lines rather than idling.
@@ -128,6 +142,23 @@ def _is_int(text):
         return False
 
 
+def _ends_at_eof(stream):
+    """
+    Whether an empty read means the stream is over.
+
+    `isinstance(stream, io.IOBase)` cannot answer this on its own: pyserial's
+    `Serial` is an `io.RawIOBase`, so the obvious test treats a live port as a
+    finished file. The first quiet read then ends the session — and the first
+    quiet read is guaranteed, because opening the port resets the board and its
+    bootloader says nothing for about a second. The result was a board that was
+    plainly printing, read back as `frames: 0`. A port has `in_waiting` and a
+    `baudrate`; a replay file does not.
+    """
+    if not isinstance(stream, io.IOBase):
+        return False
+    return not (hasattr(stream, "in_waiting") and hasattr(stream, "baudrate"))
+
+
 class SerialSource(csi.Source):
     """
     A stream of frames from a text stream of protocol lines.
@@ -144,10 +175,14 @@ class SerialSource(csi.Source):
     """
 
     def __init__(self, stream, port="?", rate=20.0, timeout=DEFAULT_TIMEOUT,
-                 baud=DEFAULT_BAUD, clock=time.monotonic):
+                 baud=DEFAULT_BAUD, clock=time.monotonic, baud_found=False):
         self.stream = stream
         self.port = port
         self.baud = baud
+        # True when the rate in `baud` was discovered rather than requested, so
+        # the views can say so: a board that reconnects at another rate is then
+        # visible instead of looking like a source that quietly stopped.
+        self.baud_found = baud_found
         self.rate = float(rate)
         self.length = None
         self.timeout = timeout
@@ -157,10 +192,13 @@ class SerialSource(csi.Source):
         self.channels = None
         self.doppler = False           # becomes True on the first CSI line
         self._clock = clock
+        self._eof_on_empty = _ends_at_eof(stream)
         self._last_line = clock()
         self._t0 = None
         self._last_ms = None
+        self._last_absolute = None
         self._wrap = 0
+        self.reboots = 0
         self._arrivals = deque(maxlen=64)
 
     # ------------------------------------------------------------- state
@@ -172,6 +210,16 @@ class SerialSource(csi.Source):
         span = self._arrivals[-1] - self._arrivals[0]
         return (len(self._arrivals) - 1) / span if span > 0 else None
 
+    @property
+    def baud_in_use(self):
+        """The rate the open stream is actually using.
+
+        The port object knows this and the application does not, which matters
+        when a stream is reopened: the number on the page should be the one in
+        effect rather than the one somebody asked for.
+        """
+        return getattr(self.stream, "baudrate", None) or self.baud
+
     def describe(self):
         if self.channels is None:
             kind = "waiting for lines"
@@ -181,8 +229,10 @@ class SerialSource(csi.Source):
             kind = f"{self.channels} sensor channels, no Doppler"
         rate = self.measured_rate
         arrived = "rate not measured yet" if rate is None else f"{rate:.0f}/s"
-        return (f"serial {self.port} at {self.baud} baud, {kind}, {arrived}"
-                + (f", {self.rejected} unreadable lines" if self.rejected else ""))
+        how = " baud (found by scanning)" if self.baud_found else " baud"
+        return (f"serial {self.port} at {self.baud_in_use}{how}, {kind}, {arrived}"
+                + (f", {self.rejected} unreadable lines" if self.rejected else "")
+                + (f", board reset {self.reboots}x" if self.reboots else ""))
 
     def close(self):
         """Release the port. A stream that cannot be closed is not an error."""
@@ -199,7 +249,7 @@ class SerialSource(csi.Source):
         while True:
             raw = self.stream.readline()
             if not raw:
-                if isinstance(self.stream, io.IOBase):
+                if self._eof_on_empty:
                     raise StopIteration
                 self._check_idle()
                 continue
@@ -238,10 +288,23 @@ class SerialSource(csi.Source):
 
             # Undo the 32-bit wrap: a jump of more than half the range backwards
             # is the counter rolling over, not a device that went back in time.
-            if self._last_ms is not None and millis < self._last_ms - MILLIS_WRAP // 2:
-                self._wrap += MILLIS_WRAP
+            # Any *other* backwards step is the board rebooting with the port
+            # still open — the common case on a Mega, whose USB bridge never
+            # disappears — and `millis()` restarts at zero. Re-base on the last
+            # absolute reading so the session clock keeps going forwards; a
+            # detector fed a time that goes backwards would discard the history
+            # it is calibrating against.
+            if self._last_ms is not None:
+                if millis < self._last_ms - MILLIS_WRAP // 2:
+                    self._wrap += MILLIS_WRAP
+                elif millis < self._last_ms and self._last_absolute is not None:
+                    # +1 so the next frame is strictly later than the last one:
+                    # a reboot is a gap, never a step backwards.
+                    self._wrap = self._last_absolute + 1
+                    self.reboots += 1
             self._last_ms = millis
             absolute = millis + self._wrap
+            self._last_absolute = absolute
 
             if self._t0 is None:
                 self._t0 = absolute
@@ -270,14 +333,169 @@ class SerialSource(csi.Source):
             f"serial monitor is holding the port open.")
 
 
+class ReconnectingSource(csi.Source):
+    """
+    A serial source that survives the board going away.
+
+    A reset, a pulled cable and a replug all look the same from here: the port
+    stops producing lines, or the read fails outright. What should not happen is
+    that the session ends — an antenna experiment is exactly the kind of thing
+    interrupted by a reset, and restarting it throws away the calibration that
+    was measured while the room was still.
+
+    Timestamps continue from the last frame plus the real gap, because the
+    board's `millis()` restarts at zero: a detector fed a clock that jumps
+    backwards would treat the whole history as invalid. Reconnects are counted
+    and described, so a session that spent two minutes waiting for a cable says
+    so instead of looking perfect.
+
+    The first open is the caller's job and is not retried. A board that was
+    never there is a bring-up problem the doctor exists for, not something to
+    paper over by waiting; only a stream that worked and then stopped is worth
+    reconnecting.
+    """
+
+    def __init__(self, source, opener, port="?", rate=20.0,
+                 timeout=DEFAULT_TIMEOUT, baud=DEFAULT_BAUD,
+                 give_up_after=DEFAULT_RECONNECT_SECONDS,
+                 retry_seconds=RECONNECT_INTERVAL, clock=time.monotonic,
+                 sleep=time.sleep, notify=None):
+        self._inner = source
+        self._open = opener
+        self.port = port
+        self.baud = baud
+        self.rate = float(rate)
+        self.timeout = timeout
+        self.length = None
+        self.reconnects = 0
+        self.offline = False
+        self.last_error = None
+        self.frames = 0
+        self._give_up = float(give_up_after)
+        self._retry = max(0.01, float(retry_seconds))
+        self._clock = clock
+        self._sleep = sleep
+        self._notify = notify or (lambda message: None)
+        self._offset = 0.0
+        self._last_t = None
+
+    # ------------------------------------------------------------- state
+    @property
+    def channels(self):
+        return self._inner.channels
+
+    @property
+    def doppler(self):
+        return self._inner.doppler
+
+    @property
+    def rejected(self):
+        return self._inner.rejected
+
+    @property
+    def measured_rate(self):
+        return self._inner.measured_rate
+
+    @property
+    def baud_found(self):
+        return getattr(self._inner, "baud_found", False)
+
+    def describe(self):
+        text = self._inner.describe()
+        if self.reconnects:
+            text += f", reconnected {self.reconnects}x"
+        if self.offline:
+            text += f", reconnecting ({self.last_error})"
+        return text
+
+    def close(self):
+        try:
+            self._inner.close()
+        except (AttributeError, OSError):
+            pass
+
+    # ------------------------------------------------------------ stream
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            try:
+                frame = next(self._inner)
+            except StopIteration:
+                # A replay that ran out has ended; reconnecting it would replay
+                # the same file from the top.
+                raise
+            except TimeoutError as error:
+                if not self._reconnect(error):
+                    raise
+                continue
+            except OSError as error:
+                # pyserial raises SerialException, which is an OSError, when
+                # the cable is pulled mid-read.
+                if not self._reconnect(error):
+                    raise
+                continue
+            self.frames += 1
+            if not self._offset:
+                self._last_t = frame.t
+                return frame
+            t = frame.t + self._offset
+            self._last_t = t
+            return csi.Frame(t, frame.values)
+
+    def _reconnect(self, error):
+        """Try to open the port again; True when a new stream is in place."""
+        self.last_error = f"{type(error).__name__}: {error}"
+        self.offline = True
+        try:
+            self._inner.close()
+        except (AttributeError, OSError):
+            pass
+        self._notify(f"{self.port} stopped: {self.last_error.rstrip('.')}. "
+                     f"Reconnecting for up to {self._give_up:.0f}s")
+        started = self._clock()
+        while self._clock() - started < self._give_up:
+            self._sleep(self._retry)
+            try:
+                inner = self._open()
+            except OSError as failure:
+                self.last_error = str(failure)
+                continue
+            if not hasattr(inner, "describe"):
+                # The opener handed back a bare stream. Wrap it here rather than
+                # trust every caller: a pyserial object iterates *lines of
+                # bytes*, so installing one as the source breaks the next frame
+                # and every accessor — which is exactly what a live reconnect
+                # did before this check existed.
+                inner = SerialSource(inner, port=getattr(inner, "port", self.port),
+                                     baud=self.baud, rate=self.rate,
+                                     timeout=self.timeout)
+            gap = max(0.0, self._clock() - started)
+            if self._last_t is not None:
+                # The board's own clock restarted, so the session clock has to
+                # be re-based on the last frame plus the time actually lost.
+                self._offset = self._last_t + gap
+            self._inner = inner
+            self.port = getattr(inner, "port", self.port)
+            self.baud = getattr(inner, "baud", self.baud)
+            self.offline = False
+            self.reconnects += 1
+            self._notify(f"reconnected to {self.port} after {gap:.1f}s")
+            return True
+        self._notify(f"gave up on {self.port} after {self._give_up:.0f}s")
+        return False
+
+
 def parse_spec(rest):
     """
     Split the tail of a `serial:` spec into (port, baud).
 
     `serial:COM3` and `serial:/dev/ttyACM0` use the default baud; an explicit
-    `serial:COM3:9600` overrides it. Only a trailing numeric field is read as a
-    baud rate, because a Windows port name has a colon in it on no platform and
-    a pathspec may.
+    `serial:COM3:9600` overrides it, and `serial:COM3:auto` returns None, which
+    means "find the rate" (see `discover_baud`). Only a trailing numeric or
+    `auto` field is read as a baud, because a Windows port name has a colon in
+    it on no platform and a pathspec may.
     """
     if not rest:
         raise ValueError(
@@ -287,11 +505,43 @@ def parse_spec(rest):
         raise ValueError(f"serial:{rest} has no port before the baud rate")
     port, baud = rest, DEFAULT_BAUD
     head, _, tail = rest.rpartition(":")
-    if head and tail.isdigit():
+    if head and tail.lower() == AUTO_BAUD:
+        port, baud = head, None
+    elif head and tail.isdigit():
         port, baud = head, int(tail)
     if not port:
         raise ValueError(f"serial:{rest} has no port before the baud rate")
     return port, baud
+
+
+def parse_baud(text):
+    """argparse type for `--baud`: an integer, or "auto" for None."""
+    if str(text).strip().lower() == AUTO_BAUD:
+        return None
+    return int(text)
+
+
+def discover_baud(port, baud=DEFAULT_BAUD, scan_seconds=None):
+    """
+    (rate, attempts) for the rate the firmware is actually printing at.
+
+    The doctor already owns this knowledge — which rates to try, how long each
+    needs, and how to tell a wrong rate from a silent board — so this is a call
+    into it rather than a second copy of the scan. The cost is real and is paid
+    once per session: each candidate rate opens and closes the port, and the
+    board resets on every open.
+    """
+    from wifi_radar import doctor
+
+    options = {} if scan_seconds is None else {"scan_seconds": scan_seconds}
+    heard, tried = doctor.find_baud(port, baud=baud, **options)
+    if not heard.get("samples"):
+        rates = ", ".join(str(item["baud"]) for item in tried)
+        raise OSError(
+            f"no samples on {port} at any of {rates} baud. `python -m "
+            f"wifi_radar.doctor --port {port}` says which part is missing — the "
+            f"cable, the sketch, or the rate.")
+    return heard["baud"], tried
 
 
 def identify_port(port):
@@ -365,7 +615,7 @@ def open_serial(port, baud=DEFAULT_BAUD, timeout=0.2):
         ) from None
 
     try:
-        return serial.Serial(port, baud, timeout=timeout)
+        stream = serial.Serial(port, baud, timeout=timeout)
     except (serial.SerialException, OSError, ValueError) as error:
         raise OSError(
             f"cannot open {port} at {baud} baud: {error}. On Windows the board "
@@ -373,6 +623,40 @@ def open_serial(port, baud=DEFAULT_BAUD, timeout=0.2):
             f"on Linux, check that your user is in the dialout group and that no "
             f"serial monitor already holds the port."
         ) from None
+    # Opening the port asserts DTR, which resets the board — and on this Mega the
+    # board then waits in its bootloader for a flash command it is never going to
+    # get, so the session that follows is silent. A second, deliberate DTR edge
+    # releases it: measured on the wire, zero bytes for twenty seconds after a
+    # plain open, and the sketch printing within one second of this.
+    pulse_reset(stream)
+    # Then throw away whatever the driver had buffered from before this open.
+    # A line left over from an earlier session carries an older `millis()`, and
+    # it becomes the session's zero: every real frame after it then looks tens
+    # of seconds in the future, which is exactly how a trial's schedule ran to
+    # its last segment in three seconds with the person still standing there.
+    try:
+        stream.reset_input_buffer()
+    except (AttributeError, OSError):
+        pass
+    return stream
+
+
+def pulse_reset(stream, sleep=time.sleep, settle=0.3, low=0.1):
+    """
+    One deliberate DTR edge, so the board runs the sketch rather than waits.
+
+    A stream with no `dtr` is a test double or a replay, and needs nothing.
+    """
+    if not hasattr(stream, "dtr"):
+        return False
+    try:
+        sleep(settle)
+        stream.dtr = False
+        sleep(low)
+        stream.dtr = True
+        return True
+    except Exception:
+        return False
 
 
 def describe_ports(ports, chosen=None):
@@ -409,7 +693,10 @@ def main(argv=None):
     parser.add_argument("--port", default="auto",
                         help="COM3 on Windows, /dev/ttyACM0 on Linux; "
                              "auto (the default) picks the likely board")
-    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("--baud", type=parse_baud, default=DEFAULT_BAUD,
+                        metavar="RATE|auto",
+                        help="the firmware's serial rate (default %(default)s), "
+                             "or auto to find it the way the doctor does")
     parser.add_argument("--seconds", type=float, default=10.0,
                         help="how long to listen; 0 waits forever")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
@@ -445,15 +732,25 @@ def main(argv=None):
         confidence, reason = identify_port(chosen)
         print(f"opening {port}: {reason}", flush=True)
 
+    baud, found = args.baud, False
+    if baud is None:
+        try:
+            baud, _attempts = discover_baud(port)
+        except OSError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        found = True
+        print(f"found   : {baud} baud", flush=True)
+
     try:
-        stream = open_serial(port, args.baud)
+        stream = open_serial(port, baud)
     except OSError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
     source = SerialSource(stream, port=port, timeout=args.timeout,
-                          baud=args.baud)
-    print(f"listening on {port} at {args.baud} baud", flush=True)
+                          baud=baud, baud_found=found)
+    print(f"listening on {port} at {baud} baud", flush=True)
     started = time.monotonic()
     shown = 0
     try:

@@ -394,6 +394,12 @@ class PacedSource(Source):
         pacing = "paced to real time" if self.realtime else "as fast as possible"
         return f"{self.inner.describe()} ({pacing})"
 
+    def close(self):
+        """Release the inner source's port, which a view may need to reopen."""
+        close = getattr(self.inner, "close", None)
+        if close:
+            close()
+
     @property
     def doppler(self):
         """
@@ -502,6 +508,7 @@ def open_source(spec, **kwargs):
         udp:10.0.0.5:5500    ... on a specific address
         serial:COM3          lines on a USB serial port (see serial_node.py)
         serial:COM3:9600     ... at a baud rate other than 115200
+        serial:COM3:auto     ... at whatever rate the firmware is using
 
     CSI does not come out of a laptop's own WiFi card: Windows exposes RSSI and
     nothing else, and a Linux monitor-mode capture needs a specific chip and a
@@ -542,7 +549,8 @@ def open_source(spec, **kwargs):
         from wifi_radar import serial_node
 
         port, baud = serial_node.parse_spec(rest)
-        if port.strip().lower() == "auto":
+        auto_port = port.strip().lower() == "auto"
+        if auto_port:
             # The board is whatever is plugged in, and asking a person which COM
             # port it got is the step where a first run usually stops.
             chosen = serial_node.choose_port(serial_node.available_ports())
@@ -554,9 +562,50 @@ def open_source(spec, **kwargs):
                     "`python -m wifi_radar.serial_node --list` shows what was "
                     "found.")
             port = chosen.device
+        found = False
+        if baud is None:
+            # `serial:...:auto`: discover the rate once, through the doctor's
+            # scan, and open the session at the answer.
+            baud, _attempts = serial_node.discover_baud(port)
+            found = True
         stream = serial_node.open_serial(port, baud)
-        return serial_node.SerialSource(stream, port=port, baud=baud,
-                                        rate=kwargs.get("rate", 20.0))
+        source = serial_node.SerialSource(
+            stream, port=port, baud=baud, rate=kwargs.get("rate", 20.0),
+            timeout=kwargs.get("timeout") or serial_node.DEFAULT_TIMEOUT,
+            baud_found=found)
+        if not kwargs.get("reconnect", True):
+            return source
+
+        def reopen():
+            """
+            Open the same board again, re-choosing the port when it was auto:
+            a replugged adapter does not always come back under the same name.
+
+            A *source*, not a stream: the reconnection replaces the inner
+            object, and everything downstream asks it for frames and for a
+            description. Returning the port itself used to make the first
+            reconnect the end of the session.
+            """
+            target = port
+            if auto_port:
+                chosen = serial_node.choose_port(serial_node.available_ports())
+                if chosen is None:
+                    raise OSError("serial:auto found no serial port while "
+                                  "reconnecting; plug the board back in")
+                target = chosen.device
+            stream = serial_node.open_serial(target, baud)
+            return serial_node.SerialSource(
+                stream, port=target, baud=baud, rate=kwargs.get("rate", 20.0),
+                timeout=kwargs.get("timeout") or serial_node.DEFAULT_TIMEOUT,
+                baud_found=found)
+
+        return serial_node.ReconnectingSource(
+            source, reopen, port=port, rate=kwargs.get("rate", 20.0),
+            timeout=kwargs.get("timeout") or serial_node.DEFAULT_TIMEOUT,
+            baud=baud,
+            give_up_after=kwargs.get("reconnect_seconds",
+                                     serial_node.DEFAULT_RECONNECT_SECONDS),
+            notify=kwargs.get("notify"))
     raise ValueError(
         f"unknown source {spec!r}: expected sim:<scenario>, file:<path>, "
         f"udp:[host:]port or serial:<port>. "
