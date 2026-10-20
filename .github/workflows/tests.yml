@@ -119,3 +119,32 @@ jobs:
       - name: C2PA provenance lab
         working-directory: provenance_lab
         run: python -m unittest -v
+
+  doctor:
+    # The radar's one hardware-facing command, pinned without hardware: a pty
+    # stands in for the board, and the doctor's contract — exit 0 and say
+    # "printing" when `S,` lines arrive — is enforced against the real port
+    # code rather than a fake object. It has already caught one crash that the
+    # unit tests could not: a driver that refuses the DTR ioctl.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # pyserial is the only dependency the doctor has, and the only one this
+      # job needs; the torch install above would be minutes of nothing.
+      - name: Install pyserial
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyserial
+
+      - name: The doctor against a simulated board
+        # Fails on a verdict other than `printing`, a non-zero exit, or no
+        # counted samples — and prints the JSON it judged, so a red log says
+        # what the doctor actually saw.
+        run: python -m wifi_radar.fakeboard --verbose
