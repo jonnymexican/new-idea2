@@ -46,7 +46,7 @@ cd provenance_lab
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 
-.venv/bin/python -m unittest -v          # 91 tests
+.venv/bin/python -m unittest -v          # 132 tests
 .venv/bin/python lab.py run --out out/full
 ```
 
@@ -269,6 +269,78 @@ credential survive until the platform's cache or transcode budget expires?
 If the refetch file is missing it falls back to the redacted record and warns
 in the report — an anonymous-host URL still works, a token-bearing one will not.
 
+### The scheduled live run
+
+[../.github/workflows/live-platforms.yml](../.github/workflows/live-platforms.yml)
+measures the five credential-backed adapters every Monday at 06:00 UTC, and on
+demand with an optional comma-separated list. It is kept out of the push
+workflow on purpose: a run publishes the fixture to real services, and a fork's
+pull request must not be able to ask for that.
+
+Credentials come from repository secrets under the same names the adapters read
+— `DISCORD_WEBHOOK`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`,
+`MASTODON_INSTANCE` and `MASTODON_TOKEN`, `BLUESKY_HANDLE` and
+`BLUESKY_APP_PASSWORD`, `FACEBOOK_PAGE_ID` and `FACEBOOK_TOKEN`. Missing ones
+are reported as "needs config" while the rest still run, so the workflow is
+useful before any account exists.
+
+`--strict` is what makes the job status mean something. Without it `run` exits 0
+even when every upload failed, because an adapter with no credentials is a skip
+rather than an error. With it, a platform that had credentials and then failed
+returns 1 — and an unconfigured one still does not.
+
+The artifact holds `report.md` and `platforms.json`, the redacted pair. It
+omits `refetch.json` deliberately: that file carries the real served URLs, and
+a Telegram file URL embeds the bot token.
+
+The anonymous hosts are not in the scheduled list. Every run leaves a permanent
+public file there, and the `catbox` control only needs re-measuring when
+transport is in doubt (`platforms.py run --platforms catbox`).
+
+### The page that remembers
+
+```bash
+.venv/bin/python pages.py build --report out/live/platforms.json --site out/site
+.venv/bin/python pages.py publish --site out/site --branch platform-history
+```
+
+A number nobody re-reads is not evidence of drift. Each run is appended to
+`history.json` and rendered as a matrix — one row per adapter, one column per
+run, a colour for what came back — so a platform that quietly starts preserving
+the credential, or quietly stops being measured because a token expired, shows
+up as a change of colour rather than as a paragraph someone has to compare by
+memory.
+
+`pages.py` is deliberately stdlib only: the page is built here, not in the
+browser, so it works with JavaScript disabled, fetches nothing from a CDN, and
+can be rebuilt from the history without the signing stack installed.
+`publish` clones the branch and commits onto it rather than force-pushing, so
+the branch keeps its history and a hand edit there is not discarded.
+
+Publishing and remembering are two different mechanisms, on purpose. Publishing
+is `actions/deploy-pages` and needs one setting: **Settings → Pages → Source:
+GitHub Actions**. Remembering is the `platform-history` branch, which the
+workflow writes *before* deploying so a failed deployment still leaves the run
+recorded. A branch Pages source would not work here: GitHub documents that
+commits pushed by a workflow using `GITHUB_TOKEN` do not trigger a branch build,
+so the branch would fill with history that is never served. The branch also
+holds the rendered page, which is readable in the repository without a
+deployment.
+
+Four verdicts collapse to one colour per platform: `valid` if any rendition kept
+a verifiable credential — the noteworthy result, not the normal one — `invalid`
+if one kept it in a form that fails its own hash, `gone` if none did,
+`unavailable` if the bytes could not be read. A platform with no secret is
+`needs config`; a week whose measurement produced no report is `not measured`,
+because an unmeasured week is not the same as a clean one. A re-run reuses its
+workflow run id, so it replaces its own column instead of adding a second
+reading of the same hour.
+
+Adapter error text is never published. A Discord webhook URL carries its token
+as a path segment and a Telegram file URL carries one after `bot<id>:`, so the
+page keeps only the class of failure (`HTTP 401`, `network error`) instead of
+trying to scrub arbitrary credentials out of free text.
+
 ## What this does not prove
 
 - The signing CA is generated locally, so `trusted` means trusted against that
@@ -292,11 +364,17 @@ in the report — an anonymous-host URL still works, a token-bearing one will no
 - `tests.py` — 16 tests: credential validity and trust, APP11 round-trip,
   each arm, verdict classification, summary counts, matrix integration and
   mode filtering
-- `test_platforms.py` — 75 tests: format sniffing, URL/token redaction, config
+- `test_platforms.py` — 78 tests: format sniffing, URL/token redaction, config
   and environment handling, each adapter's response parsing against a stub,
   Facebook rendition ordering and duplication, the read-only credential checks,
   Telegram chat discovery and its non-consuming update read, refetch handling
   including the ignored-`chmod` fallback, summarisation, HTTP failures, and the
   full upload → fetch → verify path against the local harness
+- `pages.py` — the published trend page: outcome reduction, run history, HTML
+  rendering, and the branch publish (stdlib only)
+- `test_pages.py` — 38 tests: outcome classification and precedence, credential
+  scrubbing of error text, history ordering and idempotence, HTML escaping,
+  streak reporting, build idempotence, and publish against a throwaway bare
+  repository
 - `platforms.example.json` — credential template (the real file is gitignored)
 - `requirements.txt` — pinned c2pa-python, Pillow, cryptography, requests

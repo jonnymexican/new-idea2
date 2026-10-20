@@ -1,0 +1,139 @@
+name: live platforms
+
+# This publishes the signed fixture to real services, so it is not part of the
+# push pipeline: a push cannot afford to post a photo, and a fork's pull request
+# must not be able to ask for one. Weekly is enough to notice a platform
+# changing its transcode, and each run leaves the upload behind — on the
+# anonymous hosts permanently — so there is nothing to gain from running it
+# hourly.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Comma-separated adapters to measure"
+        required: false
+        default: "discord,telegram,mastodon,bluesky,facebook"
+        type: string
+
+# contents: write keeps the page's memory on a branch; pages and id-token are
+# what actions/deploy-pages needs to publish. Nothing else here needs more than
+# read.
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  # A manual run started during the scheduled one would upload the same fixture
+  # twice and produce two reports that disagree about the same hour. Queuing is
+  # cheap; cancelling would abandon a half-finished matrix.
+  group: live-platforms
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    env:
+      # Every one of these is optional. An unset secret expands to an empty
+      # string, load_config ignores blanks, and that adapter is reported as
+      # "needs config" instead of failing the run — so this works before the
+      # secrets exist, and one expired token does not erase the other rows.
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      MASTODON_INSTANCE: ${{ secrets.MASTODON_INSTANCE }}
+      MASTODON_TOKEN: ${{ secrets.MASTODON_TOKEN }}
+      BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+      BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+      FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+      FACEBOOK_TOKEN: ${{ secrets.FACEBOOK_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: provenance_lab/requirements.txt
+
+      - name: Install the lab's pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r provenance_lab/requirements.txt
+
+      - name: Measure the served renditions
+        working-directory: provenance_lab
+        run: |
+          python platforms.py run \
+            --out out/live \
+            --platforms "${{ inputs.platforms || 'discord,telegram,mastodon,bluesky,facebook' }}" \
+            --strict
+
+      - name: Add this run to the trend page
+        # Runs even when --strict failed the step above: the week an adapter
+        # broke is the week the chart most needs a new column. If the
+        # measurement never wrote a report, --expect still records the week as
+        # not measured rather than leaving a silent gap in the series.
+        id: page
+        if: always()
+        run: |
+          python provenance_lab/pages.py build \
+            --report provenance_lab/out/live/platforms.json \
+            --site provenance_lab/out/site \
+            --expect "${{ inputs.platforms || 'discord,telegram,mastodon,bluesky,facebook' }}" \
+            --run-id "${{ github.run_id }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Keep this run in the page's history
+        # The branch is the page's memory, not its publishing source: a push
+        # made with GITHUB_TOKEN does not trigger a branch Pages build (GitHub
+        # documents this), so publishing is deploy-pages below. Writing the
+        # branch first means a deployment that fails still leaves the run
+        # recorded for the next one.
+        # Gated on the build rather than on the job: a failed build must leave
+        # the previous page alone instead of publishing half of one. The push
+        # URL carries the workflow token, which git would otherwise print in
+        # an error message; pages.py scrubs it.
+        id: history
+        if: always() && steps.page.outcome == 'success'
+        run: |
+          python provenance_lab/pages.py publish \
+            --site provenance_lab/out/site \
+            --branch platform-history \
+            --message "platform report ${{ github.run_id }}" \
+            --push-url "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+      - name: Stage the page
+        if: always() && steps.history.outcome == 'success'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: provenance_lab/out/site
+
+      - name: Deploy the page
+        id: deployment
+        if: always() && steps.history.outcome == 'success'
+        uses: actions/deploy-pages@v5
+
+      - name: Upload the report
+        # Even when --strict failed the job, the rows from the adapters that did
+        # work are the evidence for what broke, so the artifact still goes up.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: platform-report
+          # report.md and platforms.json only. refetch.json is deliberately
+          # absent: it holds the real served URLs, and a Telegram file URL
+          # embeds the bot token. Both files here carry redacted URLs.
+          path: |
+            provenance_lab/out/live/report.md
+            provenance_lab/out/live/platforms.json
+          if-no-files-found: warn
+          retention-days: 30
