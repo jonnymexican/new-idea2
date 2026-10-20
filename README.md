@@ -351,11 +351,14 @@ the time since the oldest token still inside the window, so a server busy for
 two seconds is not divided by five and understated by 60%. A window that has
 expired reports zero tokens and zero rate rather than the last rate it saw,
 because an idle machine is not still decoding at its old speed — `total` keeps
-the work that produced it. And the count is rows, not replies: a row whose
-client walked away is still decoded until the batch ends, and it is counted,
-because it is work the machine did. While a reply is streaming, the page shows
-this number next to "sampling…" — with three replies in flight it reads several
-times one row's speed, which is the point of batching.
+the work that produced it. And the count is rows decoded, not replies: a row
+whose client walked away is dropped from the batch before the next pass, so it
+stops being counted at the moment it stops being work. That retirement is why
+the meter falls rather than plateaus when the last browser in a batch closes —
+`/api/info` reports how many rows have left that way under
+`batch.retired`. While a reply is streaming, the page shows this number next to
+"sampling…" — with three replies in flight it reads several times one row's
+speed, which is the point of batching.
 
 `--no-table` skips the sweeps, so a sustained run costs only the time you ask
 for. `--refresh <n>` and `--spec <n>` are chat flags; the browser gets the cached,
@@ -407,10 +410,13 @@ Requests are batched. A worker thread gathers whatever arrived in the last 30 ms
 (up to `--batch`, four by default) and decodes them together, one token per row
 per pass — 8 concurrent replies measured 1178 tokens/s against 321 for one at a
 time, and each reply is exactly what it would have been alone. `--batch 1` turns
-it off; `--batch-wait` changes how long a request waits for company. `/api/info`
-reports what the batching did (`batches`, `replies`, `largest`) and how fast it
-is going right now (`throughput`), and every `done` event carries `batch`, the
-number of rows that shared its model passes.
+it off; `--batch-wait` changes how long a request waits for company. A reply
+whose browser closes is dropped from its batch before the next pass, so it stops
+costing model time instead of being decoded to the end for nobody. `/api/info`
+reports what the batching did (`batches`, `replies`, `largest`), how many rows
+left that way (`retired`), and how fast it is going right now (`throughput`),
+and every `done` event carries `batch`, the number of rows that shared its model
+passes.
 
 Tokens appear as they are sampled, not when the reply ends. The server writes
 newline-delimited JSON over chunked transfer encoding, and the page appends each

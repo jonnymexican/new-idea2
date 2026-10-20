@@ -264,14 +264,19 @@ class GPT(nn.Module):
         this file's suite exercises.
         """
         B, T = idx.shape
-        assert pos_offset + T <= self.block_size, (
-            f"positions {pos_offset}..{pos_offset + T - 1} exceed block_size "
-            f"{self.block_size}"
-        )
         if positions is None:
+            assert pos_offset + T <= self.block_size, (
+                f"positions {pos_offset}..{pos_offset + T - 1} exceed block_size "
+                f"{self.block_size}"
+            )
             pos = torch.arange(pos_offset, pos_offset + T, device=idx.device)
             x = self.token_emb(idx) + self.pos_emb(pos)[None, :, :]
         else:
+            # `pos_offset` is a cache index, and a batched cache can be wider
+            # than a row's own window (a short row sits behind pads, and a row
+            # that set the width can leave). With explicit positions the index
+            # is not used, so it is not asserted: the positions are what has to
+            # fit, and they are checked below.
             assert int(positions.max()) < self.block_size, (
                 f"a batched position reached {int(positions.max())}, past "
                 f"block_size {self.block_size}"

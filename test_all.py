@@ -2004,6 +2004,93 @@ class TestBatchedDecoding(unittest.TestCase):
         self.assertTrue(all(shape[0] == 4 for shape in spy.shapes), spy.shapes)
         self.assertEqual(len(spy.shapes), len(single.shapes))
 
+    def test_a_dropped_row_leaves_the_others_exactly_as_they_were(self):
+        """Retiring a row is a selection on the batch axis, not a rebuilt batch.
+        The survivors keep their cache, their absolute positions and their
+        text, which is what lets a server drop a disconnected client without
+        changing anyone else's reply — and without the re-read that rebuilding
+        would cost every other row.
+        """
+        window, refresh = 12, 4
+        want = [self.solo(p, window, refresh, 18) for p in self.prompts]
+        decoder = infer.BatchDecoder(self.model, self.prompts, window,
+                                     self.greedy(), refresh=refresh)
+        rows = [[] for _ in self.prompts]
+        for step in decoder.steps(6):
+            for b, token in enumerate(step):
+                rows[b].append(token)
+        decoder.drop([1])
+        self.assertEqual(decoder.rows, 2)
+        for step in decoder.steps(12):
+            for b, token in enumerate(step):
+                rows[[0, 2][b]].append(token)
+        self.assertEqual(rows[0], want[0])
+        self.assertEqual(rows[2], want[2])
+        self.assertEqual(rows[1], want[1][:6], "a dropped row produced more")
+
+    def test_a_dropped_row_stops_riding_every_model_call(self):
+        """The pass carries one row fewer, rather than the same batch with one
+        output thrown away: the model must not read weights for nobody.
+        """
+        spy = ModelSpy(self.model)
+        decoder = infer.BatchDecoder(spy, [self.prompts[0]] * 3, 12,
+                                     self.greedy(), refresh=4)
+        for _ in range(4):
+            decoder.step()
+        self.assertTrue(all(shape[0] == 3 for shape in spy.shapes), spy.shapes)
+        decoder.drop([1])
+        before = len(spy.shapes)
+        for step in decoder.steps(8):
+            self.assertEqual(len(step), 2)
+        after = spy.shapes[before:]
+        self.assertTrue(after, "no model pass after the drop")
+        self.assertTrue(all(shape[0] == 2 for shape in after),
+                        "a dropped row was still in a pass")
+
+    def test_a_survivor_advances_inside_a_cache_wider_than_its_window(self):
+        """Dropping the row that set the cache's width leaves the survivor in a
+        cache wider than its own window. Its next token is embedded at the
+        survivor's own position, not at the cache index — that index is what the
+        model used to assert against `block_size`, and after this drop it is
+        past it while the position is not.
+        """
+        torch.manual_seed(0)
+        model = GPT(vocab_size=13, n_embd=16, n_head=2, n_layer=2,
+                    block_size=8, dropout=0.0)
+        model.eval()
+        window, refresh = 8, 2
+        long, short = [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5]
+        decoder = infer.BatchDecoder(model, [long, short], window,
+                                     self.greedy(), refresh=refresh)
+        seen = []
+        for _ in range(window):
+            if (len(decoder.cache) == window and decoder.real[0] == window
+                    and decoder.real[1] == window - 1):
+                break
+            seen.append(decoder.step()[1])
+        else:
+            self.fail("never reached a full cache with a short row one behind")
+        decoder.drop([0])
+        seen.extend(step[0] for step in decoder.steps(10))
+        want = list(infer.Decoder(model, short, window, self.greedy(),
+                                  refresh=refresh).tokens(len(seen)))
+        self.assertEqual(seen, want)
+
+    def test_dropping_always_leaves_a_row_to_decode(self):
+        """An empty batch has no meaning, so it is refused rather than built."""
+        decoder = infer.BatchDecoder(self.model, [[1, 2, 3]] * 2, 12,
+                                     self.greedy())
+        with self.assertRaises(ValueError):
+            decoder.drop([0, 1])
+        with self.assertRaises(IndexError):
+            decoder.drop([2])
+        with self.assertRaises(IndexError):
+            decoder.drop([-1])
+        decoder.drop([])                 # nothing to do is not an error
+        self.assertEqual(decoder.rows, 2)
+        decoder.drop([0, 0])             # the same row twice is one row
+        self.assertEqual(decoder.rows, 1)
+
     def test_a_batch_needs_a_prompt_in_every_row(self):
         with self.assertRaises(ValueError):
             infer.BatchDecoder(self.model, [], 12, self.greedy())
@@ -2299,6 +2386,109 @@ class TestBatchedServing(CheckpointFixture):
         conn.close()                      # gone, mid-reply
         events = self.ask({"prompt": "cabca", "max_new_tokens": 6})
         self.assertEqual(events[-1]["t"], "done")
+
+    def test_a_row_that_left_while_queued_never_reaches_the_model(self):
+        """A client that disconnects between the queue and the batch has no text
+        to produce, so it is dropped before the prefill — not decoded once and
+        then noticed. Called on `_run` directly, because placing a cancelled job
+        in a batch over HTTP would race the worker's gathering window.
+        """
+        session = serve.Session(self.checkpoint, max_batch=2, batch_wait=0.01)
+        spy = ModelSpy(session.model)
+        session.model = spy
+        with session.lock:
+            tokenizer = session.tokenizer
+            gone_ids = tokenizer.encode("abcabc")
+            kept_ids = tokenizer.encode("cabca")
+        gone = serve.Job(serve.validate({"prompt": "abcabc",
+                                         "max_new_tokens": 20}),
+                         gone_ids, session.model.block_size)
+        gone.cancelled = True
+        kept = serve.Job(serve.validate({"prompt": "cabca",
+                                         "max_new_tokens": 12, "seed": 1}),
+                         kept_ids, session.model.block_size)
+
+        session._run([gone, kept])
+        kinds = []
+        while "done" not in kinds:
+            kind, _ = kept.events.get(timeout=5)
+            kinds.append(kind)
+
+        self.assertEqual(kinds[-1], "done")
+        self.assertEqual(kept.events.qsize(), 0, "events after done")
+        self.assertEqual(session.retired_rows, 0, "it never joined a batch")
+        self.assertTrue(spy.shapes, "nothing was decoded")
+        self.assertEqual({shape[0] for shape in spy.shapes}, {1},
+                         f"the departed row was decoded: {spy.shapes}")
+
+    def test_an_abandoned_reply_alone_is_counted_as_retired(self):
+        """The common case: one tab, closed. There is nobody left to share the
+        batch with, so the loop ends rather than dropping a row — but the reply
+        still left because its client did, and the count that says so has to
+        include it. The first version counted after the drop, so a solo reply
+        was never counted at all.
+        """
+        session = serve.Session(self.checkpoint, max_batch=1, batch_wait=0.01)
+        params = serve.validate({"prompt": "abcabc", "max_new_tokens": 400})
+        chunks = []
+
+        def emit(text):
+            chunks.append(text)
+            if len(chunks) >= 2:          # the browser closes after a little text
+                raise serve.ClientGone("gone")
+
+        with self.assertRaises(serve.ClientGone):
+            session.generate(params, emit)
+        deadline = time.time() + 10
+        while session.retired_rows == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(session.retired_rows, 1)
+
+    def test_an_abandoned_row_is_retired_from_the_batch(self):
+        """A closed socket must stop the model reading weights for that row, not
+        merely stop the writes. Checked on a session of this test's own, so no
+        other test's abandoned reply can be the row that moved the count, and on
+        a batch of two so the surviving passes can be seen losing a row.
+        """
+        session = serve.Session(self.checkpoint, max_batch=2, batch_wait=0.3)
+        spy = ModelSpy(session.model)
+        session.model = spy
+        abandoned = serve.validate({"prompt": "abcabc", "max_new_tokens": 400})
+        survivor = serve.validate({"prompt": "cabca", "max_new_tokens": 40,
+                                   "seed": 1})
+        chunks, left, results = [], [], []
+
+        def disappear():
+            def emit(text):
+                chunks.append(text)
+                if len(chunks) >= 3:      # a few tokens, then the browser closes
+                    raise serve.ClientGone("gone")
+            try:
+                session.generate(abandoned, emit)
+            except serve.ClientGone as exc:
+                left.append(exc)
+
+        def finish():
+            results.append(session.generate(survivor, lambda text: None))
+
+        threads = [threading.Thread(target=disappear),
+                   threading.Thread(target=finish)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+
+        self.assertTrue(left, "the abandoned request did not leave")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["steps"], 40)
+        self.assertEqual(results[0]["batch"], 2)
+        self.assertEqual(session.retired_rows, 1)
+        widths = [shape[0] for shape in spy.shapes]
+        self.assertIn(2, widths, "the two requests were never batched")
+        last_shared = max(i for i, width in enumerate(widths) if width == 2)
+        self.assertTrue(widths[last_shared + 1:], "no pass after the drop")
+        self.assertEqual(set(widths[last_shared + 1:]), {1},
+                         f"the abandoned row rode along: {widths}")
 
 
 if __name__ == "__main__":

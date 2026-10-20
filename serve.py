@@ -13,7 +13,9 @@ jobs that arrived within `batch_wait` (30 ms) up to `max_batch` (4), and decodes
 them in one pass per token. A row's text is exactly what it would have been alone
 — the batching cannot be seen from the outside except in `done.batch` — and each
 row samples from its own RNG, so a seeded reply does not change because of the
-company it kept. `--batch 1` restores one reply at a time.
+company it kept. A reply whose client disconnects is dropped from the batch at
+the next pass, so a closed socket stops costing model time rather than being
+decoded to the end for nobody. `--batch 1` restores one reply at a time.
 
     .venv/bin/python serve.py
     .venv/bin/python serve.py --checkpoint runs_v3/model.pt --port 8765
@@ -57,8 +59,9 @@ be placed in the text — see `window_boundary_chars`.
 
 `done` also carries `batch`: how many replies shared its model passes, 1 when it
 was decoded alone. `/api/info` reports the batching as a whole — the limit, the
-gathering window, how many batches have run and the largest one — so a reader can
-tell whether the server is actually batching or merely configured to. It also
+gathering window, how many batches have run, the largest one and how many rows
+have been retired from a batch — so a reader can tell whether the server is
+actually batching or merely configured to. It also
 reports `throughput`, the tokens the worker decoded over the last five seconds,
 which is the only number here the server measures about itself: `bench_decode.py`
 can time a run it started, but not the load someone is putting on this process.
@@ -217,7 +220,8 @@ class Job:
     The request thread fills in the events queue and pushes them to the socket;
     the worker never writes to a socket, which keeps every connection's writes
     on its own thread. `cancelled` is how a disconnected client stops being
-    flushed without the worker needing to know why.
+    flushed, and how its row stops being decoded: the worker checks it between
+    passes and drops the row, without needing to know why the client left.
     """
 
     def __init__(self, params, ids, window):
@@ -264,6 +268,11 @@ class Session:
         # allowed, and that is otherwise invisible.
         self.abandoned_replies = 0
         self.last_abandoned_chunks = 0
+        # Rows removed from a batch because the reply they belonged to had no
+        # reader left. Counted separately from `abandoned_replies`, which the
+        # handler records: this is the worker saying the pass no longer carries
+        # them, which is what stops them costing anything.
+        self.retired_rows = 0
         # What the server is doing right now, as opposed to what it has done:
         # the worker stamps every model pass into this meter.
         self.throughput = Throughput(THROUGHPUT_WINDOW)
@@ -289,6 +298,7 @@ class Session:
                 "replies": self.batched_replies,
                 "last": self.last_batch,
                 "largest": self.largest_batch,
+                "retired": self.retired_rows,
             },
             "checkpoint": self.checkpoint,
             "tokenizer": self.tokenizer.name,
@@ -338,8 +348,10 @@ class Session:
                     raise RuntimeError(payload)
         except BaseException:
             # The client went away (emit raised ClientGone) or the caller gave
-            # up: stop writing to this row. It keeps its place in the batch —
-            # the other rows cannot wait for it — but nothing more is sent.
+            # up: stop writing to this row, and flag it so the worker drops it
+            # from the batch before the next pass. The row is not removed here
+            # because the worker owns the batch; setting the flag is all it
+            # needs to stop decoding tokens nobody will read.
             job.cancelled = True
             raise
 
@@ -375,6 +387,11 @@ class Session:
 
     def _run(self, group):
         """Decode one batch, pushing each row's text to its own job."""
+        # A client that left while its job was queued has no text to produce;
+        # dropping it here saves even the prefill.
+        group = [job for job in group if not job.cancelled]
+        if not group:
+            return
         window = group[0].window
         with self.decode_lock:
             started = time.time()
@@ -410,28 +427,62 @@ class Session:
                                          generators=generators)
             budgets = [job.params["max_new_tokens"] for job in group]
             produced = [0] * len(group)
-            live = set(range(len(group)))
-            while live:
+            # `active` maps a decoder row to its index in `group`; it shrinks as
+            # rows are dropped, so the two never drift apart.
+            active = list(range(len(group)))
+            while active:
+                # A row whose client left is removed before the pass, not
+                # carried: a pass reads every weight for every row it holds, so
+                # decoding for a closed socket costs the rows people are still
+                # waiting on.
+                leaving = [i for i, index in enumerate(active)
+                           if group[index].cancelled]
+                if leaving:
+                    # Counted before the both-cases below: a reply that was
+                    # alone in its batch ends the batch instead of leaving
+                    # rows behind, but its client still walked away and the
+                    # count is what says so.
+                    self.retired_rows += len(leaving)
+                    if len(leaving) == len(active):
+                        break
+                    decoder.drop(leaving)
+                    active = [index for i, index in enumerate(active)
+                              if i not in leaving]
+
                 tokens = decoder.step()
-                # One stamp per pass, counted by row rather than by token: what
-                # the machine produced is what these rows consumed. A row whose
-                # client left is still decoded (the other rows cannot wait for
-                # it), and is still counted here — this is work, not replies.
-                self.throughput.note(len(live))
-                for b in list(live):
-                    job = group[b]
-                    produced[b] += 1
+                # One stamp per pass, counted by row: a pass that carries three
+                # rows produced three tokens. A row that has been retired is
+                # not in this number, because it is no longer work.
+                self.throughput.note(len(active))
+                finished = []
+                for i, index in enumerate(active):
+                    job = group[index]
+                    produced[index] += 1
+                    if job.cancelled:
+                        # It left during this pass. The token is already
+                        # computed, and the row is retired at the top of the
+                        # next one, so there is neither a reader nor another
+                        # pass to spend on it.
+                        continue
                     with self.lock:
-                        shown, stopped = replies[b].append(tokens[b])
-                    if shown and not job.cancelled:
+                        shown, stopped = replies[index].append(tokens[i])
+                    if shown:
                         job.events.put(("chunk", shown))
-                    if stopped or produced[b] >= budgets[b]:
-                        live.discard(b)
-                        if job.cancelled:
-                            continue
+                    if stopped or produced[index] >= budgets[index]:
+                        finished.append(i)
                         job.events.put(("done", self._finish(
-                            job, replies[b], produced[b], window,
+                            job, replies[index], produced[index], window,
                             time.time() - started, len(group))))
+
+                if len(finished) == len(active):
+                    break
+                if finished:
+                    # A finished row has produced its text; it leaves so the
+                    # remaining passes are narrower. Retiring a row nobody
+                    # wants is counted separately, at the top of the loop.
+                    decoder.drop(finished)
+                    active = [index for i, index in enumerate(active)
+                              if i not in finished]
 
     def _finish(self, job, reply, steps, window, seconds, batch):
         """The `done` payload: the reply, and the window bookkeeping.

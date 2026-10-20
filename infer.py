@@ -367,7 +367,10 @@ class BatchDecoder:
     not compose is the *stopping*: rows finish at different times and the batch
     keeps computing for the ones still going, which is why `steps` yields the
     same number of tokens for every row whether they were used or not. The
-    caller decides what to keep.
+    caller decides what to keep. A row can also leave the batch: `drop` removes
+    a finished one so later passes are narrower, or an abandoned one so it stops
+    costing anything. No row's computation refers to another's, so the survivors
+    keep their cache, their positions and their text exactly.
     """
 
     def __init__(self, model, prompts, window, samplers=None, refresh=None,
@@ -487,6 +490,54 @@ class BatchDecoder:
         self.read(rows)
 
     @torch.no_grad()
+    def drop(self, rows):
+        """Remove rows from the batch, for callers that have gone away.
+
+        The rows of a batch are independent — no query in one attends to a
+        position in another — so removal is a selection on every tensor with a
+        batch axis, and the survivors keep their cache, their absolute
+        positions and their text. No re-read is needed, which is the point: a
+        re-read caused by one abandoned client would cost every other row a
+        pass, and would be a worse trade than carrying the row to the end.
+
+        Two callers use this for different reasons. A row that finished, or hit
+        its token budget, leaves so the remaining passes are narrower — an
+        optimisation, since its token can no longer change anyone's text. The
+        other reason is the client that disconnects mid-reply: its remaining
+        tokens have no reader at all, and carrying it would make every pass pay
+        for a socket nobody is on.
+
+        The cache keeps its width, so any pads a surviving row still has stay
+        padded and are still masked; the `padded` flag is left alone for that
+        reason rather than recomputed from what is left.
+        """
+        rows = sorted({int(row) for row in rows})
+        if not rows:
+            return
+        for row in rows:
+            if row < 0 or row >= self.rows:
+                raise IndexError(
+                    f"cannot drop row {row}: the batch has {self.rows} rows")
+        keep = [b for b in range(self.rows) if b not in set(rows)]
+        if not keep:
+            raise ValueError("dropping every row would leave nothing to decode")
+        index = torch.tensor(keep, dtype=torch.long)
+        for layer, entry in enumerate(self.cache.entries):
+            if entry is not None:
+                self.cache.set(layer,
+                               entry[0].index_select(0, index).contiguous(),
+                               entry[1].index_select(0, index).contiguous())
+        self.ids = [self.ids[b] for b in keep]
+        self.samplers = [self.samplers[b] for b in keep]
+        self.generators = [self.generators[b] for b in keep]
+        self.real = [self.real[b] for b in keep]
+        self.at = [self.at[b] for b in keep]
+        self.dropped = [self.dropped[b] for b in keep]
+        self.live = self.live.index_select(0, index)
+        self.logits = self.logits.index_select(0, index)
+        self.rows = len(keep)
+
+    @torch.no_grad()
     def advance(self, tokens):
         """Extend every row's cache with one token."""
         if len(tokens) != self.rows:
@@ -502,6 +553,12 @@ class BatchDecoder:
                                torch.ones((self.rows, 1), dtype=torch.bool)],
                               dim=1)
         if self.padded:
+            # Each row's own position, not the cache index: after a row is
+            # dropped the cache can be wider than any survivor's window, so
+            # `Tk - 1` is not a position anyone is at. It is still passed as
+            # `pos_offset`, because that is what the model uses to advance the
+            # cache's length; the explicit positions are what it embeds, and
+            # with them present the offset is not asserted against block_size.
             positions = torch.tensor([[n] for n in self.real], dtype=torch.long)
             self.logits, _ = self.model(
                 idx, cache=self.cache, positions=positions, pos_offset=Tk - 1,

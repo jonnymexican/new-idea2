@@ -296,8 +296,10 @@ oldest token still inside the window, not the window itself, because a process
 busy for two seconds would otherwise divide two seconds of work by five. And an
 expired window reports no tokens and no rate rather than the last rate it saw —
 an idle server is not still decoding — while a running total keeps the work that
-produced the measurement. The count is rows decoded, so a row a client abandoned
-still counts: it is still work, and the batch cannot wait for it to stop.
+produced the measurement. The count is rows decoded, and a row a client
+abandoned leaves the batch at the next pass rather than riding to the end of the
+reply: dropping it is a selection on the batch axis, so the survivors keep their
+cache and their text, and the weights stop being read for a socket nobody is on.
 
 The page does not leave that implicit. It counts how much has fallen out and
 says so in words, and the token view dims the chips the model can no longer
