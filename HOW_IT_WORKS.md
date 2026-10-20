@@ -221,8 +221,8 @@ window, write `refresh - 1` tokens into the free positions, then move the window
 on and read again. The model then sees between `window - refresh + 1` and `window`
 tokens — the same kind of context, with its left edge moving in steps rather than
 one token at a time — and the re-read is amortised over `refresh` tokens. At 64
-and `refresh=16`, 80 tokens cost 6 window reads instead of 81, and 105
-tokens/second becomes 333. `refresh=1` is the un-chunked behaviour and reproduces
+and `refresh=32`, 80 tokens cost 4 window reads instead of 81, and 125
+tokens/second becomes 325. `refresh=1` is the un-chunked behaviour and reproduces
 the old output exactly, which is what lets the tests compare against it.
 
 The other way to buy speed is to do more work per pass: a draft guesses several
@@ -232,9 +232,72 @@ which is why it is the model's own first two layers. If the draft proposes token
 `x` with probability `q(x)` and the target assigns it `p(x)`, accepting with
 probability `min(1, p(x)/q(x))` and otherwise sampling from the leftover
 `(p - q)` mass makes the result distributed exactly as `p` — the draft's mistakes
-cost speed, never accuracy. Here it cost speed as well: on this CPU a batched
-pass is not cheap enough to pay for the draft's serial guesses, so the cache is
-the whole speedup and speculation is an option, not a default.
+cost speed, never accuracy. Here it cost speed as well: on this CPU a pass over
+several tokens is not cheap enough to pay for the draft's serial guesses, so the
+cache is the whole single-reply speedup and speculation is an option, not a
+default.
+
+Serving has a second lever the terminal does not need, and it is not about the
+past at all. Producing one token reads every weight in the model, so the
+arithmetic units spend most of a pass waiting on memory; give the same pass eight
+rows of input and they wait once for eight answers. `BatchDecoder` does that: it
+takes several prompts, pads them on the right to a common width, and passes an
+attention mask that hides the pads from every query — a pad is not a token the
+model was trained to ignore, so it has to be made invisible rather than hoped
+about. Each row also gets its own absolute positions, which is why a padded row's
+logits are the logits it would have had alone, and why a batch of one costs the
+same as a plain decode. The tests hold every row of a mixed-length batch to its
+solo decode, token for token.
+
+The two levers multiply rather than compete. On this CPU, caching alone serves
+325 tokens/s and batching alone (eight rows, no cache) serves 188 — less than the
+cache, not more, because eight rows still re-read the window eighty-one times each.
+Together they serve 1178: the same four window reads as one cached reply, now for
+eight replies at a time. What batching costs is per-reply speed — each of those
+eight rows runs at 147 tokens/s instead of 325 — and that is the trade a server
+makes on purpose, because eight people waiting on one decoder would each wait for
+the ones ahead of them. The batch limit and the 30 ms gathering window are where
+that trade is set.
+
+Those are all peaks, and a plateau is a different question. Comparing two
+decoders over eighty tokens is a comparison; describing a machine takes minutes,
+so `bench_decode.py --sustained` runs one decode for a minute, buckets the tokens
+by second, and prints the best second beside the median of the last thirty. On
+this box one row goes 321 → 298 and eight rows go 1120 → 1032, so the 3.5× is a
+property of the machine rather than of a warm start.
+
+The verdict is deliberately hard to win. Drift is a ratio of medians, so one
+scheduling hiccup cannot invent a thermal story, and it only counts when it
+clears the standard error of those two medians — not the spread of the buckets.
+That distinction was a bug here first: the initial check compared the drift
+against the bucket-to-bucket jitter, and a run whose second half was 34% slower
+was reported as steady because the same minute was also noisy. The error of a
+median shrinks with the number of buckets while the spread does not, which is
+what makes a slow decline visible once the run is long enough. The other lesson
+came from the machine rather than the code: one 60-second run reported half the
+throughput of the four runs either side of it. That is a shared CPU being shared,
+not a thermal limit, and it is why the numbers above are quoted with the error
+that separates the two.
+
+Serving adds a gap worth naming, because the server's own meter reports a slower
+number than the bench and both are true. The bare decoder runs at 326 tokens/s on
+this box; the server's in-process batch, with a job queue and a `Reply` appended
+to per token, at 240–254; a reply streamed to a browser at 124–164, because each
+token is also a write. What batching buys survives all three: three 400-token
+replies in one batch reported 412 tokens/s against 124–164 for one alone.
+
+A benchmark is still a separate program timing a run it started, and a server is
+a different question: the load is somebody else's. So the worker stamps every
+model pass into a five-second trailing window and `/api/info` reports the rate
+over it. Three decisions keep that number from flattering the server. The window
+is trailing rather than cumulative, because a cumulative average is dominated by
+the first minute and cannot show a slowdown. The span is the time since the
+oldest token still inside the window, not the window itself, because a process
+busy for two seconds would otherwise divide two seconds of work by five. And an
+expired window reports no tokens and no rate rather than the last rate it saw —
+an idle server is not still decoding — while a running total keeps the work that
+produced the measurement. The count is rows decoded, so a row a client abandoned
+still counts: it is still work, and the batch cannot wait for it to stop.
 
 The page does not leave that implicit. It counts how much has fallen out and
 says so in words, and the token view dims the chips the model can no longer
@@ -274,19 +337,32 @@ before the rule it means to override loses to it at equal specificity, which is
 what once kept the stacked layout's transcript pane from ever getting the height
 it asked for.
 
+The stacked layout had a second, quieter instance of the same problem. Below the
+breakpoint `main` stopped being two columns but kept its base `flex: 1 1 auto`,
+so as an item of the body column it still consumed the height the header left,
+and its two auto rows split that height instead of taking their own content's.
+The transcript's textarea and buttons then overflowed `section.doc` and were
+painted underneath the settings panel — at 754 px the Continue button belonged to
+the aside, and a click on it hit the panel instead of sending anything. `flex: 0
+0 auto` lets the grid be as tall as its content and the page scroll, which is
+what the breakpoint's own comment had claimed all along. The suite asserts the
+rule now rather than the comment.
+
 [`chat.py`](chat.py) is this same loop with a prompt in front of it: the knobs
 above are commands, the running text is kept as context, and each sampled token
 is written as it arrives so you can watch a sentence form.
-[`serve.py`](serve.py) is the same loop again, with a web page on the front: it
-calls `stream_reply` unchanged and gives it a file-like object that writes each
-flushed chunk to the browser as a line of JSON. The streaming is the whole point,
-so it is worth being precise about where it comes from — the sampling loop
-already decides how much text is ready to show and flushes exactly that, which is
-why the browser needs no buffering logic of its own. Nothing about the model
-changes between the terminal and the page; only the sink does. It is worth being
-clear that **this is a completion model, not an assistant** — nothing here was
-instruction-tuned, so the prompt is text to be continued, not a question to be
-answered.
+[`serve.py`](serve.py) is the same machinery with a web page on the front, and
+one thing more: a queue. A request tokenises its prompt, hands a job to a worker
+thread, and then pumps that job's events to its own socket — so several requests
+can be in flight at once, they gather into a batch, and each row's text is
+written as soon as it is sampled. The streaming is the whole point, so it is
+worth being precise about where it comes from: `chat.Reply` holds the text so far
+and returns only the new characters and whether a stop string ended the reply,
+which is the same decision the terminal's loop makes. Nothing about the model
+changes between the terminal and the page — only how many rows it is handed and
+where the bytes go. It is worth being clear that **this is a completion model,
+not an assistant** — nothing here was instruction-tuned, so the prompt is text to
+be continued, not a question to be answered.
 
 ---
 

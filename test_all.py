@@ -22,6 +22,8 @@ before or that the numbers in the README would become wrong without:
 - the edge of the model's window is a real character offset, not an
   approximation: it is cross-checked two ways, works for both tokenizers, and
   goes before the character when a byte-level token cuts one in half
+- a throughput number is quoted only from whole seconds of a run, and a
+  fall-off is only reported when it clears the run's own jitter
 - the window can be deliberately shortened but never stretched past what the
   checkpoint was trained for, and the crop is pinned where sampling noise cannot
   mask it — on the width of the tensors the model is actually handed — alongside
@@ -57,6 +59,7 @@ import torch
 
 from bpe import BYTE_VOCAB, BPETokenizer
 from bpe import train as train_bpe
+import bench_decode
 import chat
 import infer
 import serve
@@ -556,11 +559,13 @@ class ModelSpy:
     def new_cache(self, n_layers=None):
         return self.model.new_cache(n_layers)
 
-    def __call__(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None):
+    def __call__(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None,
+                 positions=None, attend=None):
         self.shapes.append(tuple(idx.shape))
         self.offsets.append(pos_offset)
         return self.model(idx, targets=targets, cache=cache,
-                          pos_offset=pos_offset, n_layers=n_layers)
+                          pos_offset=pos_offset, n_layers=n_layers,
+                          positions=positions, attend=attend)
 
 
 class TestContextWindow(unittest.TestCase):
@@ -1149,6 +1154,11 @@ class TestWebServer(CheckpointFixture):
     def test_info_survives_a_page_reload(self):
         first = json.loads(self.get("/api/info")[1])
         second = json.loads(self.get("/api/info")[1])
+        # The decode meter is a measurement of *now* and is expected to move
+        # between two reads; what this pins is that no request's settings leak
+        # into the description of the model.
+        first.pop("throughput")
+        second.pop("throughput")
         self.assertEqual(first, second)
         self.assertEqual(first["checkpoint"], self.checkpoint)
 
@@ -1427,6 +1437,14 @@ class TestPageLayout(unittest.TestCase):
         main = self.props("main", self.NARROW)
         self.assertEqual(main.get("grid-template-columns"), "1fr")
         self.assertEqual(main.get("align-content"), "start")
+        # Rows sized to their content means the grid itself must not be sized by
+        # the viewport. As a flex item with `flex-grow: 1` it took the height the
+        # header left, and its two auto rows split it — so the transcript's
+        # textarea and buttons overflowed their section and were painted under
+        # the settings panel, which put the Continue button behind the aside.
+        grow, _, basis = flex_factors(self.declarations("main", self.NARROW))
+        self.assertEqual(grow, 0.0, "the stacked grid still eats the viewport")
+        self.assertEqual(basis, "auto")
         self.assertEqual(self.props("body", self.NARROW).get("overflow"), "auto")
         _, pane_shrink, pane_basis = flex_factors(
             self.declarations(".doc-scroll", self.NARROW))
@@ -1875,6 +1893,412 @@ class TestCachedDecoding(unittest.TestCase):
             observed = counts[index] / trials
             self.assertLess(abs(observed - expected), 4 * sigma,
                             f"token {index}: {observed:.4f} vs {expected:.2f}")
+
+
+class TestBatchedDecoding(unittest.TestCase):
+    """infer.py: several rows in one pass, and the promise they do not touch.
+
+    The claim batching makes is not that it is fast — `bench_decode.py` measures
+    that — but that a row's text is the text it would have had alone. Everything
+    here checks a batched row against the same slow loop the cache is checked
+    against, because padding, a shared cache and a shared sampler are three
+    places one row could quietly leak into another.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        cls.model = GPT(vocab_size=13, n_embd=16, n_head=2, n_layer=3,
+                        block_size=12, dropout=0.0)
+        cls.model.eval()
+        # Deliberately unequal: two inside the window, one over it.
+        cls.prompts = [[1, 2, 3, 4, 5, 6, 7, 8, 9], [4, 5, 6],
+                       [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2]]
+
+    @staticmethod
+    def greedy():
+        return infer.Sampler(temperature=1e-8, top_k=1)
+
+    def solo(self, prompt, window, refresh, count):
+        return list(infer.Decoder(self.model, prompt, window, self.greedy(),
+                                  refresh=refresh).tokens(count))
+
+    def batched(self, prompts, window, refresh, count):
+        decoder = infer.BatchDecoder(self.model, prompts, window, self.greedy(),
+                                     refresh=refresh)
+        rows = [[] for _ in prompts]
+        for step in decoder.steps(count):
+            for b, token in enumerate(step):
+                rows[b].append(token)
+        return rows
+
+    def test_each_row_is_exactly_the_text_it_would_have_alone(self):
+        """Greedy, so a difference cannot be blamed on a draw. The prompts are
+        of different lengths, so every row is padded; the window is smaller than
+        one prompt, so every row also has to re-anchor."""
+        for window, refresh in ((12, 4), (12, 1), (12, 12), (5, 2)):
+            with self.subTest(window=window, refresh=refresh):
+                want = [self.solo(p, window, refresh, 24) for p in self.prompts]
+                self.assertEqual(self.batched(self.prompts, window, refresh, 24),
+                                 want)
+
+    def test_a_short_prompt_beside_a_long_one_keeps_its_own_window(self):
+        """The first version of this shared one cache and one re-anchor, and a
+        long sibling pulled a short row into an early re-read — its text changed
+        because of a request it had never met. Now each row drops its oldest
+        tokens on its own schedule, and a row still inside its window is re-read
+        whole rather than trimmed."""
+        short = [1, 2, 3]
+        long = [1, 2, 3, 4, 5] * 3
+        self.assertEqual(
+            self.batched([short, long], 12, 4, 20),
+            [self.solo(short, 12, 4, 20), self.solo(long, 12, 4, 20)])
+
+    def test_a_row_does_not_depend_on_who_it_is_batched_with(self):
+        """The serving invariant: the same prompt, seed and settings give the
+        same text whether the request arrived alone or with two others."""
+        sampler = infer.Sampler(temperature=0.8, top_k=50)
+
+        def row(prompts, count=15):
+            decoder = infer.BatchDecoder(
+                self.model, prompts, 12, [sampler] * len(prompts), refresh=4,
+                generators=[torch.Generator().manual_seed(5)
+                            for _ in prompts])
+            return [step[0] for step in decoder.steps(count)]
+
+        alone = row([self.prompts[0]])
+        self.assertEqual(alone, row([self.prompts[0], self.prompts[1],
+                                     self.prompts[2]]))
+        self.assertEqual(alone, row([self.prompts[0]]), "not even repeatable")
+
+    def test_no_row_ever_attends_to_a_pad(self):
+        """Padding is hidden by the mask, not by luck: checked directly, because
+        a larger vocabulary would make a leak into an ordinary-looking word."""
+        live = infer.BatchDecoder._live([2, 5], 5)
+        mask = infer.BatchDecoder._causal(live, 5, 5)
+        self.assertFalse(bool(mask[0, :, 2:].any()), "a pad was visible")
+        self.assertTrue(bool(mask[1, -1].all()), "a real position was hidden")
+        self.assertTrue(bool(mask[0, 0, 0]) and not bool(mask[0, 0, 1]))
+
+        # The case that was wrong first: a pad *between* real positions, once a
+        # short row has kept decoding past it.
+        live = torch.tensor([[True, True, False, True]])
+        mask = infer.BatchDecoder._causal(live, 1, 4)
+        self.assertEqual(mask[0, 0].tolist(), [True, True, False, True])
+
+    def test_four_rows_cost_the_calls_of_one(self):
+        """What batching is for, stated as a count rather than a stopwatch.
+
+        Identical prompts so no row re-anchors earlier than another: four rows
+        then take exactly the model calls one row takes, each with four rows in
+        it. A test that only timed this would pass on a fast machine for the
+        wrong reason.
+        """
+        spy = ModelSpy(self.model)
+        list(infer.BatchDecoder(spy, [self.prompts[0]] * 4, 12, self.greedy(),
+                                refresh=4).steps(20))
+        single = ModelSpy(self.model)
+        list(infer.Decoder(single, self.prompts[0], 12, self.greedy(),
+                           refresh=4).tokens(20))
+
+        self.assertTrue(all(shape[0] == 4 for shape in spy.shapes), spy.shapes)
+        self.assertEqual(len(spy.shapes), len(single.shapes))
+
+    def test_a_batch_needs_a_prompt_in_every_row(self):
+        with self.assertRaises(ValueError):
+            infer.BatchDecoder(self.model, [], 12, self.greedy())
+        with self.assertRaises(ValueError):
+            infer.BatchDecoder(self.model, [[1, 2], []], 12, self.greedy())
+        with self.assertRaises(ValueError):
+            infer.BatchDecoder(self.model, [[1, 2], [3]], 12,
+                               [self.greedy()])
+
+
+class TestSustainedMeasurement(unittest.TestCase):
+    """bench_decode.py: turning a run into a peak, a plateau and a verdict.
+
+    This arithmetic is what makes a sustained number quotable, so it is checked
+    on synthetic streams whose answer is known exactly. The two ways a
+    throughput claim usually goes wrong are both here: a partial second at the
+    end of a run being reported as a slow one, and ordinary jitter being
+    reported as a thermal limit.
+    """
+
+    @staticmethod
+    def stream(rate, seconds, tick=0.05):
+        """Samples from a run producing `rate(elapsed)` tokens per second."""
+        samples, produced = [(0.0, 0)], 0
+        for i in range(int(round(seconds / tick))):
+            elapsed = (i + 1) * tick
+            produced += int(rate(elapsed - tick) * tick)
+            samples.append((round(elapsed, 10), produced))
+        return samples
+
+    def test_a_flat_run_is_not_called_a_fall_off(self):
+        stats = bench_decode.summarise(self.stream(lambda t: 300, 60))
+        self.assertEqual(len(stats["rates"]), 60)
+        self.assertEqual(stats["peak"], 300)
+        self.assertEqual(stats["plateau"], 300)
+        self.assertEqual(stats["drift"], 0)
+        self.assertTrue(stats["steady"])
+        self.assertEqual(stats["tokens"], 18000)
+
+    def test_a_halved_run_is_called_a_fall_off(self):
+        """The reported drift is the size of the fall, not merely that it fell."""
+        stats = bench_decode.summarise(
+            self.stream(lambda t: 300 if t < 30 else 150, 60, tick=0.1))
+        self.assertAlmostEqual(stats["drift"], 0.5, places=2)
+        self.assertLess(stats["plateau"], stats["peak"] / 2 + 10)
+        self.assertFalse(stats["steady"],
+                         f"drift {stats['drift']:.2f} called steady")
+
+    def test_jitter_without_drift_is_not_a_fall_off(self):
+        """Alternating 280/320 has a flat median; that is noise, not cooling."""
+        stats = bench_decode.summarise(
+            self.stream(lambda t: 280 if int(t) % 2 else 320, 60))
+        self.assertEqual(stats["drift"], 0)
+        self.assertTrue(stats["steady"])
+
+    def test_the_partial_second_at_the_end_is_dropped(self):
+        """10.5 seconds of 300 tokens/s is ten measurements, not eleven."""
+        samples = self.stream(lambda t: 300, 10.5)
+        rates = bench_decode.bucket_rates(samples)
+        self.assertEqual(len(rates), 10)
+        self.assertAlmostEqual(sum(rates), 3000, delta=1)
+        self.assertLess(sum(rates), samples[-1][1])   # the tail really is unused
+
+    def test_a_run_shorter_than_a_bucket_has_no_measurement_in_it(self):
+        """Better to report nothing than to divide a fraction of a second."""
+        stats = bench_decode.summarise(self.stream(lambda t: 300, 0.4))
+        self.assertEqual(stats["rates"], [])
+        self.assertEqual(stats["peak"], 0.0)
+        self.assertFalse(stats["steady"])
+        self.assertEqual(stats["tokens"], 120)
+        self.assertEqual(stats["elapsed"], 0.4)
+        self.assertEqual(bench_decode.summarise([])["rates"], stats["rates"])
+
+    def test_the_loop_stops_on_the_clock(self):
+        """A step is not a unit of time: the run ends when seconds have passed."""
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def steps():
+            while True:
+                now[0] += 0.25
+                yield [1, 2]
+
+        samples = bench_decode.sustained(steps(), 1.0, clock=clock)
+        self.assertEqual(samples, [(0.0, 0)] + [(0.25 * i, 2 * i) for i in range(1, 5)])
+        self.assertEqual(bench_decode.bucket_rates(samples), [8.0])
+
+    def test_the_sparkline_is_one_character_per_bucket(self):
+        rates = [100, 200, 150, 300, 250]
+        line = bench_decode.sparkline(rates)
+        self.assertEqual(len(line), len(rates))
+        self.assertTrue(set(line) <= set(bench_decode.SHADES))
+        self.assertEqual(bench_decode.sparkline([7, 7, 7]),
+                         bench_decode.SHADES[3] * 3)
+        self.assertEqual(bench_decode.sparkline([]), "")
+
+    def test_a_real_decode_is_measured_in_whole_seconds(self):
+        """The harness runs the decoder it is given, not a simulation of one."""
+        torch.manual_seed(0)
+        model = GPT(vocab_size=13, n_embd=16, n_head=2, n_layer=2,
+                    block_size=12, dropout=0.0)
+        model.eval()
+        decoder = infer.BatchDecoder(model, [[1, 2, 3, 4, 5]] * 2, 12,
+                                     infer.Sampler(temperature=1.0, top_k=5),
+                                     refresh=4)
+        stats = bench_decode.summarise(
+            bench_decode.sustained(decoder.steps(1 << 20), 1.2))
+        self.assertGreaterEqual(len(stats["rates"]), 1)
+        self.assertGreaterEqual(stats["elapsed"], 1.2)
+        self.assertGreaterEqual(stats["tokens"], 2)
+        # Tokens in the unfinished bucket are reported in the total, not charged
+        # to a second that never completed.
+        self.assertLessEqual(sum(stats["rates"]), stats["tokens"])
+        self.assertEqual(len(decoder.ids[0]), len(decoder.ids[1]))
+
+
+class TestThroughputReport(unittest.TestCase):
+    """serve.py: the server's own answer to "how fast is it going now".
+
+    `bench_decode.py --sustained` can only time a run it started itself. This
+    meter is what lets a *running* server report the load it is under, so its two
+    failure modes are pinned here: reporting a window that has expired as though
+    the machine were still busy, and dividing a young burst by the whole window,
+    which understates it by exactly as much as a peak overstates a plateau.
+    """
+
+    def meter(self, window=5.0):
+        now = [0.0]
+        return serve.Throughput(window, clock=lambda: now[0]), now
+
+    def test_a_steady_stream_reports_its_rate(self):
+        """Ten tokens every tenth of a second is 100/s, over any window."""
+        meter, now = self.meter()
+        for _ in range(100):
+            meter.note(10)
+            now[0] += 0.1
+        info = meter.read()
+        self.assertEqual(info["window_s"], 5.0)
+        self.assertAlmostEqual(info["tokens_per_second"], 100.0, delta=2.0)
+        # Exactly one window survives, and only that: 50 passes of 10 tokens.
+        self.assertEqual(info["tokens"], 500)
+        self.assertLessEqual(info["span_s"], 5.0)
+        self.assertEqual(info["total"], 1000)
+
+    def test_an_expired_window_reports_nothing_but_keeps_the_total(self):
+        """An idle server is not still decoding at the speed it last had."""
+        meter, now = self.meter()
+        meter.note(5)
+        now[0] += 5.0                     # exactly one window later
+        info = meter.read()
+        self.assertEqual(info["tokens"], 0)
+        self.assertEqual(info["tokens_per_second"], 0.0)
+        self.assertEqual(info["span_s"], 0.0)
+        self.assertEqual(info["total"], 5)
+
+    def test_a_young_burst_is_divided_by_its_own_span(self):
+        """Two seconds of work is not averaged over a five-second window."""
+        meter, now = self.meter()
+        meter.note(20)
+        now[0] += 2.0
+        info = meter.read()
+        self.assertEqual(info["tokens"], 20)
+        self.assertAlmostEqual(info["span_s"], 2.0, places=2)
+        self.assertAlmostEqual(info["tokens_per_second"], 10.0, places=1)
+
+    def test_a_single_pass_is_floored_rather_than_divided_by_zero(self):
+        """One pass stamped and read at the same instant is a floor, not 20,000/s."""
+        meter, _ = self.meter()
+        meter.note(2)
+        info = meter.read()
+        self.assertEqual(info["span_s"], serve.Throughput.MIN_SPAN)
+        self.assertEqual(info["tokens_per_second"],
+                         round(2 / serve.Throughput.MIN_SPAN, 1))
+
+    def test_nothing_decoded_is_not_a_measurement_of_zero(self):
+        """Five seconds of silence after a reply is an empty window, not a rate."""
+        meter, now = self.meter()
+        meter.note(8)
+        now[0] += 30.0
+        meter.note(0)                     # an empty pass is not work
+        info = meter.read()
+        self.assertEqual(info["tokens"], 0)
+        self.assertEqual(info["total"], 8)
+
+
+class TestBatchedServing(CheckpointFixture):
+    """serve.py: overlapping browser requests, decoded in one pass.
+
+    A real server and real sockets, because what is new here is the scheduling:
+    a queue, a gathering window and a worker thread, none of which a mocked
+    session would exercise.
+    """
+
+    HOST = "127.0.0.1"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.checkpoint = os.path.join(cls.tmp.name, "model.pt")
+        CheckpointFixture("setUpClass").write_checkpoint(cls.checkpoint)
+        # A longer gathering window than the default, so the threads started
+        # together below are reliably in the same batch rather than usually.
+        cls.server = serve.build_server(cls.checkpoint, cls.HOST, 0, max_batch=4,
+                                        batch_wait=0.2)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def ask(self, body, keep_conn=False):
+        conn = http.client.HTTPConnection(self.HOST, self.port, timeout=120)
+        conn.request("POST", "/api/generate", json.dumps(body),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        if keep_conn:
+            return conn, resp
+        events = []
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            events.append(json.loads(line.decode()))
+        conn.close()
+        return events
+
+    def info(self):
+        conn = http.client.HTTPConnection(self.HOST, self.port, timeout=30)
+        conn.request("GET", "/api/info")
+        payload = json.loads(conn.getresponse().read().decode())
+        conn.close()
+        return payload
+
+    def together(self, bodies):
+        results = {}
+
+        def worker(index):
+            results[index] = self.ask(bodies[index])
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(len(bodies))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+
+    def test_overlapping_requests_share_one_batch(self):
+        bodies = [{"prompt": "abc" + "a" * i, "max_new_tokens": 6, "seed": i}
+                  for i in range(3)]
+        results = self.together(bodies)
+        for index, events in results.items():
+            self.assertEqual(events[-1]["t"], "done", f"request {index}")
+            self.assertEqual(events[-1]["batch"], 3,
+                             f"request {index}: {events[-1].get('batch')}")
+        stats = self.info()["batch"]
+        self.assertEqual(stats["max"], 4)
+        self.assertGreaterEqual(stats["largest"], 3)
+        self.assertGreaterEqual(stats["batches"], 1)
+
+    def test_info_reports_what_the_worker_decoded(self):
+        """The meter is fed by the real worker, not only by its own arithmetic."""
+        before = self.info()["throughput"]["total"]
+        events = self.ask({"prompt": "abc", "max_new_tokens": 6, "seed": 12})
+        self.assertEqual(events[-1]["t"], "done")
+        after = self.info()["throughput"]
+        self.assertEqual(after["window_s"], serve.THROUGHPUT_WINDOW)
+        self.assertGreaterEqual(after["total"] - before, 6)
+        self.assertGreater(after["tokens"], 0)
+        self.assertGreater(after["tokens_per_second"], 0.0)
+
+    def test_a_seeded_reply_is_the_same_alone_and_in_company(self):
+        """What a per-row generator buys: a reply does not change because it was
+        decoded next to someone else's."""
+        body = {"prompt": "abcab", "seed": 7, "max_new_tokens": 8}
+        alone = self.ask(body)[-1]["text"]
+        bodies = [body,
+                  {"prompt": "cabca", "seed": 8, "max_new_tokens": 8},
+                  {"prompt": "bcabc", "seed": 9, "max_new_tokens": 8}]
+        results = self.together(bodies)
+        self.assertEqual(results[0][-1]["text"], alone)
+        self.assertEqual(results[0][-1]["batch"], 3)
+
+    def test_a_client_that_leaves_does_not_stall_the_batch(self):
+        conn, resp = self.ask({"prompt": "abcabc", "max_new_tokens": 400},
+                              keep_conn=True)
+        self.assertEqual(json.loads(resp.readline().decode())["t"], "meta")
+        conn.close()                      # gone, mid-reply
+        events = self.ask({"prompt": "cabca", "max_new_tokens": 6})
+        self.assertEqual(events[-1]["t"], "done")
 
 
 if __name__ == "__main__":

@@ -28,10 +28,12 @@ choose, and a useful one — the model keeps writing, but with less to go on.
 The replies come from `infer.py`, which keeps the attention cache: the window is
 read once and the next tokens are written into it. `--refresh` is how many tokens
 that lasts before the window moves on and is re-read; the default (a quarter of
-the window) is about three times faster than re-reading on every token, and
-`--refresh 1` is the old behaviour, token for token. `--spec` adds speculative
+the window) is about two and a half times faster than re-reading on every token,
+and `--refresh 1` is the old behaviour, token for token. `--spec` adds speculative
 drafts — exact, because the acceptance rule corrects for the draft — which is
-interesting to watch and, on this CPU, slower than the cache alone.
+interesting to watch and, on this CPU, slower than the cache alone. The browser
+server in `serve.py` uses the same decoder, plus batching across requests: a
+feature of serving several replies at once, not of generating one.
 """
 
 import argparse
@@ -42,7 +44,7 @@ import time
 import torch
 
 import infer
-from model import GPT, sample_next
+from model import GPT
 from train import tokenizer_from_state
 
 
@@ -99,6 +101,41 @@ def context_window(model, requested=None):
     return min(int(requested), model.block_size)
 
 
+class Reply:
+    """One reply's text as it arrives: the visible part, and the stop string.
+
+    Both the terminal stream and the server's batcher need the same three
+    things per token — the text so far, the part not shown yet, and whether a
+    stop string has just ended it — so they share this rather than each keeping
+    its own copy of the rules. Two copies would eventually disagree about what
+    counts as finished, and the disagreement would be invisible until a stop
+    string landed on a token boundary.
+    """
+
+    def __init__(self, tokenizer, ids, stop=None):
+        self.tokenizer = tokenizer
+        self.ids = [int(t) for t in ids]
+        self.stop = stop
+        self.base = tokenizer.decode(self.ids)
+        self.text = ""
+        self.shown = 0
+
+    def append(self, token):
+        """Add `token`. Returns (text to show now, whether the reply stopped)."""
+        self.ids.append(int(token))
+        text = self.tokenizer.decode(self.ids)[len(self.base):]
+        stopped = bool(self.stop and self.stop in text)
+        if stopped:
+            # Cut before the stop string, so what was streamed matches what is
+            # returned as the reply.
+            text = text[:text.index(self.stop)]
+        shown = text[self.shown:] if len(text) > self.shown else ""
+        if len(text) > self.shown:
+            self.shown = len(text)
+        self.text = text
+        return shown, stopped
+
+
 def stream_reply(model, tokenizer, ids, args, out, context=None, refresh=None,
                  spec=0, draft_layers=2, guesses=4):
     """Generate a continuation of `ids`, printing it as it arrives.
@@ -114,7 +151,7 @@ def stream_reply(model, tokenizer, ids, args, out, context=None, refresh=None,
     """
     window = context_window(model, context)
     prompt = [int(t) for t in ids[-window:]]
-    base = tokenizer.decode(prompt)
+    reply = Reply(tokenizer, prompt, args.stop)
     started = time.time()
 
     sampler = infer.Sampler(
@@ -131,24 +168,17 @@ def stream_reply(model, tokenizer, ids, args, out, context=None, refresh=None,
     else:
         decoder = infer.Decoder(model, prompt, window, sampler, refresh=refresh)
 
-    steps, shown, text = 0, 0, ""
-    for _ in decoder.tokens(args.max_new_tokens):
+    steps = 0
+    for token in decoder.tokens(args.max_new_tokens):
         steps += 1
-        text = tokenizer.decode(decoder.ids)[len(base):]
-        if args.stop and args.stop in text:
-            # Cut before the stop string, and print only what was kept, so
-            # the streamed output matches what is returned.
-            text = text[:text.index(args.stop)]
-            if len(text) > shown:
-                out.write(text[shown:])
-                out.flush()
-            break
-        if len(text) > shown:
-            out.write(text[shown:])
+        shown, stopped = reply.append(token)
+        if shown:
+            out.write(shown)
             out.flush()
-            shown = len(text)
+        if stopped:
+            break
 
-    return text, steps, time.time() - started
+    return reply.text, steps, time.time() - started
 
 
 def show_tokens(tokenizer, text, out):

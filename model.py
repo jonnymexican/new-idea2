@@ -30,11 +30,13 @@ def top_p_filter(logits, top_p):
     return logits.scatter(-1, order, sorted_logits)
 
 
-def sample_next(logits, temperature=1.0, top_k=None, top_p=None):
+def sample_next(logits, temperature=1.0, top_k=None, top_p=None, generator=None):
     """Turn one position's logits into a single sampled token id.
 
     Shared by training-time sampling and the interactive prompt in chat.py so
-    both use exactly the same sampling rules.
+    both use exactly the same sampling rules. `generator` is how a batched
+    server keeps one request's draws from depending on who else it was batched
+    with: without it, every row would share the global RNG stream.
     """
     logits = logits / max(temperature, 1e-8)
     if top_k is not None and top_k > 0:
@@ -42,7 +44,8 @@ def sample_next(logits, temperature=1.0, top_k=None, top_p=None):
         logits = logits.masked_fill(logits < values[..., [-1]], float("-inf"))
     if top_p is not None:
         logits = top_p_filter(logits, top_p)
-    return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+    return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1,
+                             generator=generator)
 
 
 class KVCache:
@@ -130,13 +133,18 @@ class CausalSelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, x, cache=None, layer=0, pos_offset=0):
+    def forward(self, x, cache=None, layer=0, pos_offset=0, attend=None):
         """Attend over the new tokens, and over the cache of everything before.
 
         Without a cache this is the original full-window attention. With one,
         the new keys and values are appended to what is already there, so a
         single-token call attends over the whole prefix instead of recomputing
         it.
+
+        `attend` (B, T, Tk) replaces the causal mask entirely when given. That
+        is what a batch of prompts of different lengths needs: the rows are
+        right-padded to a common width, and the pads have to be invisible —
+        both as queries and, more importantly, as keys.
         """
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
@@ -156,7 +164,9 @@ class CausalSelfAttention(nn.Module):
 
         # Scaled dot-product attention with the causal mask applied.
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if T > 1:
+        if attend is not None:
+            att = att.masked_fill(~attend[:, None, :, :], float("-inf"))
+        elif T > 1:
             if pos_offset == 0 and T == Tk:
                 # The prefill path, unchanged: the same mask, the same shapes.
                 att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
@@ -200,9 +210,9 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = FeedForward(n_embd, dropout)
 
-    def forward(self, x, cache=None, layer=0, pos_offset=0):
+    def forward(self, x, cache=None, layer=0, pos_offset=0, attend=None):
         x = x + self.attn(self.ln1(x), cache=cache, layer=layer,
-                          pos_offset=pos_offset)
+                          pos_offset=pos_offset, attend=attend)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -237,25 +247,41 @@ class GPT(nn.Module):
     def new_cache(self, n_layers=None):
         return KVCache(self.n_layer if n_layers is None else n_layers)
 
-    def forward(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None):
+    def forward(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None,
+                positions=None, attend=None):
         """Run the model on `idx`, which starts at absolute position `pos_offset`.
 
         `n_layers` stops after that many blocks and still applies the final norm
         and head. That is a smaller model sharing the target's bottom layers, and
         it is what a speculative draft is: not a separately trained model, just
         the cheap prefix of this one.
+
+        `positions` (B, T) overrides the shared `pos_offset` when each row of a
+        batch is at a different absolute position — the reason batched prompts
+        of different lengths do not change each other's text. `attend` (B, T,
+        Tk) replaces the causal mask, and is what hides the padding those rows
+        need. Both default to None, which is the unchanged path every test in
+        this file's suite exercises.
         """
         B, T = idx.shape
         assert pos_offset + T <= self.block_size, (
             f"positions {pos_offset}..{pos_offset + T - 1} exceed block_size "
             f"{self.block_size}"
         )
-        pos = torch.arange(pos_offset, pos_offset + T, device=idx.device)
-        x = self.token_emb(idx) + self.pos_emb(pos)[None, :, :]
+        if positions is None:
+            pos = torch.arange(pos_offset, pos_offset + T, device=idx.device)
+            x = self.token_emb(idx) + self.pos_emb(pos)[None, :, :]
+        else:
+            assert int(positions.max()) < self.block_size, (
+                f"a batched position reached {int(positions.max())}, past "
+                f"block_size {self.block_size}"
+            )
+            x = self.token_emb(idx) + self.pos_emb(positions)
         for layer, block in enumerate(self.blocks):
             if n_layers is not None and layer >= n_layers:
                 break
-            x = block(x, cache=cache, layer=layer, pos_offset=pos_offset)
+            x = block(x, cache=cache, layer=layer, pos_offset=pos_offset,
+                      attend=attend)
         x = self.ln_f(x)
         logits = self.lm_head(x)                        # (B, T, vocab_size)
         if cache is not None:

@@ -19,7 +19,7 @@ the tokenizer and the training loop are all written here; only the backward pass
 | [`infer.py`](infer.py) | Decoding: the KV cache, the window policy, and speculative drafts |
 | [`chat.py`](chat.py) | Interactive prompt for a trained checkpoint |
 | [`serve.py`](serve.py) | Local web prompt: a stdlib server that streams tokens into the browser |
-| [`bench_decode.py`](bench_decode.py) | What the cache and the speculation actually buy, measured |
+| [`bench_decode.py`](bench_decode.py) | What the cache, speculation, batching and a sustained run actually buy, measured |
 | [`test_all.py`](test_all.py) | The test suite (standard library only) — run it after any change |
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
@@ -192,8 +192,8 @@ type text, it continues it, and the running conversation stays in context for th
 next turn. A blank line starts over from a newline, the same seed training uses.
 
 Sampling is streamed token by token, and Ctrl-C stops a reply without leaving.
-On this CPU the cached decoder runs the BPE model at about **330 tokens/second**
-with a full 64-token window, against **105** for the loop that re-reads the window
+On this CPU the cached decoder runs the BPE model at about **320 tokens/second**
+with a full 64-token window, against **125** for the loop that re-reads the window
 on every token — see [Making it faster](#making-it-faster). Very short replies
 report a lower rate: starting up costs about as much as the next twenty tokens.
 `--stop <text>` ends a reply when that text appears, which is the practical way
@@ -230,37 +230,136 @@ than asserting it:
 
 ```
 mode                    tokens/s  speedup   detail
-uncached                     105     1.00x   re-reads the window
-cached refresh=1             122     1.16x   81 window reads for 80 tokens
-cached refresh=8             280     2.67x   11 window reads for 80 tokens
-cached refresh=16            333     3.19x   6 window reads for 80 tokens
-cached refresh=32            334     3.19x   4 window reads for 80 tokens
-spec 2L/2 ahead              304     2.91x   71% of guesses accepted, 1.38 tokens/round
+uncached                     129     1.00x   re-reads the window
+cached refresh=1             125     0.97x   81 window reads for 80 tokens
+cached refresh=8             281     2.19x   11 window reads for 80 tokens
+cached refresh=16            308     2.40x   6 window reads for 80 tokens
+cached refresh=32            325     2.53x   4 window reads for 80 tokens
+spec 1L/6 ahead              289     2.25x   40% of guesses accepted, 2.12 tokens/round
 ```
 
 **The obvious cache does not work, and that is the interesting part.** The
 positional embeddings are absolute and trained to 64, so a cache holding a full
 window has nowhere to put the next token: `refresh=1` re-reads the window on
-every step and lands within 16% of the uncached loop, which is noise plus saved
+every step and lands on top of the uncached loop, which is noise plus saved
 allocation. What makes it pay is re-anchoring in chunks — read the window once,
-write 15 tokens into it, re-read — so the model always sees between 49 and 64
-tokens and 80 tokens cost 6 window reads instead of 81. The saving saturates near
+write 31 tokens into it, re-read — so the model always sees between 33 and 64
+tokens and 80 tokens cost 4 window reads instead of 81. The saving saturates near
 `refresh=16`; `--refresh 1` restores the old, exactly-equivalent behaviour.
 
 **Speculative decoding was implemented, measured, and lost.** The model's own
-first two layers guess two tokens ahead and the target checks both in one pass,
+first two layers guess ahead and the target checks all the guesses in one pass,
 which is exact (the acceptance rule reproduces the target's distribution for
 any draft — the suite verifies that with ten thousand rounds against
 mismatched distributions) but not faster here. On this CPU a one-token pass
-costs about 2 ms and a four-token pass about 2.5 ms, so a batch of four is worth
-far more than one token but the draft's serial guesses cost more than the
-verification saves: best 304 tokens/s against 333 for plain caching. On hardware
-where a batched pass is much cheaper than N single steps it should win, which is
-why `--spec` exists — but the honest result on a laptop is that the cache is the
-whole speedup and speculation is not.
+costs about 2 ms and a four-token pass about 2.5 ms, so the draft's serial
+guesses cost more than the verification saves: best 289 tokens/s against 325 for
+plain caching. On hardware where a batched pass is much cheaper than N single
+steps it should win, which is why `--spec` exists — but the honest result on a
+laptop is that the cache is the whole single-reply speedup and speculation is
+not.
 
-`--refresh <n>` and `--spec <n>` are chat flags; the browser gets the cached
-decoder automatically.
+### Serving several replies at once
+
+A server has a different problem from a terminal: eight people are waiting. The
+cache saves work on the past, and the second lever is the present — a model pass
+reads every weight to produce one row of output, so giving it eight rows costs a
+little more than one row did, rather than eight times as much.
+[`infer.py`](infer.py)'s
+`BatchDecoder` decodes several prompts through one pass, padding the prompts to a
+common width and masking the pads so a row's text is still exactly what it would
+have been alone. `bench_decode.py` measures the two together:
+
+```
+rows x refresh          served/s  per-row/s   detail
+1 row x refresh=1            123        123   81 window reads, 1.0x uncached
+8 rows x refresh=1           188         24   81 window reads, 1.5x uncached
+1 row x refresh=32           321        321   4 window reads, 2.5x uncached
+2 rows x refresh=32          505        252   4 window reads, 3.9x uncached
+4 rows x refresh=32          787        197   4 window reads, 6.1x uncached
+8 rows x refresh=32         1178        147   4 window reads, 9.2x uncached
+16 rows x refresh=32        1494         93   4 window reads, 11.6x uncached
+4 mixed lengths              608        152   9 window reads
+```
+
+**Batch size does not beat the cache; it multiplies it.** Batching eight rows
+*without* the cache serves 188 tokens/s — still less than one row *with* it, at
+321 — so the cache is the larger lever and the one to have. But they compose:
+cache plus eight rows is 1178 tokens/s, about 3.7× what the cache alone serves,
+because each of the four window reads now serves eight replies. Sixteen rows
+reaches 1494 and then flattens out: the machine has two threads to feed.
+
+**Per reply, batching is slower.** Eight rows each run at 147 tokens/s against
+321 alone, so a single user is better served alone and a batch only pays when
+there is someone else waiting. Eight simultaneous 80-token replies finish in
+0.54 s each; queued behind one decoder they would take 2.0 s for the last one.
+That trade is why the server's batch limit defaults to 4 rather than 16, and why
+it gathers for only 30 ms: a lone request should not pay much for company that
+never arrives.
+
+**Mixed lengths cost extra re-reads.** A batch shares one cache, so it re-reads
+when the row closest to its window needs to; four rows with a very short prompt
+among them is 608 tokens/s against 787 for four full ones. The text is
+unaffected — that is what the padding mask buys — and a row that has not yet
+filled its window is re-read whole rather than trimmed, so a short prompt keeps
+its own window instead of inheriting a long sibling's.
+
+**A minute later it is still fast, and that had to be checked.** Every number
+above is the best of three runs of under a second, which is the right way to
+compare two decoders and the wrong way to describe a machine: a peak is what a
+warm start shows, and a plateau is what a long reply gets. `--sustained 60`
+repeats the same cached decode for a minute and reports the second half
+separately, with the error on the medians it compares:
+
+```
+rows   tokens  peak/s  plateau/s  drift      ±  verdict
+   1    17838     321        298    2%  1.2%  steady
+   8    61432    1120       1032    0%  1.1%  steady
+```
+
+Eight rows keep 3.5× one row for the whole minute, and neither drops by more
+than the noise, so the batching claim is not an artefact of short runs. `±` is
+the standard error of the two medians, and a drift below it is not a measurement
+— which matters, because this machine is not quiet: the same 60-second command
+once reported 496 tokens/s for its second half, and four runs straight after it
+reported ~1000 with 0–6% drift. The first was another process competing for the
+two threads, not a thermal limit, which is why the verdict needs the error
+column and why the output ends with a per-second sparkline: a fall-off that does
+not reproduce is not the machine.
+
+**The server can now answer that about itself.** `--sustained` times a run the
+bench started; a server is a different question, because someone else is using
+it. The worker stamps every model pass into a five-second trailing window, and
+`/api/info` reports it:
+
+```
+"throughput": {"window_s": 5.0, "span_s": 2.09, "tokens": 861,
+               "tokens_per_second": 412.4, "total": 2361}
+```
+
+That sample is real: three 400-token replies in flight, decoded as one batch.
+One reply alone on the same box reports 124–164 tokens/s in the same meter, so
+batching still multiplies live throughput about threefold. The absolute numbers
+sit below the bench's, and the difference is the path rather than the model: the
+bare decoder runs at 326 tokens/s here, the server's own in-process batch at
+240–254, and the rest is the cost of writing every token to a socket as its own
+chunk. The meter reports what the server actually did, not what the decoder
+could do — which is the point of having it report at all.
+
+Three details make it honest rather than decorative. The span is
+the time since the oldest token still inside the window, so a server busy for
+two seconds is not divided by five and understated by 60%. A window that has
+expired reports zero tokens and zero rate rather than the last rate it saw,
+because an idle machine is not still decoding at its old speed — `total` keeps
+the work that produced it. And the count is rows, not replies: a row whose
+client walked away is still decoded until the batch ends, and it is counted,
+because it is work the machine did. While a reply is streaming, the page shows
+this number next to "sampling…" — with three replies in flight it reads several
+times one row's speed, which is the point of batching.
+
+`--no-table` skips the sweeps, so a sustained run costs only the time you ask
+for. `--refresh <n>` and `--spec <n>` are chat flags; the browser gets the cached,
+batched decoder automatically.
 
 ## View the loss curve
 
@@ -293,13 +392,25 @@ repeated. `--compare path` overlays another run's validation curve:
 .venv/bin/python serve.py                       # then open http://127.0.0.1:8765/
 .venv/bin/python serve.py --checkpoint runs_v3/model.pt --port 9000
 .venv/bin/python serve.py --open                # open the page for you
+.venv/bin/python serve.py --batch 8             # up to eight replies per pass
+.venv/bin/python serve.py --batch 1             # one at a time (the old shape)
 ```
 
 One standard-library process: no framework, no build step, no new dependency.
 It serves a single self-contained page (inline CSS and JS) and a small JSON API.
-Sampling is not reimplemented — the server calls the same `stream_reply` that
-`chat.py` does, so the browser, the terminal prompt and training-time sampling
-are one code path, and the page says so.
+Sampling is not reimplemented — the server builds its replies from the same
+`Sampler`, `Reply` and `BatchDecoder` that [`infer.py`](infer.py) and
+`chat.py` use, so the browser, the terminal prompt and training-time sampling
+share one set of rules, and the page says so.
+
+Requests are batched. A worker thread gathers whatever arrived in the last 30 ms
+(up to `--batch`, four by default) and decodes them together, one token per row
+per pass — 8 concurrent replies measured 1178 tokens/s against 321 for one at a
+time, and each reply is exactly what it would have been alone. `--batch 1` turns
+it off; `--batch-wait` changes how long a request waits for company. `/api/info`
+reports what the batching did (`batches`, `replies`, `largest`) and how fast it
+is going right now (`throughput`), and every `done` event carries `batch`, the
+number of rows that shared its model passes.
 
 Tokens appear as they are sampled, not when the reply ends. The server writes
 newline-delimited JSON over chunked transfer encoding, and the page appends each
@@ -400,6 +511,11 @@ and would quietly invalidate the results if it broke again:
   past the window, and the speculative path reproduces the greedy sequence while
   the acceptance rule reproduces the target distribution (checked by histogram
   over 10,000 rounds, against a draft that disagrees with it)
+- a batched row is a solo row: every row of a mixed-length batch reproduces its
+  own uncached decode token for token, no pad is ever attended to (including the
+  pad that ends up between a short row's old tokens and its new ones), four rows
+  cost the model calls of one, and overlapping browser requests really do share
+  a batch — with a per-row RNG, so a seeded reply is unchanged by its company
 - the bigram floor is measured on the same validation split as the model, so the
   two can honestly share one bits-per-character axis
 - a resumed run keeps its history, records no duplicate point at the seam step,

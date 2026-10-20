@@ -4,19 +4,27 @@ A local web prompt for a trained checkpoint, streaming tokens into the browser.
 
 One standard-library process serves a single page and a small JSON API. There is
 no framework, no build step and no new dependency: what is new here is the
-plumbing, not the model. Sampling is *not* reimplemented — the server calls the
-same `stream_reply` that `chat.py` uses, so the browser, the terminal prompt and
-training-time sampling all share one code path.
+plumbing, not the model. Sampling is *not* reimplemented — the server builds its
+replies from `infer.Sampler`, `chat.Reply` and `infer.BatchDecoder`, the same
+rules the terminal and training use.
+
+Requests are batched. Each handler queues a job; one worker thread gathers the
+jobs that arrived within `batch_wait` (30 ms) up to `max_batch` (4), and decodes
+them in one pass per token. A row's text is exactly what it would have been alone
+— the batching cannot be seen from the outside except in `done.batch` — and each
+row samples from its own RNG, so a seeded reply does not change because of the
+company it kept. `--batch 1` restores one reply at a time.
 
     .venv/bin/python serve.py
     .venv/bin/python serve.py --checkpoint runs_v3/model.pt --port 8765
+    .venv/bin/python serve.py --batch 8 --batch-wait 0.05
 
 Then open http://127.0.0.1:8765/ .
 
 Endpoints:
 
     GET  /            the page (self-contained: inline CSS and JS)
-    GET  /api/info    checkpoint, tokenizer and model description
+    GET  /api/info    checkpoint, tokenizer, model description, live decode rate
     POST /api/tokens  {"text": ...} -> how the tokenizer splits it
     POST /api/window  {"text": ..., "context": n} -> where the window would fall
     POST /api/generate  JSON settings -> newline-delimited JSON token stream
@@ -38,7 +46,7 @@ and the replies change with it.
 token written), `block_size` (the ceiling), `context` (the window actually
 used), and the two counts that make the window honest: `dropped_tokens` (written,
 but outside the window by the end) and `dropped_prompt_tokens` (tokens of the
-prompt alone that never reached the model, because `stream_reply` crops to the
+prompt alone that never reached the model, because the decoder crops to the
 window). A prompt longer than the window is the quiet case: without that count,
 the page would look as though the model had read all of it.
 
@@ -46,6 +54,14 @@ the page would look as though the model had read all of it.
 transcript the model was given (`prompt + text`), so the page can draw the edge
 of its memory in the place it actually falls. It is null when the offset cannot
 be placed in the text — see `window_boundary_chars`.
+
+`done` also carries `batch`: how many replies shared its model passes, 1 when it
+was decoded alone. `/api/info` reports the batching as a whole — the limit, the
+gathering window, how many batches have run and the largest one — so a reader can
+tell whether the server is actually batching or merely configured to. It also
+reports `throughput`, the tokens the worker decoded over the last five seconds,
+which is the only number here the server measures about itself: `bench_decode.py`
+can time a run it started, but not the load someone is putting on this process.
 
 It is deliberately an NDJSON stream over chunked transfer encoding rather than
 Server-Sent Events: EventSource cannot POST, and 40 lines of fetch plus a
@@ -58,18 +74,34 @@ for anyone who can reach the port, so keep it on 127.0.0.1 unless you mean it.
 
 import argparse
 import json
+import queue
 import threading
 import time
 import webbrowser
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
 
-from chat import context_window, load_model, stream_reply
+import infer
+from chat import Reply, context_window, load_model
 
 DEFAULT_CHECKPOINT = "runs_tok_bpe/model.pt"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+
+# How many replies one model pass may serve, and how long a request waits for
+# company before it starts alone. Four is where `bench_decode.py` measures most
+# of a single reply's speed surviving (197 of 321 tokens/s) while served
+# throughput nearly triples; the gathering window is short enough to be
+# invisible next to a reply of any length.
+DEFAULT_BATCH = 4
+DEFAULT_BATCH_WAIT = 0.03
+
+# The trailing window `/api/info` reports the decode rate over. Long enough to
+# smooth one slow model pass, short enough that a reply which has stopped shows
+# up as stopped rather than as an average of a busier past.
+THROUGHPUT_WINDOW = 5.0
 
 # Generous enough for real use, small enough that a runaway client cannot ask
 # the server to spend the afternoon tokenising a novel.
@@ -83,6 +115,69 @@ MAX_CONTEXT = 4096
 
 class ClientGone(Exception):
     """Raised inside the sampling loop when the browser has disconnected."""
+
+
+class Throughput:
+    """Tokens decoded per second over a trailing window — measured in-process.
+
+    `bench_decode.py --sustained` answers this for a run it started itself, and
+    cannot see a server somebody else is using. The worker can: it calls `note`
+    once per model pass with the number of rows still decoding, and `read`
+    reports the last `window` seconds of that.
+
+    A trailing window rather than a lifetime average, because an average is
+    dominated by whatever happened first and cannot show a slowdown. And a span
+    rather than the window itself: a server busy for two seconds would otherwise
+    divide two seconds of work by five and report 40% of its real speed, which is
+    the same error as quoting a peak, in the other direction.
+
+    A window that has expired reports no tokens and no rate rather than the last
+    rate it saw — an idle server is not still decoding at its old speed. `total`
+    survives the expiry, so the measurement can always be checked against the
+    work that produced it.
+    """
+
+    # One model pass can be well under a millisecond, and a span that short says
+    # nothing about rate while dividing by almost zero. Rates below this span
+    # are a floor, not a measurement.
+    MIN_SPAN = 0.05
+
+    def __init__(self, window=THROUGHPUT_WINDOW, clock=time.monotonic):
+        self.window = float(window)
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.marks = deque()          # (when, how many tokens at that pass)
+        self.total = 0
+
+    def note(self, tokens=1):
+        """Record `tokens` decoded now — one call per model pass."""
+        tokens = int(tokens)
+        if tokens <= 0:
+            return
+        now = self.clock()
+        with self.lock:
+            self._trim(now)
+            self.marks.append((now, tokens))
+            self.total += tokens
+
+    def _trim(self, now):
+        cutoff = now - self.window
+        while self.marks and self.marks[0][0] <= cutoff:
+            self.marks.popleft()
+
+    def read(self):
+        now = self.clock()
+        with self.lock:
+            self._trim(now)
+            if not self.marks:
+                return {"window_s": self.window, "span_s": 0.0, "tokens": 0,
+                        "tokens_per_second": 0.0, "total": self.total}
+            tokens = sum(n for _, n in self.marks)
+            span = max(now - self.marks[0][0], self.MIN_SPAN)
+            return {"window_s": self.window, "span_s": round(span, 2),
+                    "tokens": tokens,
+                    "tokens_per_second": round(tokens / span, 1),
+                    "total": self.total}
 
 
 # --------------------------------------------------------------------- model
@@ -116,24 +211,65 @@ def window_boundary_chars(tokenizer, text, ids, block):
     return None
 
 
-class Session:
-    """A loaded checkpoint, shared by every request.
+class Job:
+    """One reply waiting for the batch that will decode it.
 
-    `sample_next` and `tokenizer.encode` are called from request threads, and a
-    BPE tokenizer keeps a merge cache as it goes, so generation is serialised
-    with a lock: one model on one CPU means one reply at a time anyway, and this
-    makes the sharing obviously safe rather than subtly so.
+    The request thread fills in the events queue and pushes them to the socket;
+    the worker never writes to a socket, which keeps every connection's writes
+    on its own thread. `cancelled` is how a disconnected client stops being
+    flushed without the worker needing to know why.
     """
 
-    def __init__(self, checkpoint):
+    def __init__(self, params, ids, window):
+        self.params = params
+        self.ids = [int(t) for t in ids]
+        self.window = window
+        self.events = queue.Queue()
+        self.cancelled = False
+
+
+class Session:
+    """A loaded checkpoint, and the batch that serves requests from it.
+
+    Generation is batched rather than serialised: requests that arrive while a
+    batch is still gathering are decoded together, one token per row per model
+    pass. On a CPU that is the difference between one weight read per token and
+    one per token *per row*, which is why it is worth a queue and a worker
+    thread rather than the simple lock this used to hold.
+
+    There are two locks, and the split matters. `lock` guards the tokenizer,
+    whose BPE merge cache is state, and is held only for single calls; a request
+    must be able to tokenise its prompt while the previous batch is still
+    decoding. `decode_lock` guards the model, and is held by the worker for one
+    batch at a time — so the model is never entered twice at once.
+    """
+
+    def __init__(self, checkpoint, max_batch=DEFAULT_BATCH,
+                 batch_wait=DEFAULT_BATCH_WAIT):
         self.checkpoint = checkpoint
         self.model, self.tokenizer, self.ckpt = load_model(checkpoint)
         self.lock = threading.Lock()
+        self.decode_lock = threading.Lock()
+        self.max_batch = max(1, int(max_batch))
+        self.batch_wait = max(0.0, float(batch_wait))
+        self.jobs = queue.Queue()
+        # What the batching actually did, rather than what it was configured
+        # to do. Reported by /api/info and asserted by the tests.
+        self.batches = 0
+        self.batched_replies = 0
+        self.last_batch = 0
+        self.largest_batch = 0
         # Replies the browser walked away from, and how far each got. Worth
         # counting: an abandoned reply stops at whatever the socket buffering
         # allowed, and that is otherwise invisible.
         self.abandoned_replies = 0
         self.last_abandoned_chunks = 0
+        # What the server is doing right now, as opposed to what it has done:
+        # the worker stamps every model pass into this meter.
+        self.throughput = Throughput(THROUGHPUT_WINDOW)
+        self.worker = threading.Thread(target=self._serve_batches,
+                                       name="batch-worker", daemon=True)
+        self.worker.start()
 
     def note_abandoned(self, chunks):
         """Record an abandoned reply: `chunks` includes the write that failed."""
@@ -145,6 +281,15 @@ class Session:
         return {
             "abandoned_replies": self.abandoned_replies,
             "last_abandoned_chunks": self.last_abandoned_chunks,
+            "throughput": self.throughput.read(),
+            "batch": {
+                "max": self.max_batch,
+                "wait_ms": round(self.batch_wait * 1000, 1),
+                "batches": self.batches,
+                "replies": self.batched_replies,
+                "last": self.last_batch,
+                "largest": self.largest_batch,
+            },
             "checkpoint": self.checkpoint,
             "tokenizer": self.tokenizer.name,
             "vocab_size": self.tokenizer.vocab_size,
@@ -172,61 +317,150 @@ class Session:
     def generate(self, params, emit):
         """Stream a continuation of `params['prompt']`, calling emit(text).
 
-        Everything below this line is chat.py's code: the settings are handed to
-        `stream_reply` in the small namespace it reads, and `emit` is a
-        file-like object that writes each flushed chunk to the browser.
+        The reply is decoded by the batch worker, not here: this queues a job
+        and pumps its events to `emit` as they arrive, which is what lets two
+        requests that overlap in time share one model pass. The return value is
+        what it always was — the reply, its statistics and the window it used —
+        so a caller cannot tell whether it shared its batch.
         """
-        out = _EmitterStream(emit)
-        block = self.model.block_size
-        # What the model will actually be given: the request may ask for less
-        # than this checkpoint can hold, and never for more.
-        window = context_window(self.model, params["context"])
-        args = argparse.Namespace(
-            temperature=params["temperature"],
-            top_k=params["top_k"],
-            top_p=params["top_p"],
-            repetition_penalty=params["repetition_penalty"],
-            penalty_window=params["penalty_window"],
-            max_new_tokens=params["max_new_tokens"],
-            stop=params["stop"],
-        )
-
         with self.lock:
-            if params["seed"] is not None:
-                # Seeding per request, so the same text and seed reproduce the
-                # same continuation — which is what makes this testable.
-                torch.manual_seed(params["seed"])
             ids = self.tokenizer.encode(params["prompt"])
-            prompt_tokens = len(ids)
-            text, steps, seconds = stream_reply(self.model, self.tokenizer,
-                                                ids, args, out, context=window)
-            # The transcript the model was given, and the tokens it made of it.
-            # `in_context` is that whole sequence: every token written.
-            full = params["prompt"] + text
+        job = Job(params, ids, context_window(self.model, params["context"]))
+        self.jobs.put(job)
+        try:
+            while True:
+                kind, payload = job.events.get()
+                if kind == "chunk":
+                    emit(payload)
+                elif kind == "done":
+                    return payload
+                else:
+                    raise RuntimeError(payload)
+        except BaseException:
+            # The client went away (emit raised ClientGone) or the caller gave
+            # up: stop writing to this row. It keeps its place in the batch —
+            # the other rows cannot wait for it — but nothing more is sent.
+            job.cancelled = True
+            raise
+
+    # ------------------------------------------------------------ batching
+    def _serve_batches(self):
+        """Gather a batch, decode it, repeat — the only thread that samples."""
+        while True:
+            group = [self.jobs.get()]
+            deadline = time.monotonic() + self.batch_wait
+            while len(group) < self.max_batch:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    group.append(self.jobs.get(timeout=remaining))
+                except queue.Empty:
+                    break
+            # A batch shares one cache and so one window; requests asking for
+            # different windows are decoded as separate batches rather than
+            # being quietly cropped to the smallest, which would change the
+            # text of a reply that asked for more context.
+            pending = group
+            while pending:
+                head = pending.pop(0)
+                same = [job for job in pending if job.window == head.window]
+                pending = [job for job in pending if job.window != head.window]
+                batch = [head] + same
+                try:
+                    self._run(batch)
+                except Exception as exc:      # noqa: BLE001 - report, keep serving
+                    for job in batch:
+                        job.events.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _run(self, group):
+        """Decode one batch, pushing each row's text to its own job."""
+        window = group[0].window
+        with self.decode_lock:
+            started = time.time()
+            self.batches += 1
+            self.last_batch = len(group)
+            self.largest_batch = max(self.largest_batch, len(group))
+            self.batched_replies += len(group)
+
+            prompts, replies, samplers, generators = [], [], [], []
+            for job in group:
+                params = job.params
+                prompt = job.ids[-window:]
+                prompts.append(prompt)
+                with self.lock:      # decoding walks the tokenizer's caches
+                    replies.append(Reply(self.tokenizer, prompt, params["stop"]))
+                samplers.append(infer.Sampler(
+                    temperature=params["temperature"],
+                    top_k=params["top_k"],
+                    top_p=params["top_p"],
+                    repetition_penalty=params["repetition_penalty"],
+                    penalty_window=params["penalty_window"]))
+                if params["seed"] is None:
+                    generators.append(None)
+                else:
+                    # A stream per row, so a seeded reply does not depend on
+                    # who it was batched with — the same seed and prompt still
+                    # reproduce the same text.
+                    generator = torch.Generator()
+                    generator.manual_seed(params["seed"])
+                    generators.append(generator)
+
+            decoder = infer.BatchDecoder(self.model, prompts, window, samplers,
+                                         generators=generators)
+            budgets = [job.params["max_new_tokens"] for job in group]
+            produced = [0] * len(group)
+            live = set(range(len(group)))
+            while live:
+                tokens = decoder.step()
+                # One stamp per pass, counted by row rather than by token: what
+                # the machine produced is what these rows consumed. A row whose
+                # client left is still decoded (the other rows cannot wait for
+                # it), and is still counted here — this is work, not replies.
+                self.throughput.note(len(live))
+                for b in list(live):
+                    job = group[b]
+                    produced[b] += 1
+                    with self.lock:
+                        shown, stopped = replies[b].append(tokens[b])
+                    if shown and not job.cancelled:
+                        job.events.put(("chunk", shown))
+                    if stopped or produced[b] >= budgets[b]:
+                        live.discard(b)
+                        if job.cancelled:
+                            continue
+                        job.events.put(("done", self._finish(
+                            job, replies[b], produced[b], window,
+                            time.time() - started, len(group))))
+
+    def _finish(self, job, reply, steps, window, seconds, batch):
+        """The `done` payload: the reply, and the window bookkeeping.
+
+        `seconds` is wall clock from the batch starting to this row's last
+        token — what its client actually waited, not a share of the batch.
+        `batch` is how many rows shared the passes, so a reader can tell a
+        reply that was served alone from one that was not.
+        """
+        full = job.params["prompt"] + reply.text
+        with self.lock:
             full_ids = self.tokenizer.encode(full)
-            in_context = len(full_ids)
-            # Inside the lock as well: decoding walks the tokenizer's cache.
             boundary_chars = window_boundary_chars(self.tokenizer, full,
                                                    full_ids, window)
-
-        # `stream_reply` keeps the last `window` tokens, so everything before
-        # them is invisible to the model. Counted and reported rather than left
-        # for the reader to infer from a running total — and located, as an
-        # offset into the transcript, so the page can draw the edge of the
-        # window where it actually falls instead of at some approximation.
+        prompt_tokens = len(job.ids)
         # `window` and not `block`: the counts belong to the window that was
         # used, while `block_size` stays what the model could have held.
         return {
-            "text": text,
+            "text": reply.text,
             "steps": steps,
             "seconds": seconds,
             "prompt_tokens": prompt_tokens,
             "dropped_prompt_tokens": max(0, prompt_tokens - window),
-            "in_context": in_context,
-            "dropped_tokens": max(0, in_context - window),
+            "in_context": len(full_ids),
+            "dropped_tokens": max(0, len(full_ids) - window),
             "boundary_chars": boundary_chars,
             "context": window,
-            "block_size": block,
+            "block_size": self.model.block_size,
+            "batch": batch,
         }
 
     def window_for(self, text, context):
@@ -249,26 +483,6 @@ class Session:
             "dropped_tokens": max(0, len(ids) - window),
             "boundary_chars": boundary_chars,
         }
-
-
-class _EmitterStream:
-    """A minimal write/flush sink that turns text into streamed chunks.
-
-    `stream_reply` already flushes exactly the text it wants shown, so no
-    buffering logic is duplicated here — a write *is* a chunk.
-    """
-
-    def __init__(self, emit):
-        self.emit = emit
-        self.chunks = 0
-
-    def write(self, text):
-        if text:
-            self.emit(text)
-            self.chunks += 1
-
-    def flush(self):
-        pass
 
 
 # ---------------------------------------------------------------- validation
@@ -531,11 +745,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_stream()
 
 
-def build_server(checkpoint=DEFAULT_CHECKPOINT, host=DEFAULT_HOST, port=DEFAULT_PORT):
+def build_server(checkpoint=DEFAULT_CHECKPOINT, host=DEFAULT_HOST, port=DEFAULT_PORT,
+                 max_batch=DEFAULT_BATCH, batch_wait=DEFAULT_BATCH_WAIT):
     """Create the server without starting it. Used by main() and by the tests."""
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
-    server.session = Session(checkpoint)
+    server.session = Session(checkpoint, max_batch=max_batch,
+                             batch_wait=batch_wait)
     return server
 
 
@@ -680,7 +896,14 @@ PAGE = """<!doctype html>
        rows are sized to their content instead of being stretched to fit, or
        the token view is squeezed to nothing by the transcript above it. */
     body { overflow: auto; }
-    main { grid-template-columns: 1fr; align-content: start; }
+    /* `flex: 0 0 auto` is not decoration: `main` is a flex item of the body
+       column, and the base rule's `flex: 1 1 auto` made it consume the viewport
+       height. Its two auto rows then split that height rather than taking their
+       content's, so the transcript's textarea and buttons overflowed
+       `section.doc` and were painted *under* the settings panel — at 754px the
+       Continue button belonged to the aside, and clicking it hit the aside.
+       Letting `main` be as tall as its content is what makes the page scroll. */
+    main { grid-template-columns: 1fr; align-content: start; flex: 0 0 auto; }
     .doc-scroll { flex: 0 0 38vh; }
     aside { border-left: 0; border-top: 1px solid var(--line); }
   }
@@ -803,8 +1026,9 @@ keeps count of how much has gone.</span></div>
 
     <div class="hint" style="font-size:11.5px;margin-top:10px">
       Sampling rules and the repetition penalty are <code>chat.py</code>'s —
-      this page calls the same <code>stream_reply</code>, so the terminal prompt
-      and the browser behave identically.
+      the browser decodes through the same <code>infer</code> as the terminal
+      prompt, so the two behave identically. Overlapping requests are batched
+      into one model pass; <code>done</code> says how many shared it.
     </div>
   </aside>
 </main>
@@ -1081,6 +1305,19 @@ keeps count of how much has gone.</span></div>
     $("stop").disabled = false;
     statusEl.textContent = "sampling…";
     let count = 0, closing = "", cut = null;
+    // This reply's speed is in the status line below; the server's own meter is
+    // what the machine is doing for everyone. With three replies in flight it
+    // reads several times one row's rate, which is the point of batching, and it
+    // is the same number `/api/info` reports rather than a second opinion.
+    const meter = setInterval(() => {
+      fetch("/api/info").then((r) => r.json()).then((info) => {
+        const t = info.throughput;
+        if (streaming && t && t.tokens_per_second > 0) {
+          statusEl.textContent =
+            `sampling… · ${t.tokens_per_second.toFixed(0)} decoded/s`;
+        }
+      }).catch(() => {});
+    }, 1000);
 
     try {
       const response = await fetch("/api/generate", {
@@ -1147,6 +1384,7 @@ keeps count of how much has gone.</span></div>
         closing = "failed";
       }
     } finally {
+      clearInterval(meter);
       streaming = false;
       live.classList.remove("live");
       live = null;
@@ -1257,6 +1495,12 @@ def main():
                          "use the model")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help="0 picks a free port and prints it")
+    ap.add_argument("--batch", type=int, default=DEFAULT_BATCH,
+                    help="replies one model pass may serve at once "
+                         f"(default {DEFAULT_BATCH}; 1 disables batching)")
+    ap.add_argument("--batch-wait", type=float, default=DEFAULT_BATCH_WAIT,
+                    help="seconds a request waits for batch company "
+                         f"(default {DEFAULT_BATCH_WAIT})")
     ap.add_argument("--open", action="store_true",
                     help="open the page in a browser once it is listening")
     args = ap.parse_args()
@@ -1265,7 +1509,8 @@ def main():
     # socket is not bound until it is done — so say so, flushed, rather than
     # leaving the user staring at a URL that is not answering yet.
     print(f"loading    : {args.checkpoint}", flush=True)
-    server = build_server(args.checkpoint, args.host, args.port)
+    server = build_server(args.checkpoint, args.host, args.port,
+                          max_batch=args.batch, batch_wait=args.batch_wait)
     host, port = server.server_address[0], server.server_address[1]
     url = f"http://{host}:{port}/"
 
@@ -1273,6 +1518,9 @@ def main():
           f"vocab {server.session.tokenizer.vocab_size}", flush=True)
     print(f"model      : {server.session.model.num_params():,} params, "
           f"{server.session.model.block_size}-token context", flush=True)
+    print(f"batches    : up to {server.session.max_batch} replies per model "
+          f"pass, {round(server.session.batch_wait * 1000)} ms gathering window",
+          flush=True)
     print(f"listening  : {url}", flush=True)
     print("Ctrl-C to stop.", flush=True)
 

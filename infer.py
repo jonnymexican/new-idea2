@@ -37,6 +37,14 @@ draft and comparing the histogram against p.
 `Sampler` holds the sampling rules so the plain path and the speculative path
 cannot drift apart: the same temperature, cutoffs and repetition penalty define
 both p and q, which is what makes the comparison meaningful.
+
+`BatchDecoder` is the serving answer to a different cost: not the past, but the
+idle time. A CPU generating one token at a time reads every weight in the model
+to produce a single row of output, so the arithmetic units are mostly waiting on
+memory. Give it eight rows and the same weights serve all eight — the pass costs
+more, but far less than eight passes. That is why batching and caching are not
+rivals: the cache removes work, batching makes the remaining work pay for more
+rows. `bench_decode.py` measures both, and their product.
 """
 
 import torch
@@ -90,10 +98,14 @@ class Sampler:
             logits = top_p_filter(logits, self.top_p)
         return F.softmax(logits, dim=-1)
 
-    def sample(self, row, history):
-        """One token id, drawn exactly as `sample_next` draws it."""
+    def sample(self, row, history, generator=None):
+        """One token id, drawn exactly as `sample_next` draws it.
+
+        `generator` lets a batched row draw from its own stream, so its reply
+        does not depend on what it happened to be batched with.
+        """
         return int(sample_next(self.penalise(row, history), self.temperature,
-                               self.top_k, self.top_p))
+                               self.top_k, self.top_p, generator=generator))
 
     def draw(self, probs):
         return int(torch.multinomial(probs, num_samples=1)[0, 0])
@@ -337,3 +349,185 @@ def decode(model, ids, window, sampler, max_tokens, spec=0, draft_layers=2,
     else:
         decoder = Decoder(model, ids, window, sampler, refresh=refresh)
     yield from decoder.tokens(max_tokens)
+
+
+class BatchDecoder:
+    """Several prompts decoded together, in one model pass per step.
+
+    The rows do not have to be the same length. They are right-padded to a
+    common width, and the pads are hidden by an attention mask rather than by a
+    sentinel the model might have been trained to notice; the padded positions
+    keep the absolute positions they would have had alone, so a row's logits
+    are the same ones it would get on its own. There is a test that holds a
+    batched row to a solo decode token for token, because that is the whole
+    claim batching is allowed to make.
+
+    Caching works exactly as it does for one row — a re-anchor is one pass over
+    the batch instead of one per row — so the two savings compose. What does
+    not compose is the *stopping*: rows finish at different times and the batch
+    keeps computing for the ones still going, which is why `steps` yields the
+    same number of tokens for every row whether they were used or not. The
+    caller decides what to keep.
+    """
+
+    def __init__(self, model, prompts, window, samplers=None, refresh=None,
+                 generators=None):
+        if not prompts:
+            raise ValueError("a batch needs at least one prompt")
+        self.model = model
+        self.window = max(1, int(window))
+        self.refresh = max(1, min(int(refresh) if refresh else max(1, self.window // 4),
+                                  self.window))
+        self.ids = []
+        for prompt in prompts:
+            ids = [int(t) for t in prompt]
+            if not ids:
+                raise ValueError("cannot decode from an empty prompt")
+            self.ids.append(ids[-self.window:])
+        self.rows = len(self.ids)
+
+        if samplers is None or isinstance(samplers, Sampler):
+            samplers = [samplers or Sampler()] * self.rows
+        self.samplers = list(samplers)
+        if len(self.samplers) != self.rows:
+            raise ValueError("give one sampler per row, or one for the batch")
+        self.generators = [None] * self.rows if generators is None else list(generators)
+        if len(self.generators) != self.rows:
+            raise ValueError("give one generator per row, or none")
+
+        # The pads are masked out, so their id carries no information at all.
+        self.pad = 0
+        self.cache = None
+        self.logits = None
+        self.real = [0] * self.rows      # real tokens currently in the cache
+        self.at = [0] * self.rows        # which logit row predicts each next token
+        self.dropped = [0] * self.rows   # tokens each row has left behind
+        self.padded = False              # whether the cache holds any pad at all
+        self.live = None                 # which cache positions hold real tokens
+        self.reads = 0
+        self.prefill()
+
+    def _matrix(self, rows):
+        """Right-pad `rows` to one width. Returns the ids and the real lengths."""
+        width = max(len(row) for row in rows)
+        idx = torch.full((len(rows), width), self.pad, dtype=torch.long)
+        lengths = []
+        for b, row in enumerate(rows):
+            kept = row[-width:]
+            idx[b, :len(kept)] = torch.tensor(kept, dtype=torch.long)
+            lengths.append(len(kept))
+        return idx, lengths
+
+    @staticmethod
+    def _live(lengths, width):
+        """Which of `width` cache positions hold a real token in each row."""
+        live = torch.zeros((len(lengths), width), dtype=torch.bool)
+        for b, n in enumerate(lengths):
+            live[b, :n] = True
+        return live
+
+    @staticmethod
+    def _causal(live, T, Tk):
+        """Who may attend to whom: earlier positions, and no pad ever.
+
+        `live` rather than a length, because a pad is not always at the end:
+        once a short row keeps decoding beside a long one, new tokens land
+        *after* its pads. Counting real tokens would then include the pads.
+        """
+        keys = torch.arange(Tk).view(1, 1, Tk)
+        queries = torch.arange(T).view(1, T, 1) + (Tk - T)
+        return (keys <= queries) & live[:, None, :]
+
+    @torch.no_grad()
+    def read(self, rows):
+        """Read `rows` into a fresh cache and keep the last logits of each."""
+        self.reads += 1
+        idx, lengths = self._matrix(rows)
+        width = idx.size(1)
+        self.padded = any(n != width for n in lengths)
+        self.live = self._live(lengths, width)
+        self.cache = self.model.new_cache()
+        if self.padded:
+            positions = torch.arange(width).view(1, width).expand(len(rows), width)
+            self.logits, _ = self.model(
+                idx, cache=self.cache, positions=positions,
+                attend=self._causal(self.live, width, width))
+        else:
+            # Equal lengths: the ordinary path, unchanged down to the mask, so a
+            # batch of one costs what a single decode costs.
+            self.logits, _ = self.model(idx, cache=self.cache)
+        self.real = list(lengths)
+        self.at = [n - 1 for n in lengths]
+
+    @torch.no_grad()
+    def prefill(self):
+        self.read(self.ids)
+
+    @torch.no_grad()
+    def reanchor(self):
+        """One re-read for the whole batch, but each row keeps its own schedule.
+
+        A row still inside its window has nothing to drop, so it is re-read in
+        full — which costs nothing in accuracy, because a prefix read at the
+        same positions is the same computation. Only rows that have actually
+        filled the window give up their oldest tokens, exactly as `Decoder`
+        does. Without that distinction a long sibling would silently shorten a
+        short prompt's text, which is the one thing batching must not do.
+        """
+        keep = max(1, self.window - self.refresh + 1)
+        rows = []
+        for b, ids in enumerate(self.ids):
+            available = len(ids) - self.dropped[b]
+            if available > self.window:
+                take = keep
+                self.dropped[b] = len(ids) - take
+            else:
+                take = available
+            rows.append(ids[-take:])
+        self.read(rows)
+
+    @torch.no_grad()
+    def advance(self, tokens):
+        """Extend every row's cache with one token."""
+        if len(tokens) != self.rows:
+            raise ValueError(f"expected {self.rows} tokens, got {len(tokens)}")
+        # The trigger is any row's own fill, not the cache's length: pads
+        # occupy cache slots without using up anyone's window.
+        if any(n + 1 > self.window for n in self.real):
+            self.reanchor()
+            return
+        Tk = len(self.cache) + 1
+        idx = torch.tensor([[int(t)] for t in tokens], dtype=torch.long)
+        self.live = torch.cat([self.live,
+                               torch.ones((self.rows, 1), dtype=torch.bool)],
+                              dim=1)
+        if self.padded:
+            positions = torch.tensor([[n] for n in self.real], dtype=torch.long)
+            self.logits, _ = self.model(
+                idx, cache=self.cache, positions=positions, pos_offset=Tk - 1,
+                attend=self._causal(self.live, 1, Tk))
+        else:
+            self.logits, _ = self.model(idx, cache=self.cache,
+                                        pos_offset=Tk - 1)
+        self.real = [n + 1 for n in self.real]
+        # A one-token pass returns one position, so the predicting logit is 0 —
+        # not the cache index it sits at.
+        self.at = [0] * self.rows
+
+    @torch.no_grad()
+    def step(self):
+        """One token per row, drawn from that row's own logits and history."""
+        tokens = []
+        for b in range(self.rows):
+            row = self.logits[b:b + 1, self.at[b], :]
+            token = self.samplers[b].sample(row, self.ids[b],
+                                            generator=self.generators[b])
+            self.ids[b].append(token)
+            tokens.append(token)
+        self.advance(tokens)
+        return tokens
+
+    def steps(self, count):
+        """`count` steps, each a list of one token per row."""
+        for _ in range(count):
+            yield self.step()
