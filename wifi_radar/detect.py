@@ -69,6 +69,67 @@ DEFAULT_OFF_SIGMA = 2.0
 #: steps, and short enough that an empty room reads as empty promptly.
 DEFAULT_PRESENCE_HOLD = 2.0
 
+#: How long to measure the empty-room floor before deciding anything, in seconds.
+#:
+#: Two seconds is enough for a radio, whose noise is flat and fast. It is not
+#: enough for an input that drifts: a wire on an ADC pin picks up a slow mains
+#: envelope, and a two-second sample of it is a sample of one part of that
+#: envelope — calibrate on the quiet half-second and the other half of every
+#: cycle reads as movement for the rest of the session. So `calibrate_seconds`
+#: is a *minimum*, and the detector keeps measuring while the input still shows
+#: slow change; passing a number fixes the window at that length instead.
+DEFAULT_CALIBRATE_SECONDS = 2.0
+
+#: Longest the automatic calibration will wait for a drifting input to settle.
+#:
+#: The waiting has a point — a window that covers whole cycles of a slow
+#: envelope estimates the floor the rest of the session will be judged against —
+#: but an input that never repeats (a hand on the sensor, a slowly emptying
+#: battery) would otherwise calibrate forever. 40 s covers three cycles of the
+#: 0.1 Hz mains envelope a wire picks up, which is the case this was built for.
+DEFAULT_CALIBRATE_LIMIT_SECONDS = 40.0
+
+#: How often automatic calibration asks whether it has measured enough, in
+#: seconds. Once a cycle is cheap: the check is a median and an FFT over the
+#: samples so far, and repeated checks would only make the decision noisier.
+CALIBRATE_PROBE_SECONDS = 1.0
+
+#: How many cycles of the slowest visible component to cover before stopping.
+#: Fewer than this and the window is a sample of part of the envelope, which is
+#: the mistake the automatic length exists to prevent.
+CALIBRATE_CYCLES = 3
+
+#: How much of the frame-to-frame change the high-pass has to remove before the
+#: input counts as drifting, as a ratio of the filtered to unfiltered metric.
+#: Measured on a simulated ADC drift the ratio is 0.2-0.4; on a quiet radio, a
+#: walking person, and breathing it is 0.94-0.95 — the filter either takes most
+#: of the change away or almost none of it, so anywhere in the gap would do.
+CALIBRATE_DRIFT_RATIO = 0.6
+
+#: Time constant of the baseline the metric is compared against, in seconds.
+#:
+#: A change slower than this is treated as the input moving under the detector
+#: rather than as something happening in front of it: mains hum on a wire, a
+#: supply sagging, a sensor warming up. 0.5 s is below the 0.3 Hz bottom of the
+#: motion band, so a walk passes through unchanged (measured: 97.1% of the walk
+#: detected with any value from 0 to 1 s), while the ten-second envelope a wire
+#: on an ADC pin picks up is attenuated. 0 turns it off.
+DEFAULT_HIGHPASS_SECONDS = 0.5
+
+def parse_calibrate(text):
+    """
+    `--calibrate` for argparse: seconds, or "auto" for the automatic length.
+
+    Auto is the default because the length that works depends on what the input
+    is doing, not on what the user knows about it, and the wrong guess is silent:
+    a too-short window does not fail, it just calls the rest of the session
+    movement.
+    """
+    if isinstance(text, str) and text.strip().lower() == "auto":
+        return None
+    return float(text)
+
+
 #: Smallest spread the threshold may be a multiple of.
 #:
 #: A transmitter's noise keeps `scale` comfortably away from zero, but an ADC
@@ -219,7 +280,9 @@ class MotionDetector:
     def __init__(self, rate=20.0, window=128, calibrate_frames=None,
                  band=DEFAULT_BAND, on_sigma=DEFAULT_ON_SIGMA,
                  off_sigma=DEFAULT_OFF_SIGMA, presence_hold=DEFAULT_PRESENCE_HOLD,
-                 smoothing=3, calibrate_seconds=2.0, doppler=True):
+                 smoothing=3, calibrate_seconds=DEFAULT_CALIBRATE_SECONDS,
+                 calibrate_max_seconds=DEFAULT_CALIBRATE_LIMIT_SECONDS,
+                 highpass_seconds=DEFAULT_HIGHPASS_SECONDS, doppler=True):
         self.rate = float(rate)
         # A channel profile has no speed to report: the metric's spectrum says
         # how fast the profile changed, not how fast anything moved through the
@@ -233,17 +296,37 @@ class MotionDetector:
         self.presence_hold = float(presence_hold)
         self.presence_window = max(4, int(round(2.0 * self.rate)))
         self.smoothing = max(1, smoothing)
+        # `calibrate_seconds=None` means automatic: measure at least the default
+        # minimum, and keep going while the input still drifts.
+        self.calibrate_auto = calibrate_seconds is None
+        minimum = DEFAULT_CALIBRATE_SECONDS if calibrate_seconds is None else calibrate_seconds
+        self.calibrate_seconds = float(minimum)
         self.calibrate_frames = (calibrate_frames if calibrate_frames is not None
-                                 else int(round(calibrate_seconds * self.rate)))
+                                 else int(round(self.calibrate_seconds * self.rate)))
+        self.calibrate_limit_frames = int(round(calibrate_max_seconds * self.rate))
+        self.calibrate_probe_frames = max(1, int(round(CALIBRATE_PROBE_SECONDS * self.rate)))
+        self.highpass_seconds = float(highpass_seconds)
         self.reset()
 
     def reset(self):
         self._prev_shape = None
+        self._slow = None            # per-channel baseline for the high-pass
+        self._prev_high = None       # previous high-passed shape
         self._recent = []            # smoothed metric, latest last
         self._raw = []               # for the smoothing filter only
         self._calibration = []       # smoothed metric during calibration
         self._cal_changes = []       # per-subcarrier change during calibration
+        self._cal_raw = []           # unfiltered metric during calibration
+        self._cal_filtered = []      # high-passed metric during calibration
         self._cal_samples = 0
+        self._cal_done = self.calibrate_frames <= 0
+        self._cal_reason = "fixed" if self._cal_done else None
+        # While the length is automatic the honest share of the work done is
+        # unknown, so progress is measured against the longest it may take; the
+        # browser shows seconds elapsed for exactly that reason.
+        self._cal_target = max(1, self.calibrate_limit_frames
+                               if self.calibrate_auto else self.calibrate_frames)
+        self._cal_next_probe = self.calibrate_frames
         self.frames = 0
         self._motion = False
         self._presence = False
@@ -253,11 +336,30 @@ class MotionDetector:
     # -------------------------------------------------------------- state
     @property
     def calibrating(self):
-        return self._cal_samples < self.calibrate_frames
+        return not self._cal_done
 
     @property
     def calibration_progress(self):
-        return min(1.0, self._cal_samples / max(1, self.calibrate_frames))
+        if self._cal_done:
+            return 1.0
+        return min(0.99, self._cal_samples / max(1, self._cal_target))
+
+    @property
+    def calibration_reason(self):
+        """
+        Why the window closed, or None while it is still open.
+
+        "fixed" (a length was given), "settled" (the input is not drifting),
+        "cycles" (a drifting input has been watched for whole cycles), or
+        "limit" (it never settled and the maximum was reached). The views print
+        it, because "calibrating for 16 seconds" is otherwise indistinguishable
+        from a detector that is stuck.
+        """
+        return self._cal_reason
+
+    @property
+    def calibration_seconds(self):
+        return self._cal_samples / self.rate if self.rate else 0.0
 
     @property
     def metrics(self):
@@ -304,11 +406,19 @@ class MotionDetector:
         self._prev_shape = shape
         if previous is None or len(previous) != len(shape):
             # First frame (or a change in the number of subcarriers) has nothing
-            # to compare against.
+            # to compare against. The slow baseline starts from this frame so the
+            # high-pass has somewhere to follow from.
+            self._slow = list(shape)
+            self._prev_high = None
             return self._result(frame, metric=0.0, changes=[0.0] * len(shape))
 
         changes = [abs(a - b) for a, b in zip(shape, previous)]
-        metric = sum(changes) / len(changes)
+        raw_metric = sum(changes) / len(changes)
+        metric = raw_metric
+        if self.highpass_seconds > 0:
+            filtered = self._highpassed(shape)
+            if filtered is not None:
+                metric = filtered
 
         self._raw.append(metric)
         if len(self._raw) > self.smoothing:
@@ -318,11 +428,17 @@ class MotionDetector:
         if len(self._recent) > self.window:
             self._recent.pop(0)
 
-        if self.calibrating:
+        if not self._cal_done:
             self._cal_samples += 1
+            # Both versions are kept for the automatic length: how much of the
+            # change the high-pass removed is what separates a drifting input
+            # from a moving one.
+            self._cal_raw.append(raw_metric)
+            self._cal_filtered.append(metric)
             if len(self._raw) == self.smoothing:
                 self._calibration.append(smoothed)
                 self._cal_changes.append(changes)
+            self._advance_calibration()
             return self._result(frame, metric=smoothed, changes=changes)
 
         floor, scale = self.floor, self.scale
@@ -346,6 +462,106 @@ class MotionDetector:
         peak_hz, band_power = self._doppler()
         return self._result(frame, metric=smoothed, changes=changes, z=z,
                             peak_hz=peak_hz, band_power=band_power)
+
+    def _highpassed(self, shape):
+        """
+        The change between frames with the slowly moving baseline taken out.
+
+        Gain normalisation already cancels a drift that reaches every channel
+        equally. What survives is drift that reaches them unequally — the case a
+        wire on an ADC pin produces, because the first conversion after the mux
+        moves carries the most of it and each later pin carries less. That drift
+        is slow: a hand arriving changes the input in under a second, the mains
+        envelope under the wire takes ten.
+
+        So the shape is compared with a baseline that follows it with a time
+        constant of `highpass_seconds`, and what is differenced is the deviation
+        from that baseline rather than the value itself. A component slower than
+        the time constant contributes almost nothing to the difference; anything
+        faster passes through with its amplitude intact. `None` means there is
+        not yet a previous deviation to compare against.
+        """
+        step = 1.0 / self.rate
+        alpha = min(1.0, step / self.highpass_seconds)
+        if self._slow is None or len(self._slow) != len(shape):
+            self._slow = list(shape)
+            self._prev_high = None
+        else:
+            self._slow = [slow + alpha * (value - slow)
+                          for slow, value in zip(self._slow, shape)]
+        high = [value - slow for value, slow in zip(shape, self._slow)]
+        previous, self._prev_high = self._prev_high, high
+        if previous is None or len(previous) != len(high):
+            return None
+        return sum(abs(a - b) for a, b in zip(high, previous)) / len(high)
+
+    # -------------------------------------------------------- calibration
+    def _advance_calibration(self):
+        """
+        Decide whether the window can close yet.
+
+        A fixed window closes when its frame count arrives. An automatic one is
+        re-asked once a second, and needs two answers: is the input drifting at
+        all, and if so has it been watched for whole cycles of the drift?
+
+        "Drifting" is measured rather than assumed: the high-pass is compared
+        with no high-pass on the same frames. Movement survives that filter — a
+        walk is a 1-2 Hz change and passes almost untouched, ratio 0.94 here —
+        while a 0.1 Hz envelope is most of what the filter removes, ratio 0.2-0.4.
+        So a ratio near 1 means there is nothing slow to wait for and the minimum
+        is enough.
+        """
+        if not self.calibrate_auto:
+            if self._cal_samples >= self.calibrate_frames:
+                self._finish_calibration("fixed")
+            return
+        if self._cal_samples < self._cal_next_probe:
+            return
+        self._cal_next_probe += self.calibrate_probe_frames
+        if self._cal_samples >= self.calibrate_limit_frames:
+            self._finish_calibration("limit")
+            return
+
+        raw = _median(self._cal_raw)
+        filtered = _median(self._cal_filtered)
+        if raw <= 0 or filtered / raw >= CALIBRATE_DRIFT_RATIO:
+            self._finish_calibration("settled")
+            return
+
+        needed = self._cycles_needed()
+        self._cal_target = max(self._cal_target, needed)
+        if self._cal_samples >= needed:
+            self._finish_calibration("cycles")
+
+    def _cycles_needed(self):
+        """Frames needed to cover CALIBRATE_CYCLES of the slowest visible part.
+
+        The spectrum of the metric says how slow the drift is, and the window
+        grows until it holds whole cycles of it: a floor measured over part of
+        an envelope is a floor for that part only. When the window is still too
+        short to resolve anything below the motion band, the answer is the
+        smallest useful extension rather than a guess at a period.
+        """
+        shortest = CALIBRATE_CYCLES * self.calibrate_seconds
+        if len(self._calibration) < 4:
+            return int(round(shortest * self.rate))
+        freqs, powers = power_spectrum(self._calibration, self.rate)
+        peak, power = None, 0.0
+        for f, p in zip(freqs, powers):
+            if 0 < f < self.band[0] and p > power:
+                peak, power = f, p
+        if peak is None:
+            return int(round(shortest * self.rate))
+        return max(1, int(round(CALIBRATE_CYCLES / peak * self.rate)))
+
+    def _finish_calibration(self, reason):
+        self._cal_done = True
+        self._cal_reason = reason
+        self._cal_target = max(1, self._cal_samples)
+        # Nothing after this point reads them, and they are the two longest
+        # lists the detector holds.
+        self._cal_raw = []
+        self._cal_filtered = []
 
     # -------------------------------------------------------------- parts
     def _doppler(self):

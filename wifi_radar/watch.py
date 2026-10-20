@@ -66,7 +66,26 @@ def _db(value):
     return "  n/a" if value is None else f"{value:5.1f}"
 
 
-def summarise(detections, floor, took, frames=None):
+def calibration_note(detector):
+    """
+    How long the window was and why it closed.
+
+    An automatic window that ran for sixteen seconds looks like a hang unless
+    the reason is printed next to it, and the reason is the interesting part:
+    the input was still drifting, so the detector waited for whole cycles of it.
+    """
+    seconds = detector.calibration_seconds
+    reason = detector.calibration_reason
+    if reason is None:
+        return f"{seconds:.1f}s so far, still measuring"
+    words = {"fixed": "fixed window",
+             "settled": "auto, the floor had settled",
+             "cycles": "auto, covered whole cycles of the drift",
+             "limit": "auto, stopped at the limit"}
+    return f"{seconds:.1f}s ({words.get(reason, reason)})"
+
+
+def summarise(detections, floor, took, frames=None, calibration=None):
     """What the session amounted to, so a run can be read after it has gone."""
     measured = [d for d in detections if not d.calibrating]
     flagged = [d for d in measured if d.motion]
@@ -76,11 +95,18 @@ def summarise(detections, floor, took, frames=None):
         "",
         f"frames          : {len(detections)} ({frames or len(detections)} read)",
         f"calibrated floor: {floor:.6f}" if floor else "calibrated floor: n/a",
+        *([f"calibration     : {calibration}"] if calibration else []),
         f"wall clock      : {took:.1f}s",
         f"flagged frames  : {len(flagged)} of {len(measured)} measured "
         f"({100 * len(flagged) / max(1, len(measured)):.1f}%)",
         f"presence held   : {100 * len(present) / max(1, len(measured)):.1f}% of the session",
     ]
+    if detections and not measured:
+        # Not an error, but not a measurement either: a session shorter than its
+        # own calibration window would otherwise read as a quiet room.
+        lines.append(f"no frames measured: the run ended during the "
+                     f"{len(detections)}-frame calibration. Run longer than "
+                     f"--calibrate, or lower it.")
     if peaks:
         ordered = sorted(peaks)
         lines.append(f"doppler peak    : median {ordered[len(ordered) // 2]:.2f} Hz "
@@ -104,10 +130,69 @@ def main(argv=None):
                         help="write the frames to this JSON Lines file as they arrive")
     parser.add_argument("--every", type=float, default=0.25,
                         help="seconds between trace lines")
+    parser.add_argument("--timeout", type=float, default=None, metavar="SECONDS",
+                        help="a serial source gives up after this long with "
+                             "nothing readable (default 10); raise it while a "
+                             "board is being reset or plugged back in by hand")
+    parser.add_argument("--no-reconnect", dest="reconnect", action="store_false",
+                        help="end the session when a serial board stops instead "
+                             "of waiting for it to come back")
+    parser.add_argument("--reconnect-seconds", type=float, default=None,
+                        metavar="SECONDS",
+                        help="how long to keep trying after a serial board goes "
+                             "away (default 120)")
+    parser.add_argument("--calibrate", type=detect.parse_calibrate,
+                        default=None, metavar="SECONDS|auto",
+                        help="how long to measure the still floor before "
+                             "deciding anything; auto (the default) keeps "
+                             "measuring while the input drifts and stops once "
+                             "the floor has settled, a number fixes the window "
+                             "at that many seconds")
+    parser.add_argument("--highpass", type=float,
+                        default=detect.DEFAULT_HIGHPASS_SECONDS,
+                        metavar="SECONDS",
+                        help="subtract a baseline that follows the input with "
+                             "this time constant, so drift slower than it is "
+                             "ignored (default %(default)s); 0 turns it off")
+    parser.add_argument("--on-sigma", type=float,
+                        default=detect.DEFAULT_ON_SIGMA, metavar="SIGMA",
+                        help="how many calibrated sigmas of change count as "
+                             "motion (default %(default)s); a wire on an ADC "
+                             "pin can need more, and thresholds.py measures "
+                             "the number on the input in front of you")
     args = parser.parse_args(argv)
 
+    if args.highpass < 0:
+        print("error: --highpass cannot be negative; 0 turns the filter off.",
+              file=sys.stderr)
+        return 2
+
+    if args.on_sigma <= 0:
+        print("error: --on-sigma must be more than 0; it multiplies the "
+              "calibrated spread, and a threshold of zero would call every "
+              "frame movement.", file=sys.stderr)
+        return 2
+
+    if args.calibrate is not None and args.calibrate <= 0:
+        print("error: --calibrate must be more than 0 seconds (or auto). The "
+              "detector needs a still window to measure the noise floor from; "
+              "without one every frame would be judged against nothing.",
+              file=sys.stderr)
+        return 2
+
     try:
-        source = csi.open_source(args.source, seconds=args.seconds, rate=args.rate)
+        options = {"seconds": args.seconds, "rate": args.rate}
+        if args.source.startswith("serial:"):
+            # Only a serial source has an idle timeout or a cable to lose; the
+            # simulator and a recording end on their own.
+            if args.timeout is not None:
+                options["timeout"] = args.timeout
+            options["reconnect"] = args.reconnect
+            if args.reconnect_seconds is not None:
+                options["reconnect_seconds"] = args.reconnect_seconds
+            options["notify"] = lambda message: print(f"note  : {message}",
+                                                      flush=True)
+        source = csi.open_source(args.source, **options)
     except (ValueError, OSError) as error:
         # A serial port that is not there is an OSError, and its message already
         # names the port and what to check; a traceback would bury that.
@@ -115,7 +200,10 @@ def main(argv=None):
         return 2
 
     paced = csi.PacedSource(source, realtime=not args.fast)
-    detector = detect.MotionDetector(rate=paced.rate)
+    detector = detect.MotionDetector(rate=paced.rate,
+                                     calibrate_seconds=args.calibrate,
+                                     highpass_seconds=args.highpass,
+                                     on_sigma=args.on_sigma)
     interactive = sys.stdout.isatty()
     recorded = open(args.record, "w", encoding="utf-8") if args.record else None
 
@@ -178,7 +266,8 @@ def main(argv=None):
 
     if interactive:
         sys.stdout.write("\r" + " " * 96 + "\r")
-    print(summarise(detections, detector.floor, time.time() - started, read))
+    print(summarise(detections, detector.floor, time.time() - started, read,
+                    calibration=calibration_note(detector)))
     return 2 if failed else 0
 
 

@@ -47,6 +47,8 @@ server do more work than a fast one.
 
 import argparse
 import json
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -59,6 +61,30 @@ DEFAULT_PORT = 8770
 
 #: Frames of trace kept for the page to draw.
 TRACE_FRAMES = 400
+
+
+def doctor_check(port, timeout=30.0):
+    """
+    (verdict, message) from `python -m wifi_radar.doctor --json`, or unknown.
+
+    A subprocess rather than an import: the doctor opens the port for its own
+    bootloader probe and listen window, and has its own timeouts. If it cannot
+    answer, the page says that instead of claiming the board is broken.
+    """
+    command = [sys.executable, "-m", "wifi_radar.doctor", "--port", port,
+               "--json", "--scan-seconds", "0"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return "unknown", f"the doctor could not run: {error}"
+    try:
+        document = json.loads(result.stdout)
+    except ValueError:
+        text = (result.stdout or result.stderr or "").strip()
+        return "unknown", (text[-300:] or "the doctor printed nothing")
+    return document.get("verdict", "unknown"), document.get("message", "")
 
 
 def busiest_channel(changes, ratio=2.0):
@@ -95,11 +121,15 @@ class RadarSession:
     network.
     """
 
-    def __init__(self, source, realtime=True):
+    def __init__(self, source, realtime=True, calibrate_seconds=None,
+                 highpass_seconds=detect.DEFAULT_HIGHPASS_SECONDS,
+                 on_sigma=detect.DEFAULT_ON_SIGMA):
         self.source = csi.PacedSource(source, realtime=realtime)
         # Doppler is turned on per frame from the source: a serial one only
         # learns from its first line whether it is talking to a CSI receiver.
-        self.detector = detect.MotionDetector(rate=self.source.rate)
+        self.detector = detect.MotionDetector(
+            rate=self.source.rate, calibrate_seconds=calibrate_seconds,
+            highpass_seconds=highpass_seconds, on_sigma=on_sigma)
         self.lock = threading.Lock()
         self.trace = deque(maxlen=TRACE_FRAMES)
         self.latest = None
@@ -109,6 +139,9 @@ class RadarSession:
         # each one changed.
         self.levels = []
         self.error = None
+        # Filled only when a serial source has failed: what the doctor makes of
+        # the board, so the page can say why it is silent.
+        self.diagnosis = None
         self.finished = False
         self._stop = threading.Event()
         self._thread = None
@@ -147,11 +180,37 @@ class RadarSession:
                     self.levels = list(frame.amplitudes())
         except Exception as error:                      # reported to the page
             self.error = f"{type(error).__name__}: {error}"
+            self.diagnosis = self._diagnose()
         finally:
             # A view whose source has run out must say so: freezing on the last
             # frame looks exactly like a quiet room, and that is the one reading
             # of the page that would be wrong.
             self.finished = True
+
+    def _serial_port(self):
+        inner = getattr(self.source, "inner", self.source)
+        return getattr(inner, "port", None)
+
+    def _diagnose(self):
+        """
+        The doctor's verdict, for a board that is attached and not printing.
+
+        An empty trace is the least useful reading of a silent serial source:
+        the doctor already separates "no sketch", "wrong rate" and "no board",
+        so the page repeats its answer rather than making the user run a second
+        command to find out. The port is released first — only one process can
+        have it open — and the doctor runs as a subprocess so a wedged adapter
+        cannot stall the page.
+        """
+        port = self._serial_port()
+        if not port:
+            return None
+        try:
+            self.source.close()
+        except Exception:
+            pass
+        verdict, message = doctor_check(port)
+        return {"verdict": verdict, "message": message}
 
     def snapshot(self):
         with self.lock:
@@ -167,7 +226,8 @@ class RadarSession:
             return {"source": self.description, "rate": self.source.rate,
                     "frames": 0, "calibrating": True, "progress": 0.0,
                     "metrics": [], "changes": [], "levels": [], "busiest": None,
-                    "doppler": self.detector.doppler, "error": self.error}
+                    "doppler": self.detector.doppler, "error": self.error,
+                    "diagnosis": self.diagnosis}
         # No Doppler, no spectrum: for a channel profile the FFT of the metric
         # is the rate the profile changed at, and drawing it on a frequency axis
         # labelled in hertz invites reading it as a speed.
@@ -181,6 +241,9 @@ class RadarSession:
             "t": round(latest.t, 3),
             "calibrating": calibrating,
             "progress": round(progress, 3),
+            "calibration": {"auto": self.detector.calibrate_auto,
+                            "seconds": round(self.detector.calibration_seconds, 1),
+                            "reason": self.detector.calibration_reason},
             "floor": floor,
             "threshold": (floor + self.detector.on_sigma * self.detector.scale
                           if floor and self.detector.scale else None),
@@ -204,6 +267,7 @@ class RadarSession:
             "doppler": self.detector.doppler,
             "finished": self.finished,
             "error": self.error,
+            "diagnosis": self.diagnosis,
         }
 
 
@@ -299,6 +363,7 @@ PAGE = """<!doctype html>
         <div>time <b id="time">–</b></div>
       </div>
       <div class="sub" id="error" style="margin-top:10px"></div>
+      <div class="sub" id="diagnosis" style="margin-top:6px"></div>
     </div>
   </div>
   <div class="row" style="margin-top:14px" id="pinsCard">
@@ -567,7 +632,12 @@ async function poll() {
     if (state.error) { label.textContent = 'ERROR'; label.className = 'err'; }
     else if (state.finished) { label.textContent = 'SESSION ENDED'; label.className = 'quiet'; }
     else if (state.calibrating) {
-      label.textContent = `CALIBRATING ${Math.round((state.progress || 0) * 100)}%`;
+      const cal = state.calibration || {};
+      // A percentage of an unknown-length window is a guess; when the length is
+      // automatic, show how long it has been measuring instead.
+      label.textContent = cal.auto
+        ? `CALIBRATING ${Math.round(cal.seconds || 0)}s`
+        : `CALIBRATING ${Math.round((state.progress || 0) * 100)}%`;
       label.className = 'cal';
     } else if (state.presence) { label.textContent = 'PRESENT'; label.className = 'present'; }
     else if (state.motion) { label.textContent = 'MOVING'; label.className = 'moving'; }
@@ -587,6 +657,9 @@ async function poll() {
     document.getElementById('subs').textContent = state.subcarriers || '–';
     number('time', state.t, 1);
     document.getElementById('error').textContent = state.error || '';
+    const diagnosis = state.diagnosis;
+    document.getElementById('diagnosis').textContent = diagnosis
+      ? `doctor says: ${diagnosis.message}` : '';
 
     fit(traceCanvas, 150);
     if (state.doppler) fit(spectrumCanvas, 120);
@@ -625,7 +698,41 @@ def main(argv=None):
                         help="run the source as fast as the CPU allows")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--calibrate", type=detect.parse_calibrate,
+                        default=None, metavar="SECONDS|auto",
+                        help="how long to measure the still floor before "
+                             "deciding anything; auto (the default) keeps "
+                             "measuring while the input drifts and stops once "
+                             "the floor has settled, a number fixes the window "
+                             "at that many seconds")
+    parser.add_argument("--highpass", type=float,
+                        default=detect.DEFAULT_HIGHPASS_SECONDS,
+                        metavar="SECONDS",
+                        help="subtract a baseline that follows the input with "
+                             "this time constant, so drift slower than it is "
+                             "ignored (default %(default)s); 0 turns it off")
+    parser.add_argument("--on-sigma", type=float,
+                        default=detect.DEFAULT_ON_SIGMA, metavar="SIGMA",
+                        help="how many calibrated sigmas of change count as "
+                             "motion (default %(default)s); thresholds.py "
+                             "measures the right number from a recording")
     args = parser.parse_args(argv)
+
+    if args.highpass < 0:
+        print("error: --highpass cannot be negative; 0 turns the filter off.")
+        return 2
+
+    if args.calibrate is not None and args.calibrate <= 0:
+        print("error: --calibrate must be more than 0 seconds (or auto). The "
+              "detector needs a still window to measure the noise floor from; "
+              "without one every frame would be judged against nothing.")
+        return 2
+
+    if args.on_sigma <= 0:
+        print("error: --on-sigma must be more than 0; it multiplies the "
+              "calibrated spread, and a threshold of zero would call every "
+              "frame movement.")
+        return 2
 
     try:
         source = csi.open_source(args.source,
@@ -636,7 +743,10 @@ def main(argv=None):
         print(f"error: {error}")
         return 2
 
-    session = RadarSession(source, realtime=not args.fast)
+    session = RadarSession(source, realtime=not args.fast,
+                           calibrate_seconds=args.calibrate,
+                           highpass_seconds=args.highpass,
+                           on_sigma=args.on_sigma)
     server = build_server(session, args.host, args.port)
     session.start()
     # Flushed so the URL is visible immediately when output is redirected to a
