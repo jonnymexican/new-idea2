@@ -9,7 +9,8 @@ seam is the point of the design, not a side effect.
 ```bash
 .venv/bin/python -m wifi_radar.watch                    # live trace in the terminal
 .venv/bin/python -m wifi_radar.live                     # live view in a browser
-.venv/bin/python -m unittest wifi_radar.test_radar      # 89 tests, no dependencies
+.venv/bin/python -m unittest wifi_radar.test_radar      # 212 tests, no dependencies
+.venv/bin/python -m wifi_radar.selftest                 # needs a Mega on a cable
 ```
 
 Nothing here is measured from a real radio yet. Every number below comes from
@@ -102,11 +103,88 @@ does, and the flag does not pretend otherwise.
 of signal processing fixes that at this bandwidth. It also cannot tell which way
 someone is moving: that needs phase, or two receivers.
 
-**It is calibrated, not absolute.** The first two seconds of any session measure
-an empty room; every threshold afterwards is a multiple of that measurement.
+**It is calibrated, not absolute.** Every session starts by measuring an empty
+room, and every threshold afterwards is a multiple of that measurement.
 Calibrate with a person sitting in the room and their movement becomes part of
 the baseline — the view says "keep still" while it calibrates for exactly this
-reason.
+reason. The length is automatic: at least two seconds, which is right for radio
+noise because it is fast and flat, and then as long as the input keeps drifting.
+A wire on an ADC pin is the case that needs the longer window — its reading
+swings on a slow mains envelope, so a two-second sample can catch one part of a
+cycle and the rest of every cycle then reads as movement. (Measured on a Mega
+with a wire in A0: an 8 s baseline left presence on for 94% of an idle session;
+25 s left it at 0%.)
+
+How the automatic length decides, in [detect.py](detect.py#L324):
+
+- **Is it drifting at all?** The high-pass is compared with the same frames
+  unfiltered. A walk survives that filter almost intact — ratio 0.94 on the
+  simulated walk and on breathing — while a 0.1 Hz envelope is most of what it
+  removes — ratio 0.2-0.4. Near 1 means nothing slow is happening and the two-
+  second minimum is enough.
+- **If it is, how long is a cycle?** The spectrum of the metric so far says how
+  slow the drift is, and the window keeps growing until it holds three cycles of
+  it. One or two is not enough: a floor measured over part of an envelope is a
+  floor for that part only.
+- **What if it never settles?** Forty seconds is the limit, after which the
+  window closes anyway and the run says so. A hand resting on the sensor, or a
+  battery slowly dying, is not something to wait out.
+
+`--calibrate SECONDS` still fixes the window at exactly that length, and
+`--calibrate auto` is the default. The terminal summary prints which happened —
+`calibration : 16.0s (auto, covered whole cycles of the drift)` — and the browser
+counts the seconds rather than showing a percentage of a length it does not
+know yet.
+
+**The threshold is a multiple of the measured spread, and the multiple can be
+measured.** `thresholds.py` runs an input at several `on_sigma` values and
+reports, for each, how often a still room trips it and what fraction of the
+frames where anything rose at all it still catches:
+
+```bash
+.venv/bin/python -m wifi_radar.thresholds --source serial:COM5 \
+    --hand serial:COM5 --seconds 60
+```
+
+`--source` is the idle run — leave the room, or keep still — and `--hand` is the
+same port while you wave at the antenna; the seconds are spent on each in turn.
+It names the lowest threshold whose idle rate stays under `--max-idle` (1%), or
+says that none of them does.
+
+A recording does the same without the hardware, and answers a question a live run
+cannot: how long the calibration window has to be. `--record` takes what
+`handtrial` wrote — or a plain recording of an empty room, which needs a minute of
+standing still rather than a hand moved on cue — tries each window length against
+the idle frames that follow it, then sweeps the threshold with the winner fixed:
+
+```bash
+.venv/bin/python -m wifi_radar.thresholds --record out/wire-new.jsonl --sigmas 2,3,4,5,6
+```
+
+On the wire, a 2 s window leaves the idle stretch tripping 16.7% of the time at
+4σ and a 5 s window 26.4%, so the floor the detector measures in two seconds is
+not the floor the room has; 15 s leaves 1.0%. With 15 s fixed, 4σ holds the idle
+at 1.0% and 5σ at 0.0%, and the recording names `--calibrate 15 --on-sigma 5`.
+Both are flags on `watch` and `live`, so the number the measurement produced is
+the number the session runs with.
+
+On the simulator the idle rate is 0.0% at every threshold from 2 to 6 while the
+walk is caught 98.4% at 2σ and 89.5% at 6σ; the default stays at 4σ because a
+simulated noise floor is not a wire's, and the wire's tail is the thing worth
+measuring.
+
+The metric is also high-passed by default. Each channel is compared with a
+baseline that follows it with a 0.5 s time constant, so a change slower than that
+— the ten-second envelope a wire picks up, a supply sagging, a sensor warming up
+— is not reported as motion. It costs nothing measurable on the simulated walk:
+97.1% of the walk is detected at any time constant from 0 to 1 s. `--highpass 0`
+turns it off; a longer value rejects more drift and starts to cost the slowest
+movement. What it cannot do is invent a signal that never arrived: on this board
+a hand brought to within 2 cm of the wire moved A0 by less than the noise
+(5.45 counts of spread during the approaches against 5.36 while still), so
+touching the wire remains the way to make this input respond. That was the first
+wire; the longer one now in A0 swings its level by ±40% on a five-second cycle,
+which is why the calibration window matters as much as the threshold.
 
 **It is simulated.** No part of this has touched a real radio. The physics in
 `csi.py` is real physics (2.4 GHz carrier, 312.5 kHz subcarrier spacing,
@@ -150,10 +228,16 @@ choice costs.
 | [`detect.py`](detect.py) | The metric, calibration, presence, the FFT and the Doppler band |
 | [`watch.py`](watch.py) | The terminal trace |
 | [`live.py`](live.py) | The browser view (standard library server, no dependencies) |
+| [`thresholds.py`](thresholds.py) | Measures false alarms against missed movement for each detection threshold, live or from a marked recording, and derives the calibration length from it |
+| [`cues.py`](cues.py) | Tones and speech for a trial's segment changes, so the person can keep their eyes on the wire |
+| [`handtrial.py`](handtrial.py) | A guided antenna trial: records empty room then a hand at each distance, and reports z with and without the high-pass |
+| [`fakeboard.py`](fakeboard.py) | A board on a pseudo-terminal, so CI can run the doctor against a real port |
 | [`nexmon.py`](nexmon.py) | Real frames off the wire: the nexmon packet layout and the UDP source |
 | [`serial_node.py`](serial_node.py) | Frames off a USB serial port: CSI lines, and sensor-channel lines from a board with no radio |
+| [`doctor.py`](doctor.py) | One-step bring-up: which board is this, is its chip alive, and is the sketch printing? |
 | [`arduino/mega_channel_node`](arduino/mega_channel_node/mega_channel_node.ino) | The Mega 2560 sketch that prints those channel lines |
-| [`test_radar.py`](test_radar.py) | 89 tests against simulated ground truth |
+| [`selftest.py`](selftest.py) | The hardware-in-the-loop check: flash a silent sketch, prove `doctor` diagnoses it, put `mega_channel_node` back |
+| [`test_radar.py`](test_radar.py) | 212 tests against simulated ground truth |
 
 ## Attaching a real radio
 
@@ -243,14 +327,294 @@ IDE's serial monitor — it holds the port open — then:
 
 ```bash
 .venv/bin/python -m pip install pyserial                 # the one optional dependency
+.venv/bin/python -m wifi_radar.doctor                    # which board, is it alive, is it printing?
 .venv/bin/python -m wifi_radar.serial_node --list        # which port is the board?
 .venv/bin/python -m wifi_radar.serial_node               # is it talking?
-.venv/bin/python -m wifi_radar.watch --source serial:auto      # terminal trace
-.venv/bin/python -m wifi_radar.live  --source serial:auto      # browser view
+.venv/bin/python -m wifi_radar.watch --source serial:auto       # terminal trace
+.venv/bin/python -m wifi_radar.live  --source serial:auto       # browser view
 ```
 
+`doctor` is the command to start with, because it answers all three questions a
+silent board asks at once — is there a port, is the chip alive, is anything being
+printed — and names the fix for whichever one fails:
+
+```text
+board      : COM5  Arduino Mega 2560 (COM5)  VID:PID=2341:0042  SER=85935333537351609150
+recognised : Arduino USB-serial
+
+bootloader : answered 5 syncs in 2.1s (status 0xc0 = OK)
+             the MCU is powered, clocked and running its bootloader
+sketch     : 63 lines, 62 samples in 4.1s, 20.0/s on the board's own clock
+             # mega_channel_node 8 channels 20 Hz
+             S,50,392,389,362,379,337,345,339,315
+
+ok — the board is identified, alive, and printing samples.
+   next: python -m wifi_radar.watch --source serial:COM5
+```
+
+The middle line is the one `--list` cannot give you, and the one that separates a
+broken board from a missing sketch. Every Arduino resets when its port opens,
+because DTR is wired to the reset pin, and for about a second the bootloader
+waits for stk500v2 commands and answers `GET_SYNC`. A reply proves the MCU, its
+clock and the USB-serial wiring are all fine; it says nothing about the sketch,
+so `doctor` then resets the board again and listens. Exit status is 0 when samples
+arrive, 1 when a board was found but nothing usable is printing, and 2 when
+nothing could be opened — so a script can tell "no board" from "wrong firmware".
+
+When `--baud` produces no samples, the doctor tries the common rates — 9600,
+57600, 38400, 19200, 230400, 250000, 500000 — giving each two seconds, and stops
+at the first one that decodes. Then it names the rate instead of leaving you to
+guess at the sketch's `Serial.begin()`:
+
+```text
+sketch     : 71 lines, 70 samples in 2.1s, 20.0/s on the board's own clock
+             (arrived at 9600 baud; 115200 produced no samples)
+
+ok — the board is identified, alive, and printing samples.
+   baud : the firmware is printing at 9600, not 115200 — pass --baud 9600
+```
+
+`--scan-seconds` sets the time given to each rate (2 s by default, which is about
+a second of samples after the board's reset); `0` disables the scan entirely.
+
+`--json` prints the same answers as one object and nothing else, so a CI job or
+a wiring check can read them without parsing the table above:
+
+```bash
+.venv/bin/python -m wifi_radar.doctor --json
+```
+
+```json
+{
+  "port": "COM5",
+  "verdict": "printing",
+  "exit_status": 0,
+  "message": "the board is identified, alive, and printing samples",
+  "board": { "device": "COM5", "description": "Arduino Mega 2560 (COM5)",
+             "manufacturer": "Arduino LLC (www.arduino.cc)",
+             "vid": 9025, "pid": 66,
+             "serial_number": "85935333537351609150",
+             "recognised": "Arduino USB-serial", "confidence": 3 },
+  "bootloader": { "answered": true, "replies": 18, "status": 192,
+                  "status_ok": true, "seconds": 2.1, "error": null },
+  "sketch": { "printing": true, "bytes": 2458, "lines": 62, "samples": 61,
+              "rejected": 0, "rate_hz": 20.0, "baud": 115200,
+              "baud_requested": 115200,
+              "banner": "# mega_channel_node 8 channels 20 Hz",
+              "first_sample": "S,50,431,422,392,405,364,369,362,334",
+              "seconds": 4.1, "error": null },
+  "bauds_tried": [115200]
+}
+```
+
+`verdict` is one of `printing`, `silent_firmware` (bootloader answers, nothing
+prints), `silent_no_bootloader` (nothing at all), `wrong_protocol` (bytes that
+are not `S,` or `C,` lines), `unopenable`, or `no_port`. `sketch.baud` is the
+rate the samples actually arrived at, `sketch.baud_requested` what was asked for,
+and `bauds_tried` every rate the scan opened — so a caller can read the answer
+out of the document rather than out of the prose. Numbers stay numbers —
+`rate_hz` and `vid` are not the formatted strings the text report draws — and
+`exit_status` repeats the process exit code so a stored log still records what
+the run concluded.
+
+For a hands-on session, `handtrial` does the counting for you: it records an
+empty room, then prints when to hold your hand at 20, 30 and 40 cm, marks where
+each stretch is, and replays the recording through the detector twice — once
+with the high-pass and once without — reporting each segment's z.
+
+```bash
+.venv/bin/python -m wifi_radar.handtrial --source serial:auto \
+    --record out/wire.jsonl
+```
+
+The report is one table per high-pass setting — frames, median and maximum `z`,
+and the fraction above the 4σ threshold for each segment. That pairing is the
+point: a hand that shows up with the filter on and vanishes with it off means the
+filter is eating the signal; the reverse means it is doing its job. The marks are
+written beside the recording (`out/wire.jsonl.marks.json`), so a trial can be
+analysed again later without repeating the hand movements.
+
+Every trial now opens with a placement control: `--control 10` (the default)
+records ten seconds of empty room and ten with a hand 2 cm from the wire, and
+abandons the run with exit 4 if no channel level moves by 3σ. A hand that is not
+where the wire is looks exactly like an antenna that sees nothing, and the
+difference between the two is twenty seconds of the person's time instead of
+eighty. When it passes it says which channel moved, which is also the answer to
+"is the wire in the pin I think it is": the sketch reads A0..A7 in order, so a
+wire in A0 is the channel that moves most, and one in A3 is the fourth.
+
+The report carries a second table, because the motion metric answers a narrower
+question than "was the hand there". `levels` gives, for each stretch, the channel
+that moved most and by how much, in units of the idle stretch's own spread,
+taken over one-second windows rather than the whole stretch: a hand that arrives
+slowly and stays for four seconds of a fifteen-second stretch is a presence, and
+a median over the whole stretch calls it nothing. A run where no stretch clears
+either test is named a baseline and exits 3, instead of printing a row of zeros
+to be read as reach.
+
+With the cues working, the same trial produced a result. 1601 frames over 80 s:
+20 s of empty room, then 15 s each with the hand at 2, 20, 30 and 40 cm, placed
+on the spoken prompt.
+
+| segment | frames | median z | max z | z > 4σ |
+| --- | --- | --- | --- | --- |
+| idle | 359 | −0.4 | 5.2 | 2.8% |
+| 2 cm | 300 | −0.1 | 71.6 | 25.3% |
+| 20 cm | 300 | −0.6 | 5.0 | 0.7% |
+| 30 cm | 300 | −0.9 | 4.8 | 1.3% |
+| 40 cm | 300 | 0.3 | 5.1 | 3.7% |
+
+**The hand is visible close in and nowhere else.** At what the schedule called
+2 cm the hand drove the first two channels into the floor — medians of 0 against
+301 and 306 — and the detector flagged 20-25% of the stretch from 4σ to 8σ. At
+20, 30 and 40 cm nothing exceeded the idle's own maximum (4.8-5.1 against 5.2),
+and the raw levels agree: +22, +27 and −25 counts against a 40-count idle spread.
+The response sits in t=25-35 s of the 2 cm stretch, which began at 20 s — the
+cue, then a hand walked into place. `thresholds --record` on that recording picks
+3 s and 4σ (idle 0.0% at 3 s against 2.8% at 2 s).
+
+It did not reproduce, and a sweep from contact outwards explains why.
+
+| distance | median z | max z | z > 4σ |
+| --- | --- | --- | --- |
+| idle | −0.3 | 5.5 | 5.7% |
+| 0 cm (touch) | 1.4 | 71.2 | 32.5% |
+| 0.5 cm | 0.2 | 32.6 | 7.5% |
+| 1 cm | −0.7 | 2.8 | 0.0% |
+| 1.5 cm | −0.4 | 4.1 | 1.2% |
+| 2 cm | −0.5 | 4.2 | 0.6% |
+
+Touching the wire takes A0 down to zero — the control's row was `A0..A7 −100%
+−100% −92% −77% −68% −59% −53% −51%` — and by 1 cm there is nothing left. So the
+earlier stretches recorded as "2 cm" that showed a large effect were closer than
+2 cm; the coupling here falls off a cliff between half a centimetre and one,
+not gently over centimetres. Reach for a bare wire on this board, with this
+detector, is contact to about half a centimetre — not the 2-20 cm the first
+trial suggested, and the 20-40 cm null stands.
+
+The pin is confirmed the same way: the touch response peaks on A0 and falls
+monotonically to A7, which is the order the sketch reads pins in, so the wire is
+the one in A0 and the board is coupled to it.
+
+The first attempt at this trial, run without cues, found nothing at 2 cm either.
+The prompts were a segment late and the hand followed the prompts, so it was
+never where the marks said it was. `--no-reconnect` is the other guard here: a
+reconnect keeps the schedule aligned by rebasing the clock, which is right for a
+long session and wrong for a trial, where nobody is being guided during the gap.
+
+Two bugs surfaced only on the wire. The first: `open_serial` left a stale line in
+the driver's buffer, and its older `millis()` became the session's zero — every
+live frame then looked 30-120 s in the future, so the schedule raced through every
+segment in seconds while the person was still standing there. It reads as a dead
+board and was not one; `open_serial` now flushes the input buffer after the DTR
+pulse. The second: a reconnect installed the raw port as the source, so the next
+frame failed — the opener returns a `SerialSource` now, and `ReconnectingSource`
+wraps a bare stream rather than trust its caller.
+
+That is a process failure, and the fix belongs in the tool rather than in the
+procedure: every change of stretch is now announced out loud as well as printed.
+`--cue both` (the default) sounds two tones and says the distance — "hand at 20
+centimetres" — `--cue bell` keeps the tones only, and `--cue off` goes back to
+watching the screen. A trial then works with its output going anywhere, or with
+the person facing the wire instead of the terminal.
+
+The speech engine is started once when the trial opens and kept open, because
+PowerShell plus SAPI take about three seconds to load on Windows — a cue that
+arrives three seconds into a fifteen-second stretch is one the hand follows
+late, which corrupts the marks it is supposed to describe. Against an already
+running engine a prompt is a write and a flush. `--cue voice` with no engine
+installed degrades to the tones rather than to silence, and every failure in
+`cues.py` is swallowed: a machine with no audio device must not end a recording.
+
+Fixing the announcement exposed a real bug in the schedule. `record()` advanced
+to the next stretch when that stretch had *ended* rather than when it began, so
+every prompt was one whole segment late: 15 s on a 15-second stretch. A person
+watching the terminal therefore moved when the previous stretch was already
+over, which puts the hand in the wrong segment of the recording — which is
+exactly what the uncued run shows. It now compares against the next mark's
+`start`, and a test pins the 20 cm cue to frame 40 of a two-second-per-stretch
+run instead of frame 80.
+
+A trial is still run from a terminal, and still writes the marks that
+`thresholds --record` reads afterwards:
+
+```bash
+.venv/bin/python -m wifi_radar.handtrial --source serial:auto \
+    --record out/wire.jsonl --idle 20 --seconds 15 --distances 2,20,30,40 --cue both
+```
+
+For a plain trace, give it time and a longer idle timeout:
+
+```bash
+.venv/bin/python -m wifi_radar.watch --source serial:auto --seconds 300 \
+    --timeout 60 --record antenna.jsonl
+```
+
+`--timeout` is how long a serial source waits in silence before giving up; the
+default of 10 s is right for a bring-up and too short while a board is being
+reset by hand. Five minutes of trace with a recording of the same frames is what
+makes an antenna experiment repeatable: the JSONL can be replayed through a
+different `--highpass` or threshold afterwards instead of being remeasured.
+
+A pulled cable also no longer ends the session. A serial source reconnects on
+its own — one attempt a second, for two minutes — and the session clock picks up
+where the last frame left off plus the real gap, because the board's `millis()`
+restarts at zero after a reset and a detector fed a clock going backwards would
+throw the session away. A reset that leaves the port open — the usual case on a
+Mega, whose USB bridge never disappears — is handled the same way: a backwards
+step in `millis()` that is not the 49.7-day wrap is counted as a board reset, and
+the session clock continues instead of jumping back to zero. The reconnects are counted in the source line
+(`serial COM5 at 115200 baud, …, reconnected 2x`) and announced in the terminal:
+
+```text
+note  : COM5 stopped: SerialException: device disconnected. Reconnecting for up to 120s
+note  : reconnected to COM5 after 3.2s
+```
+
+`--no-reconnect` ends the run instead, and `--reconnect-seconds` changes the
+wait. With `serial:auto` the port is chosen again on every attempt, since a
+replugged adapter does not always come back under the same name. The first open
+is never retried: a board that was not there at all is a bring-up failure, and
+pretending otherwise would make the doctor's job harder to see.
+
+There is nothing to set in those two commands. A bare wire in A0 acts as an
+antenna for the slow envelope of mains hum, and the floor is a measure of
+whatever the input did while calibrating, so a two-second sample of a ten-second
+swing is a sample of one part of it — which is why the window grows while the
+input drifts instead of being a number the user has to guess. On a simulated
+wire — A0 swinging 10 counts on a 0.1 Hz envelope — the automatic window closes
+at 16 s with a floor within 2% of a 40 s reference, and the run prints
+`calibration : 16.0s (auto, covered whole cycles of the drift)`.
+`--calibrate 25` still works if you would rather fix it. The real board has not
+run this: its adapter is not accepting writes, so the numbers above are the
+simulator's.
+
 In the browser, `serial:auto` also adds the pins panel described above — the
-same command for wiring that the CSI path uses for walking.
+same command for wiring that the CSI path uses for walking. And when a board is
+attached but not printing, the page stops guessing: once the source has been
+silent long enough to give up, the view runs the doctor once and puts its verdict
+under the numbers — `doctor says: not printing — the cable, the port and the
+chip are all fine, so the sketch is the missing piece` — instead of leaving an
+empty trace for the reader to interpret. `RadarSession` releases the port first, since
+only one process can hold it, and the doctor runs as a subprocess so a wedged
+adapter cannot stall the page.
+
+The **rate** is part of the spec too. `serial:COM5:9600` says it, and
+`serial:COM5:auto` finds it the way the doctor does — the requested rate
+first, then 9600, 57600, 38400, 19200, 230400, 250000 and 500000, stopping at the
+first that decodes. That scan costs a few seconds and resets the board once per rate,
+which is why it happens once at open rather than continuously; the source line
+then says which rate it settled on:
+
+```text
+serial COM5 at 9600 baud (found by scanning), 8 sensor channels, no Doppler, 20/s (paced to real time)
+```
+
+A board that comes back from a reset at a different rate is visible in that line
+rather than looking like a source that quietly stopped, and
+`python -m wifi_radar.serial_node --baud auto` finds it too. `parse_spec` returns
+`None` for auto, so the discovery happens before the stream is opened and the
+session that follows has a fixed rate.
 
 `--port` and `serial:` both accept `auto`, which is what they default to, and
 which is the point: `COM3` or `COM4` is the question a first bring-up stops on,
@@ -363,7 +727,7 @@ detection.
 
 ## The tests
 
-`python -m unittest wifi_radar.test_radar` — 89 tests, standard library only
+`python -m unittest wifi_radar.test_radar` — 212 tests, standard library only
 (pyserial is needed to open a board, never to test one), well under a minute.
 They can be strict because the simulator knows the answer:
 it knows when the person is walking, at what cadence, and when the room is
@@ -414,3 +778,83 @@ nexmon parser added one of its own: the first version of the walk test fed
 frames over a real socket but timestamped them from the real clock, so 400
 frames arrived in a few milliseconds, every frame sat at `t≈0`, and the test
 reported zero detections — the frames were fine, the clock was wrong.
+
+### The board self-test
+
+One claim above is asserted by proxy: that `doctor` tells "the chip is alive and
+the sketch is missing" from "nothing is there" is tested against a fake port, not
+a real bootloader. `selftest.py` closes that gap, and it is the only command here
+that needs a board:
+
+```bash
+.venv/bin/python -m wifi_radar.selftest                    # auto-detects the port
+.venv/bin/python -m wifi_radar.selftest --port /dev/ttyACM0
+```
+
+It works in four steps, each one an assertion:
+
+1. **Preflight.** `doctor` must already be printing samples. If it is not, the
+   run stops before flashing anything — overwriting a broken board, and then
+   promising to restore firmware that was never running, turns a diagnosis into
+   a second fault. `--force` overrides this for the one case where the reasoning
+   inverts: a board that is silent *because* its sketch is missing, which is what
+   the restore puts back. The preflight is then recorded under its own name —
+   "the board is silent, so it is being overwritten on purpose" — rather than as
+   a board that prints: a pass, but one that says what it actually did. It does
+   not override a port that will not open (exit 2) — no upload can fix that.
+2. **Break it on purpose.** It writes a sketch whose `setup` and `loop` are empty
+   and flashes it with `arduino-cli compile --upload` (found on `PATH`, from
+   `ARDUINO_CLI`, or in the copy the Arduino IDE bundles). The compile is not
+   incidental: `arduino-cli upload` alone does not compile, and fails with
+   "Compiled sketch not found" for any sketch that has not been built before —
+   which is every sketch this module writes.
+3. **Assert the diagnosis.** `doctor` must exit 1, say "not printing", name
+   `mega_channel_node` as the sketch to upload, and still show
+   `bootloader : answered` — that last one is the whole claim: the chip was
+   alive the entire time.
+4. **Put it back.** `mega_channel_node` is uploaded again and `doctor` must exit
+   0 with samples arriving.
+
+`--json` prints one object and nothing else — every check with its detail, the
+pass count, the failures by name, and the exit status — so a scheduled job can
+record a result without parsing the running commentary:
+
+```bash
+.venv/bin/python -m wifi_radar.selftest --json > selftest.json
+```
+
+The restore is in a `finally`, so a failed assertion in step 3 still puts the
+firmware back. The run ends with `9/9 checks passed`, or with what failed and
+what state the board was left in: a refused run says "nothing was flashed", and
+a failed restore says `WARNING` instead of reassuring you — and says whether the
+silent sketch actually got on, so you know what to re-flash. Exit status is 0
+only when every check passed.
+
+Uploads run under a timeout that kills the **whole process tree**. That detail
+is not housekeeping: `arduino-cli` uploads through `avrdude`, which it starts as
+its own child, and killing only the parent on a timeout leaves `avrdude` alive
+and holding the serial port. Every later upload then fails with "Access is
+denied" — indistinguishable from a dead USB adapter, and it cost this bench an
+afternoon of blaming the cable before the orphan was found in `tasklist`.
+
+CI does run one check against a real port, without a board: [fakeboard.py](fakeboard.py)
+opens a pseudo-terminal that prints the sketch's lines and runs the actual
+doctor against it, failing when the verdict is not `printing`:
+
+```bash
+python -m wifi_radar.fakeboard --verbose      # Linux and macOS; needs pyserial
+```
+
+That job exists because the unit tests pin the pieces but never open a port, and
+the first time the real path ran against a pty it crashed on the DTR ioctl — a
+driver detail no fake stream would have raised. `--silent` makes the simulated
+board print nothing, which is how the failure branch is checked.
+
+It is deliberately not in the unittest suite: CI has no Mega on the end of a
+cable, and a test that skips is a test that rots. The script itself is tested
+without a board — a scripted `subprocess.run` answers the uploads and the doctor
+calls, so the ordering, the refusal, the restore and the wording are pinned.
+What that cannot prove is that a real bootloader answers `GET_SYNC` the way the
+fake does; that is what running it on a desk is for. On this bench the CH340
+still enumerates and returns no bytes, so step 1 currently stops the run with
+`0/1 checks passed` and the board untouched.

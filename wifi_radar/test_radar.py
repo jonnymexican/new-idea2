@@ -55,15 +55,21 @@ Run with:  .venv/bin/python -m unittest wifi_radar.test_radar
 
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
 import socket
+import statistics
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
-from wifi_radar import csi, detect, live, nexmon, serial_node
+from wifi_radar import (csi, detect, doctor, fakeboard, handtrial, live, nexmon,
+                        selftest, serial_node)
 
 
 def collect(source, detector, limit=None):
@@ -378,6 +384,134 @@ class TestDetector(unittest.TestCase):
         quiet = [d.agreement for d in detections if 18.0 <= d.t <= 24.0]
         self.assertGreater(sum(during) / len(during), 0.6)
         self.assertLess(sum(quiet) / len(quiet), 0.25)
+
+    def test_the_high_pass_is_on_by_default(self):
+        """A filter that has to be remembered is one that is not there."""
+        self.assertGreater(detect.DEFAULT_HIGHPASS_SECONDS, 0)
+        self.assertEqual(self.detector().highpass_seconds,
+                         detect.DEFAULT_HIGHPASS_SECONDS)
+
+    def test_highpass_zero_turns_the_filter_off(self):
+        from wifi_radar import watch
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = watch.main(["--source", "sim:walk", "--seconds", "1",
+                                 "--highpass", "0", "--fast", "--every", "10"])
+        self.assertEqual(status, 0)
+
+    def test_a_high_pass_follows_slow_drift_instead_of_reporting_it(self):
+        """
+        A wire on an ADC pin swings on a slow envelope, and the first pin after
+        the mux move carries most of it. The filter follows that baseline, so the
+        drift stops arriving as change; a fast hand does not get followed.
+        """
+        import math
+
+        def frames(seconds=20.0):
+            for i in range(int(seconds * 20)):
+                t = i / 20.0
+                swing = 10.0 * math.sin(2 * math.pi * 0.1 * t)
+                values = [complex(300.0, 0)] * 8
+                values[0] = complex(300.0 + swing, 0)   # A0 leads the swing
+                yield csi.Frame(t, values)
+
+        def spread(**kw):
+            det = self.detector(calibrate_seconds=2.0, **kw)
+            metrics = [d.metric for d in (det.update(f) for f in frames())
+                       if not d.calibrating]
+            return statistics.pstdev(metrics), statistics.mean(metrics)
+
+        plain_sd, plain_mean = spread(highpass_seconds=0.0)
+        filtered_sd, filtered_mean = spread(highpass_seconds=0.5)
+        self.assertLess(filtered_sd, plain_sd)
+        self.assertLess(filtered_mean, plain_mean)
+
+    def test_a_fast_change_on_one_channel_survives_the_high_pass(self):
+        """The filter must not trade drift rejection for latency."""
+        def frames():
+            for i in range(60):
+                noise = 0.3 if i % 2 else -0.3
+                values = [complex(300 + noise, 0)] * 8
+                if 40 <= i < 43:            # a 0.15 s edge, like a hand arriving
+                    values[0] = complex(340 + noise, 0)
+                yield i, csi.Frame(i / 20.0, values)
+
+        det = self.detector(calibrate_seconds=1.0, highpass_seconds=0.5)
+        quiet, edge = [], []
+        for i, frame in frames():
+            m = det.update(frame).metric
+            if 20 <= i < 40:            # settled, before the hand
+                quiet.append(m)
+            elif 40 <= i < 48:          # the edge up and the edge back down
+                edge.append(m)
+        self.assertGreater(max(edge), 10 * max(quiet))
+
+    @staticmethod
+    def adc_drift(seconds=30.0, hz=0.1, amplitude=10.0):
+        """A wire on A0, swinging on the slow envelope it picks up from the air."""
+        import math
+
+        for i in range(int(seconds * 20)):
+            t = i / 20.0
+            values = [complex(300.0, 0)] * 8
+            values[0] = complex(300.0 + amplitude * math.sin(2 * math.pi * hz * t), 0)
+            yield csi.Frame(t, values)
+
+    def test_automatic_calibration_stops_at_the_minimum_when_nothing_drifts(self):
+        """A radio's floor is flat: there is nothing to wait for."""
+        detector = self.detector(calibrate_seconds=None)
+        for frame in csi.SyntheticSource(scenario="quiet", seconds=10.0, seed=5):
+            detector.update(frame)
+        self.assertEqual(detector.calibration_reason, "settled")
+        self.assertAlmostEqual(detector.calibration_seconds, 2.0, places=1)
+
+    def test_automatic_calibration_follows_a_drifting_floor_for_whole_cycles(self):
+        """
+        The point of the longer window, measured rather than asserted: its floor
+        is the session's floor, where a two-second sample of a ten-second
+        envelope lands on whichever part of it was sampled.
+        """
+        automatic = self.detector(calibrate_seconds=None)
+        for frame in self.adc_drift(30.0):
+            automatic.update(frame)
+        self.assertEqual(automatic.calibration_reason, "cycles")
+        self.assertGreater(automatic.calibration_seconds, 8.0)
+
+        reference = self.detector(calibrate_seconds=40.0)
+        for frame in self.adc_drift(40.0):
+            reference.update(frame)
+        self.assertLess(abs(automatic.floor / reference.floor - 1), 0.10,
+                        f"auto floor {automatic.floor} against {reference.floor}")
+
+        minimum = self.detector(calibrate_seconds=2.0)
+        for frame in self.adc_drift(40.0):
+            minimum.update(frame)
+        self.assertGreater(abs(minimum.floor / reference.floor - 1), 0.10,
+                           "the minimum window was already representative, so "
+                           "the longer one proves nothing")
+
+    def test_automatic_calibration_stops_at_its_limit(self):
+        detector = self.detector(calibrate_seconds=None, calibrate_max_seconds=5.0)
+        for frame in self.adc_drift(10.0):
+            detector.update(frame)
+        self.assertEqual(detector.calibration_reason, "limit")
+        self.assertAlmostEqual(detector.calibration_seconds, 5.0, places=1)
+
+    def test_a_number_still_fixes_the_window_exactly(self):
+        detector = self.detector(calibrate_seconds=1.0)
+        for frame in self.adc_drift(5.0):
+            detector.update(frame)
+        self.assertEqual(detector.calibration_reason, "fixed")
+        self.assertAlmostEqual(detector.calibration_seconds, 1.0, places=1)
+
+    def test_without_the_high_pass_there_is_no_drift_to_wait_for(self):
+        """With the filter off the two series are identical, and the detector "
+        says so rather than looking at a number that cannot mean anything."""
+        detector = self.detector(calibrate_seconds=None, highpass_seconds=0.0)
+        for frame in self.adc_drift(10.0):
+            detector.update(frame)
+        self.assertEqual(detector.calibration_reason, "settled")
 
     def test_calibration_is_reported_rather_than_hidden(self):
         """The user is being asked to stand still; the view has to say so."""
@@ -890,6 +1024,371 @@ class QuietPort:
         self.closed = True
 
 
+class FakeBootloader:
+    """
+    A port that answers stk500v2 GET_SYNC the way a Mega 2560 does.
+
+    The reply is the bytes a real board sent, kept verbatim: a test written from
+    the datasheet would pass against a frame no bootloader sends.
+    """
+
+    REPLY = bytes.fromhex("1b0000020e30c0e7")
+
+    def __init__(self, reply=REPLY):
+        self.reply = reply
+        self.writes = 0
+        self.dtr = None
+        self.closed = False
+
+    def write(self, data):
+        self.writes += 1
+
+    def flush(self):
+        pass
+
+    def read(self, size=64):
+        if self.reply and self.writes:
+            data, self.reply = self.reply, b""
+            return data
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+class TestDoctor(unittest.TestCase):
+    """The bring-up doctor: identity, bootloader, and is anything printing."""
+
+    def test_the_bytes_the_mega_sent_are_read_as_a_sync(self):
+        replies, status = doctor.parse_sync_replies(FakeBootloader.REPLY * 3)
+        self.assertEqual(replies, 3)
+        self.assertEqual(status, 0xC0)
+        self.assertTrue(doctor.status_ok(status))
+
+    def test_noise_is_not_a_sync(self):
+        self.assertEqual(doctor.parse_sync_replies(b"hello, world\r\n" * 4),
+                         (0, None))
+
+    def test_a_reply_without_the_token_is_not_a_sync(self):
+        self.assertEqual(doctor.parse_sync_replies(
+            bytes.fromhex("1b0000020030c0e7")), (0, None))
+
+    def test_the_probe_resets_the_board_and_closes_the_port(self):
+        port = FakeBootloader()
+        result = doctor.probe_bootloader(
+            "COM5", sync_seconds=0.05, interval=0.0,
+            open_port=lambda device, baud=115200: port, sleep=lambda s: None)
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["replies"], 1)
+        self.assertIs(port.dtr, True)      # the reset edge was driven
+        self.assertTrue(port.closed)
+
+    def test_a_port_that_cannot_be_written_to_is_an_error_not_a_hang(self):
+        """A wedged USB chip blocks writes; the probe must surface that."""
+        class Frozen(FakeBootloader):
+            def write(self, data):
+                raise OSError("write timeout")
+
+        port = Frozen()
+        result = doctor.probe_bootloader(
+            "COM5", sync_seconds=0.05, interval=0.0,
+            open_port=lambda device, baud=115200: port, sleep=lambda s: None)
+        self.assertFalse(result["answered"])
+        self.assertIn("write failed", result["error"])
+        self.assertTrue(port.closed)
+
+    def test_a_board_that_never_answers_is_not_called_alive(self):
+        port = FakeBootloader(reply=b"")
+        result = doctor.probe_bootloader(
+            "COM5", sync_seconds=0.05, interval=0.0,
+            open_port=lambda device, baud=115200: port, sleep=lambda s: None)
+        self.assertFalse(result["answered"])
+        self.assertEqual(result["replies"], 0)
+
+    def test_listening_reads_samples_at_the_boards_own_rate(self):
+        heard = doctor.listen(
+            "COM5", seconds=0.05, sleep=lambda s: None,
+            open_port=lambda device, baud=115200: io.StringIO(
+                "# mega_channel_node 8 channels 20 Hz\n"
+                "S,100,1,2\nS,150,3,4\nS,200,5,6\n"))
+        self.assertEqual(heard["samples"], 3)
+        self.assertIn("mega_channel_node", heard["banner"])
+        self.assertEqual(heard["first_sample"], "S,100,1,2")
+        self.assertAlmostEqual(heard["rate"], 20.0)
+
+    def test_listening_tells_noise_apart_from_silence(self):
+        heard = doctor.listen(
+            "COM5", seconds=0.05, sleep=lambda s: None,
+            open_port=lambda device, baud=115200: io.StringIO("hello\nhello\n"))
+        self.assertEqual(heard["samples"], 0)
+        self.assertEqual(heard["rejected"], 2)
+        self.assertIsNotNone(heard["rejection"])
+        self.assertGreater(heard["bytes"], 0)
+
+    def test_json_payload_for_a_printing_board(self):
+        boot = {"answered": True, "replies": 18, "status": 0xC0,
+                "error": None, "duration": 2.1}
+        heard = {"error": None, "samples": 61, "lines": 62, "bytes": 2400,
+                 "banner": "# mega_channel_node 8 channels 20 Hz",
+                 "first_sample": "S,50,1,2", "rejected": 0, "rejection": None,
+                 "rate": 20.0123, "duration": 4.1}
+        verdict, status = doctor.classify(boot, heard)
+        doc = doctor.as_json(
+            "COM5", FakePort("COM5", "Arduino Mega 2560 (COM5)", vid=0x2341,
+                             pid=0x0042), boot, heard, verdict, status)
+        self.assertEqual(verdict, "printing")
+        self.assertEqual(doc["exit_status"], 0)
+        self.assertEqual(doc["port"], "COM5")
+        self.assertEqual(doc["board"]["vid"], 0x2341)
+        self.assertEqual(doc["board"]["pid"], 0x0042)
+        self.assertEqual(doc["sketch"]["rate_hz"], 20.01)
+        self.assertTrue(doc["sketch"]["printing"])
+        self.assertTrue(doc["bootloader"]["status_ok"])
+        self.assertEqual(doc["bootloader"]["status"], 0xC0)
+        json.dumps(doc)                      # must be serialisable as it stands
+
+    def test_json_payload_for_silent_firmware(self):
+        boot = {"answered": True, "replies": 18, "status": 0xC0,
+                "error": None, "duration": 2.1}
+        heard = {"error": None, "samples": 0, "lines": 0, "bytes": 0,
+                 "banner": None, "first_sample": None, "rejected": 0,
+                 "rejection": None, "rate": None, "duration": 4.0}
+        verdict, status = doctor.classify(boot, heard)
+        doc = doctor.as_json("COM5", None, boot, heard, verdict, status)
+        self.assertEqual((verdict, status), ("silent_firmware", 1))
+        self.assertEqual(doc["sketch"]["samples"], 0)
+        self.assertFalse(doc["sketch"]["printing"])
+        self.assertIsNone(doc["sketch"]["rate_hz"])
+        self.assertIn("sketch", doc["message"])
+
+    def test_json_mode_prints_one_parseable_object(self):
+        """Scripts get a document and nothing else, with the same exit status."""
+        ports = [FakePort("COM1", "Communications Port"),
+                 FakePort("COM5", "Arduino Mega 2560 (COM5)", vid=0x2341)]
+        streams = [FakeBootloader(),
+                   io.StringIO("# banner\nS,0,10,20\nS,50,11,19\n")]
+
+        original_ports = serial_node.available_ports
+        original_open = serial_node.open_serial
+        serial_node.available_ports = lambda: ports
+        serial_node.open_serial = lambda device, baud=115200: streams.pop(0)
+        self.addCleanup(setattr, serial_node, "available_ports", original_ports)
+        self.addCleanup(setattr, serial_node, "open_serial", original_open)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = doctor.main(["--json", "--sync-seconds", "0.05",
+                                  "--seconds", "0.05"])
+        self.assertEqual(status, 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["verdict"], "printing")
+        self.assertEqual(doc["exit_status"], 0)
+        self.assertEqual(doc["port"], "COM5")
+        self.assertEqual(doc["sketch"]["samples"], 2)
+
+    def test_json_mode_with_no_ports_exits_2_without_stderr(self):
+        original = serial_node.available_ports
+        serial_node.available_ports = lambda: []
+        self.addCleanup(setattr, serial_node, "available_ports", original)
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = doctor.main(["--json"])
+        self.assertEqual(status, 2)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["verdict"], "no_port")
+        self.assertEqual(doc["exit_status"], 2)
+        self.assertIsNone(doc["board"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_printing_board_is_ok(self):
+        text, status = doctor.report(
+            "COM5",
+            FakePort("COM5", "Arduino Mega 2560 (COM5)", vid=0x2341, pid=0x0042),
+            {"answered": True, "replies": 24, "status": 0xC0,
+             "error": None, "duration": 2.0},
+            {"error": None, "samples": 62, "lines": 63, "bytes": 1600,
+             "banner": "# mega_channel_node 8 channels 20 Hz",
+             "first_sample": "S,50,1,2", "rejected": 0, "rejection": None,
+             "rate": 20.0, "duration": 4.1})
+        self.assertEqual(status, 0)
+        self.assertIn("COM5", text)
+        self.assertIn("20.0/s", text)
+        self.assertIn("watch --source serial:COM5", text)
+
+    def test_the_scan_finds_the_rate_the_firmware_uses(self):
+        """A silent 115200 and a talking 9600 must end at 9600, and stop."""
+        def opener(device, baud=115200):
+            if baud == 9600:
+                return io.StringIO("# banner\nS,0,10,20\nS,50,11,19\n")
+            return io.StringIO("")
+
+        heard, tried = doctor.find_baud(
+            "COM5", 115200, seconds=0.05, scan_seconds=0.05,
+            open_port=opener, sleep=lambda s: None)
+        self.assertEqual(heard["samples"], 2)
+        self.assertEqual(heard["baud"], 9600)
+        self.assertEqual(heard["baud_requested"], 115200)
+        self.assertEqual([entry["baud"] for entry in tried], [115200, 9600])
+
+    def test_a_scan_that_finds_nothing_reports_every_rate_it_tried(self):
+        heard, tried = doctor.find_baud(
+            "COM5", 115200, seconds=0.02, scan_seconds=0.02,
+            open_port=lambda device, baud=115200: io.StringIO("hello\n"),
+            sleep=lambda s: None)
+        self.assertEqual(heard["samples"], 0)
+        self.assertGreater(len(tried), 1)
+        self.assertIn(9600, [entry["baud"] for entry in tried])
+
+    def test_scanning_can_be_turned_off(self):
+        heard, tried = doctor.find_baud(
+            "COM5", 115200, seconds=0.02, scan_seconds=0.0,
+            open_port=lambda device, baud=115200: io.StringIO(""),
+            sleep=lambda s: None)
+        self.assertEqual([entry["baud"] for entry in tried], [115200])
+        self.assertEqual(heard["baud"], 115200)
+
+    def test_a_printing_board_at_another_rate_is_named_in_the_report(self):
+        boot = {"answered": True, "replies": 18, "status": 0xC0,
+                "error": None, "duration": 2.1}
+        heard = {"error": None, "samples": 2, "lines": 2, "bytes": 60,
+                 "banner": None, "first_sample": "S,0,10,20",
+                 "rejected": 0, "rejection": None, "rate": 20.0,
+                 "duration": 0.1, "baud": 9600, "baud_requested": 115200,
+                 "tried": [{"baud": 115200, "bytes": 0, "samples": 0,
+                            "rejected": 0},
+                           {"baud": 9600, "bytes": 60, "samples": 2,
+                            "rejected": 0}]}
+        verdict, status = doctor.classify(boot, heard)
+        text, status = doctor.report("COM5", FakePort("COM5", vid=0x2341),
+                                     boot, heard)
+        self.assertEqual((verdict, status), ("printing", 0))
+        self.assertIn("--baud 9600", text)
+        self.assertIn("9600", text)
+        doc = doctor.as_json("COM5", FakePort("COM5", vid=0x2341),
+                             boot, heard, verdict, status)
+        self.assertEqual(doc["sketch"]["baud"], 9600)
+        self.assertEqual(doc["sketch"]["baud_requested"], 115200)
+        self.assertEqual(doc["bauds_tried"], [115200, 9600])
+        self.assertIn("9600", doc["message"])
+
+    def test_the_command_scans_when_the_requested_rate_is_silent(self):
+        ports = [FakePort("COM5", "Arduino Mega 2560 (COM5)", vid=0x2341)]
+        opened = []
+
+        def opener(device, baud=115200):
+            opened.append(baud)
+            if len(opened) == 1:            # the bootloader probe
+                return FakeBootloader()
+            if baud == 9600:
+                return io.StringIO("S,0,10,20\nS,50,11,19\n")
+            return io.StringIO("")
+
+        original_ports = serial_node.available_ports
+        original_open = serial_node.open_serial
+        serial_node.available_ports = lambda: ports
+        serial_node.open_serial = opener
+        self.addCleanup(setattr, serial_node, "available_ports", original_ports)
+        self.addCleanup(setattr, serial_node, "open_serial", original_open)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = doctor.main(["--json", "--sync-seconds", "0.05",
+                                  "--seconds", "0.05", "--scan-seconds", "0.05"])
+        self.assertEqual(status, 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["sketch"]["baud"], 9600)
+        self.assertEqual(doc["verdict"], "printing")
+        self.assertEqual(doc["bauds_tried"][:2], [115200, 9600])
+
+    def test_a_silent_board_that_answers_its_bootloader_is_a_sketch_problem(self):
+        text, status = doctor.report(
+            "COM5", FakePort("COM5", vid=0x2341),
+            {"answered": True, "replies": 24, "status": 0xC0,
+             "error": None, "duration": 2.0},
+            {"error": None, "samples": 0, "lines": 0, "bytes": 0,
+             "banner": None, "first_sample": None, "rejected": 0,
+             "rejection": None, "rate": None, "duration": 4.0})
+        self.assertEqual(status, 1)
+        self.assertIn("not printing", text)
+        self.assertIn("mega_channel_node", text)
+
+    def test_something_else_printing_is_named_as_the_wrong_protocol(self):
+        text, status = doctor.report(
+            "COM5", FakePort("COM5", vid=0x2341),
+            {"answered": False, "replies": 0, "status": None,
+             "error": None, "duration": 2.0},
+            {"error": None, "samples": 0, "lines": 33, "bytes": 400,
+             "banner": None, "first_sample": None, "rejected": 33,
+             "rejection": "a line starting 'hello' is neither a sensor sample",
+             "rate": None, "duration": 4.0})
+        self.assertEqual(status, 1)
+        self.assertIn("wrong protocol", text)
+        self.assertIn("--baud", text)
+
+    def test_a_port_that_cannot_be_opened_exits_2(self):
+        busy = "cannot open COM5 at 115200 baud: access denied"
+        text, status = doctor.report(
+            "COM5", FakePort("COM5", vid=0x2341),
+            {"answered": False, "replies": 0, "status": None,
+             "error": busy, "duration": 0.0},
+            {"error": busy, "samples": 0, "lines": 0, "bytes": 0,
+             "banner": None, "first_sample": None, "rejected": 0,
+             "rejection": None, "rate": None, "duration": 0.0})
+        self.assertEqual(status, 2)
+        self.assertIn("access denied", text)
+
+    def test_the_command_runs_end_to_end_against_a_fake_board(self):
+        ports = [FakePort("COM1", "Communications Port"),
+                 FakePort("COM5", "Arduino Mega 2560 (COM5)", vid=0x2341)]
+        streams = [FakeBootloader(),
+                   io.StringIO("# banner\nS,0,10,20\nS,50,11,19\n")]
+
+        original_ports = serial_node.available_ports
+        original_open = serial_node.open_serial
+        serial_node.available_ports = lambda: ports
+        serial_node.open_serial = lambda device, baud=115200: streams.pop(0)
+        self.addCleanup(setattr, serial_node, "available_ports", original_ports)
+        self.addCleanup(setattr, serial_node, "open_serial", original_open)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = doctor.main(["--sync-seconds", "0.05", "--seconds", "0.05"])
+        self.assertEqual(status, 0)
+        text = out.getvalue()
+        self.assertIn("COM5", text)
+        self.assertIn("2 samples", text)
+
+    def test_no_ports_exits_2_and_names_the_driver(self):
+        original = serial_node.available_ports
+        serial_node.available_ports = lambda: []
+        self.addCleanup(setattr, serial_node, "available_ports", original)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status = doctor.main([])
+        self.assertEqual(status, 2)
+        self.assertIn("CH340", err.getvalue())
+
+
+class PortLikeFile(io.RawIOBase):
+    """
+    pyserial's `Serial` is an `io.RawIOBase` with `in_waiting` and `baudrate`.
+
+    That shape — an IOBase that is a port, not a file — is what used to be read
+    as a finished capture, so it is the shape a regression test has to have.
+    """
+
+    baudrate = 115200
+    in_waiting = 0
+
+    def readable(self):
+        return True
+
+    def readline(self, size=-1):
+        return b""
+
+
 class TestSerialProtocol(unittest.TestCase):
     def test_a_sample_line_is_a_list_of_channel_values(self):
         kind, millis, values = serial_node.parse_line("S,1204,512,498,733\r\n")
@@ -932,6 +1431,782 @@ class TestSerialProtocol(unittest.TestCase):
         for bad in ("", ":9600"):
             with self.assertRaises(ValueError, msg=bad):
                 serial_node.parse_spec(bad)
+
+    def test_auto_baud_in_a_spec_is_none_not_a_number(self):
+        self.assertEqual(serial_node.parse_spec("COM5:auto"), ("COM5", None))
+        self.assertEqual(serial_node.parse_spec("/dev/ttyACM0:AUTO"),
+                         ("/dev/ttyACM0", None))
+        self.assertIsNone(serial_node.parse_baud("auto"))
+        self.assertEqual(serial_node.parse_baud("9600"), 9600)
+
+
+class TestAutoBaud(unittest.TestCase):
+    """The rate is found the way the doctor finds it, once, at open time."""
+
+    def test_discovery_asks_the_doctor_which_rate_works(self):
+        seen = {}
+
+        def fake_find(port, baud=serial_node.DEFAULT_BAUD, **kwargs):
+            seen["port"] = port
+            seen["baud"] = baud
+            return ({"samples": 40, "baud": 9600},
+                    [{"baud": 115200}, {"baud": 9600}])
+
+        with mock.patch.object(doctor, "find_baud", fake_find):
+            rate, tried = serial_node.discover_baud("COM5")
+        self.assertEqual((rate, seen["port"]), (9600, "COM5"))
+        self.assertEqual([item["baud"] for item in tried], [115200, 9600])
+
+    def test_discovery_that_finds_nothing_names_the_rates_and_the_doctor(self):
+        with mock.patch.object(doctor, "find_baud",
+                               lambda port, **kw: ({"samples": 0},
+                                                   [{"baud": 115200},
+                                                    {"baud": 9600}])):
+            with self.assertRaises(OSError) as caught:
+                serial_node.discover_baud("COM5")
+        message = str(caught.exception)
+        self.assertIn("115200, 9600", message)
+        self.assertIn("wifi_radar.doctor", message)
+
+    def test_a_source_says_when_its_rate_was_found(self):
+        found = serial_node.SerialSource(io.StringIO(""), port="COM5", baud=9600,
+                                         baud_found=True)
+        self.assertIn("9600 baud (found by scanning)", found.describe())
+        asked = serial_node.SerialSource(io.StringIO(""), port="COM5", baud=9600)
+        self.assertIn("9600 baud,", asked.describe())
+        self.assertNotIn("found by scanning", asked.describe())
+
+    def test_the_page_reads_the_rate_the_stream_is_actually_using(self):
+        class Stream(io.StringIO):
+            baudrate = 57600
+
+        source = serial_node.SerialSource(Stream(""), port="COM5", baud=115200)
+        self.assertEqual(source.baud_in_use, 57600)
+        self.assertIn("57600", source.describe())
+
+    def test_the_idle_timeout_reaches_a_serial_source(self):
+        """A board being reset by hand needs longer than the ten-second default."""
+        with mock.patch.object(serial_node, "open_serial",
+                               lambda port, baud, timeout=0.2: io.StringIO("")):
+            source = csi.open_source("serial:COM5", timeout=45.0)
+        self.assertEqual(source.timeout, 45.0)
+
+    def test_a_serial_spec_with_auto_discovers_before_opening(self):
+        opened = {}
+
+        def fake_open(port, baud=serial_node.DEFAULT_BAUD, timeout=0.2):
+            opened["port"], opened["baud"] = port, baud
+            return io.StringIO("")
+
+        with mock.patch.object(serial_node, "discover_baud",
+                               lambda port, **kw: (9600, [{"baud": 9600}])), \
+                mock.patch.object(serial_node, "open_serial", fake_open):
+            source = csi.open_source("serial:COM5:auto")
+        self.assertEqual(opened, {"port": "COM5", "baud": 9600})
+        self.assertTrue(source.baud_found)
+
+
+class TestHandTrial(unittest.TestCase):
+    """The guided antenna trial: schedule, recording, and per-segment z."""
+
+    def test_the_schedule_is_a_contiguous_timeline(self):
+        from wifi_radar import handtrial
+
+        marks = handtrial.schedule(10, 5, [20, 30])
+        self.assertEqual([mark["name"] for mark in marks],
+                         ["idle", "20 cm", "30 cm"])
+        self.assertEqual(marks[0], {"name": "idle", "start": 0.0, "end": 10.0})
+        self.assertEqual(marks[-1]["end"], 20.0)
+        for before, after in zip(marks, marks[1:]):
+            self.assertEqual(before["end"], after["start"])
+
+    def test_a_hand_that_arrives_shows_up_in_the_segment_it_arrived_in(self):
+        from wifi_radar import handtrial
+
+        def frames():
+            for i in range(8 * 20):
+                t = i / 20.0
+                values = [complex(300.0, 0)] * 8
+                values[0] = complex(340.0 if t >= 4.0 else 300.0, 0)
+                yield csi.Frame(t, values)
+
+        rows, _ = handtrial.analyse(list(frames()), handtrial.schedule(4, 4, [20]),
+                                    detect.DEFAULT_HIGHPASS_SECONDS, 20.0,
+                                    calibration=2.0)
+        self.assertGreaterEqual(rows["idle"]["frames"], 38)
+        self.assertLess(rows["idle"]["max"], 5.0)
+        self.assertGreater(rows["20 cm"]["max"], 20.0)
+
+    def test_the_placement_control_passes_only_when_a_channel_moved(self):
+        from wifi_radar import handtrial
+
+        self.assertTrue(handtrial.control_passed(
+            {"idle": {"worst": 2.1}, "2 cm": {"worst": 4.4, "channel": 7}}))
+        self.assertFalse(handtrial.control_passed(
+            {"idle": {"worst": 2.1}, "2 cm": {"worst": 1.8, "channel": 7}}))
+        self.assertFalse(handtrial.control_passed({}))
+
+    def test_the_control_is_two_equal_stretches(self):
+        from wifi_radar import handtrial
+
+        marks = handtrial.control_marks(10)
+        self.assertEqual([mark["name"] for mark in marks], ["idle", "2 cm"])
+        self.assertEqual(marks[0]["end"], marks[1]["start"])
+        self.assertEqual(marks[1]["end"], 20.0)
+
+    def test_recording_stops_at_the_end_of_the_schedule(self):
+        from wifi_radar import handtrial
+
+        source = csi.SyntheticSource(scenario="quiet", seconds=20.0, seed=1)
+        marks = handtrial.schedule(1, 1, [20])
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "trial.jsonl")
+            written = handtrial.record(source, marks, path, say=lambda *a: None)
+            with open(path, encoding="utf-8") as handle:
+                lines = sum(1 for _ in handle)
+        self.assertEqual(written, lines)
+        self.assertGreaterEqual(written, 38)
+        self.assertLess(written, 50)
+
+
+class TestThresholdsFromARecording(unittest.TestCase):
+    """Deriving the calibration length and threshold from what was recorded."""
+
+    def write(self, root, marks=None, seconds=12.0, hand_at=None):
+        """A recording of a quiet room, optionally with a hand arriving at t."""
+        path = os.path.join(root, "trial.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            for i in range(int(seconds * 20)):
+                t = i / 20.0
+                level = 300.0 + (40.0 if hand_at is not None and t >= hand_at else 0.0)
+                values = [complex(level, 0)] * 8
+                out.write(json.dumps(csi.Frame(t, values).as_record()) + "\n")
+        if marks is not None:
+            with open(path + ".marks.json", "w", encoding="utf-8") as out:
+                json.dump({"marks": marks, "frames": int(seconds * 20)}, out)
+        return path
+
+    def run_main(self, argv):
+        from wifi_radar import thresholds
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = thresholds.main(argv)
+        return status, out.getvalue()
+
+    def test_the_lowest_window_that_holds_its_idle_rate_is_the_one_chosen(self):
+        from wifi_radar import thresholds
+
+        rows = [{"seconds": 2.0, "rate": 0.20},
+                {"seconds": 5.0, "rate": 0.01},
+                {"seconds": 10.0, "rate": 0.0}]
+        self.assertEqual(thresholds.pick_calibration(rows), 5.0)
+        # Asked for no false alarms at all, only the window measured at zero
+        # qualifies; the others are not promoted just because none does.
+        self.assertEqual(thresholds.pick_calibration(rows, max_idle=0.0), 10.0)
+        self.assertIsNone(thresholds.pick_calibration(rows[:2], max_idle=0.0))
+
+    def test_a_window_and_a_threshold_are_derived_from_a_marked_recording(self):
+        marks = [{"name": "idle", "start": 0.0, "end": 6.0},
+                 {"name": "20 cm", "start": 6.0, "end": 12.0}]
+        with tempfile.TemporaryDirectory() as root:
+            path = self.write(root, marks, hand_at=6.0)
+            status, text = self.run_main(["--record", path, "--sigmas", "2,4"])
+        self.assertEqual(status, 0)
+        self.assertIn("calibration window", text)
+        self.assertIn("20 cm", text)
+        self.assertIn("--calibrate", text)
+        self.assertIn("--on-sigma", text)
+
+    def test_an_unmarked_recording_is_taken_as_one_idle_stretch(self):
+        """A plain recording of an empty room still sizes the window."""
+        with tempfile.TemporaryDirectory() as root:
+            path = self.write(root, marks=None)
+            status, text = self.run_main(["--record", path, "--sigmas", "4"])
+        self.assertEqual(status, 0)
+        self.assertIn("none marked", text)
+        self.assertIn("calibration window", text)
+
+    def test_an_idle_stretch_too_short_to_judge_a_window_is_refused(self):
+        marks = [{"name": "idle", "start": 0.0, "end": 3.0},
+                 {"name": "20 cm", "start": 3.0, "end": 6.0}]
+        with tempfile.TemporaryDirectory() as root:
+            path = self.write(root, marks, seconds=6.0)
+            from wifi_radar import thresholds
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                status = thresholds.main(["--record", path])
+        self.assertEqual(status, 2)
+        self.assertIn("--idle", err.getvalue())
+
+
+class TestCues(unittest.TestCase):
+    """A trial announced out loud, so it can be run without watching a screen."""
+
+    def cue(self, mode="both", **kwargs):
+        from wifi_radar import cues
+
+        said, beeped = [], []
+        kwargs.setdefault("background", False)
+        kwargs.setdefault("speak", lambda text: said.append(text) or True)
+        kwargs.setdefault("beep", lambda **kw: beeped.append(kw) or True)
+        return cues.Cue(mode, **kwargs), said, beeped
+
+    def test_off_says_nothing_at_all(self):
+        cue, said, beeped = self.cue("off")
+        cue.announce("hand at 20 centimetres")
+        self.assertEqual((said, beeped), ([], []))
+
+    def test_both_beeps_and_speaks_the_change(self):
+        cue, said, beeped = self.cue("both")
+        cue.announce("hand at 20 centimetres")
+        self.assertEqual(said, ["hand at 20 centimetres"])
+        self.assertEqual(len(beeped), 1)
+
+    def test_a_voice_that_fails_still_leaves_a_tone(self):
+        """Silence is the one outcome a segment change cannot have."""
+        cue, _, beeped = self.cue("both", speak=lambda text: False)
+        cue.announce("hand at 30 centimetres")
+        self.assertEqual(len(beeped), 2)
+
+    def test_a_broken_cue_never_ends_the_trial(self):
+        def boom(*args, **kwargs):
+            raise OSError("no audio device")
+
+        cue, _, _ = self.cue("both", speak=boom, beep=boom)
+        cue.announce("hand at 40 centimetres")      # must not raise
+
+    def test_the_trial_cues_every_segment_in_order(self):
+        from wifi_radar import handtrial
+
+        class Counting:
+            def __init__(self):
+                self.texts = []
+
+            def announce(self, text):
+                self.texts.append(text)
+
+        cue = Counting()
+        source = csi.SyntheticSource(scenario="quiet", seconds=6.0, seed=1)
+        marks = handtrial.schedule(2, 2, [20, 30])
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "trial.jsonl")
+            handtrial.record(source, marks, path, say=lambda *a: None, cue=cue)
+        self.assertEqual(cue.texts[:3],
+                         ["empty room, please step back",
+                          "hand at 20 centimetres",
+                          "hand at 30 centimetres"])
+
+    def test_the_cue_arrives_at_the_start_of_its_segment_not_a_segment_late(self):
+        """The hand moves on the cue, so the cue has to be on time."""
+        from wifi_radar import handtrial
+
+        seen = {"n": 0}
+        cues_at = {}
+
+        class Counting:
+            def announce(self, text):
+                cues_at[text] = seen["n"]
+
+        def frames():
+            for i in range(120):       # 6 s at 20 fps
+                seen["n"] = i
+                yield csi.Frame(i / 20.0, [complex(300.0, 0)] * 8)
+
+        marks = handtrial.schedule(2, 2, [20, 30])
+        with tempfile.TemporaryDirectory() as root:
+            handtrial.record(frames(), marks,
+                             os.path.join(root, "trial.jsonl"),
+                             say=lambda *a: None, cue=Counting())
+        # 20 cm starts at 2 s, which is frame 40; the old comparison used the
+        # segment's end and fired at frame 80 instead.
+        self.assertLessEqual(abs(cues_at["hand at 20 centimetres"] - 40), 1,
+                             cues_at)
+        self.assertLessEqual(abs(cues_at["hand at 30 centimetres"] - 80), 1,
+                             cues_at)
+
+    def test_a_trial_that_lost_the_board_names_the_stretches_it_lost(self):
+        """`n/a` reads as "no hand there"; a dead board is not a negative result."""
+        from wifi_radar import handtrial
+
+        marks = handtrial.schedule(20, 15, [2, 20, 30, 40])
+        frames = [csi.Frame(i / 20.0, [complex(300.0, 0)] * 8) for i in range(120)]
+        covered, wanted, missing = handtrial.missing_segments(frames, marks)
+        self.assertAlmostEqual(covered, 5.95, places=2)
+        self.assertEqual(wanted, 80.0)
+        self.assertEqual(missing, ["2 cm", "20 cm", "30 cm", "40 cm"])
+
+    def test_a_complete_trial_has_nothing_missing(self):
+        from wifi_radar import handtrial
+
+        marks = handtrial.schedule(2, 2, [20, 30])
+        frames = [csi.Frame(i / 20.0, [complex(300.0, 0)] * 8) for i in range(121)]
+        covered, wanted, missing = handtrial.missing_segments(frames, marks)
+        self.assertEqual(missing, [])
+        self.assertGreaterEqual(covered, wanted - 0.5)
+
+    def test_a_hand_stretch_with_no_frames_is_refused(self):
+        """Timestamps 80 s apart can hide a recording that holds two frames."""
+        from wifi_radar import handtrial
+
+        rows = {"idle": {"frames": 0, "over_4": None},
+                "2 cm": {"frames": 0, "over_4": None},
+                "5 cm": {"frames": 300, "over_4": 0.0}}
+        self.assertEqual(handtrial.empty_segments(rows), ["2 cm"])
+
+    def test_a_slow_hand_shows_in_the_level_table_and_not_in_the_motion_one(self):
+        """The control run at 2 cm moved every channel 36-58% and z stayed at 1."""
+        from wifi_radar import handtrial
+
+        def frames():
+            for i in range(12 * 20):
+                t = i / 20.0
+                # A hand arriving over two seconds, then held: no frame-to-frame
+                # change big enough to look like motion.
+                factor = 1.0 + 0.5 * min(1.0, max(0.0, (t - 4.0) / 2.0))
+                values = [complex(300.0 * factor, 0)] * 8
+                yield csi.Frame(t, values)
+
+        marks = handtrial.schedule(4, 8, [2])
+        rows = handtrial.level_table(list(frames()), marks)
+        self.assertLess(abs(rows["idle"]["worst"]), 3.0)
+        self.assertGreater(rows["2 cm"]["worst"], 3.0)
+
+    def test_a_steady_input_shows_no_level_shift(self):
+        from wifi_radar import handtrial
+
+        frames = [csi.Frame(i / 20.0, [complex(300.0, 0)] * 8) for i in range(160)]
+        rows = handtrial.level_table(frames, handtrial.schedule(4, 4, [2]))
+        self.assertLess(abs(rows["2 cm"]["worst"]), 1.0)
+
+    def test_a_run_with_no_hand_in_it_is_called_a_baseline(self):
+        """Every segment at the idle rate means the hand was not there."""
+        from wifi_radar import handtrial
+
+        rows = {"idle": {"frames": 300, "over_4": 0.03},
+                "2 cm": {"frames": 300, "over_4": 0.02},
+                "5 cm": {"frames": 300, "over_4": 0.01}}
+        self.assertTrue(handtrial.baseline_only(rows))
+
+    def test_one_stretch_above_the_idle_rate_is_a_measurement(self):
+        from wifi_radar import handtrial
+
+        rows = {"idle": {"frames": 300, "over_4": 0.03},
+                "2 cm": {"frames": 300, "over_4": 0.25},
+                "5 cm": {"frames": 300, "over_4": 0.01}}
+        self.assertFalse(handtrial.baseline_only(rows))
+
+    def test_a_stretch_with_no_frames_is_not_evidence_either_way(self):
+        from wifi_radar import handtrial
+
+        rows = {"idle": {"frames": 0, "over_4": 0.0},
+                "2 cm": {"frames": 0, "over_4": 0.0}}
+        self.assertFalse(handtrial.baseline_only(rows))
+
+    def test_a_prompt_names_the_distance_rather_than_the_mark(self):
+        from wifi_radar import handtrial
+
+        self.assertEqual(handtrial.prompt_for("2 cm"), "hand at 2 centimetres")
+        self.assertIn("step back", handtrial.prompt_for("idle"))
+
+    def test_the_speaker_takes_one_prompt_per_line(self):
+        """The engine stays open, so a prompt is a write rather than a startup."""
+        import sys
+
+        from wifi_radar import cues
+
+        with tempfile.TemporaryDirectory() as root:
+            heard = os.path.join(root, "heard.txt")
+            script = ("import sys\n"
+                      f"out = open({heard!r}, 'a', encoding='utf-8')\n"
+                      "for line in sys.stdin:\n"
+                      "    out.write(line)\n"
+                      "    out.flush()\n")
+            speaker = cues.Speaker([sys.executable, "-u", "-c", script])
+            self.assertTrue(speaker.start())
+            self.assertTrue(speaker.say("hand at 20 centimetres"))
+            self.assertTrue(speaker.say("hand at 30\ncentimetres"))
+            speaker.close()
+            with open(heard, encoding="utf-8") as handle:
+                spoken = handle.read().split("\n")
+        self.assertEqual(spoken[0], "hand at 20 centimetres")
+        # A line break in a prompt would become a second, earlier-sounding cue.
+        self.assertEqual(spoken[1], "hand at 30 centimetres")
+
+    def test_a_dead_speaker_falls_back_to_a_short_lived_engine(self):
+        from wifi_radar import cues
+
+        class Dead:
+            def say(self, text):
+                return False
+
+            def start(self):
+                return True
+
+            def close(self):
+                pass
+
+        said = []
+        cue = cues.Cue("voice", speaker=Dead(), background=False,
+                       speak=lambda text: said.append(text) or True,
+                       beep=lambda **kw: True)
+        cue.announce("hand at 40 centimetres")
+        self.assertEqual(said, ["hand at 40 centimetres"])
+
+    def test_the_speech_command_is_usable_or_absent(self):
+        from wifi_radar import cues
+
+        command = cues.speech_command("hand at 20 centimetres")
+        if command is None:
+            self.skipTest("no speech engine on this machine")
+        self.assertTrue(all(isinstance(part, str) for part in command), command)
+        # The sentence is handed over in the environment, never spliced into a
+        # command line, so punctuation cannot be read as shell syntax.
+        self.assertTrue(cues.SPEECH_ENV in " ".join(command)
+                        or "hand at 20 centimetres" in command, command)
+
+
+class TestBoardReset(unittest.TestCase):
+    """A Mega resets without its USB bridge going away: millis() restarts."""
+
+    def test_the_session_clock_keeps_going_forward_across_a_reset(self):
+        lines = "S,1000,1,2\nS,1050,2,3\nS,0,3,4\nS,50,4,5\n"
+        source = serial_node.SerialSource(io.StringIO(lines), port="COM5")
+        times = [frame.t for frame in source]
+        self.assertEqual(source.reboots, 1)
+        self.assertTrue(all(b > a for a, b in zip(times, times[1:])), times)
+        self.assertIn("board reset 1x", source.describe())
+
+    def test_a_reset_does_not_look_like_the_counter_wrapping(self):
+        """The wrap moves the clock forwards by 49.7 days; a reset by a second."""
+        lines = "S,4294967290,1,2\nS,10,3,4\n"
+        source = serial_node.SerialSource(io.StringIO(lines), port="COM5")
+        times = [frame.t for frame in source]
+        self.assertGreater(times[1], times[0])
+        self.assertLess(times[1], 1.0)
+        self.assertEqual(source.reboots, 0)
+
+
+class TestOpeningAPort(unittest.TestCase):
+    """Opening the port must leave the board running its sketch, not its loader."""
+
+    def test_opening_pulses_dtr(self):
+        class Fake:
+            def __init__(self):
+                self.edges = []
+
+            @property
+            def dtr(self):
+                return True
+
+            @dtr.setter
+            def dtr(self, value):
+                self.edges.append(value)
+
+        stream = Fake()
+        slept = []
+        self.assertTrue(serial_node.pulse_reset(stream, sleep=slept.append))
+        self.assertEqual(stream.edges, [False, True])
+        self.assertEqual(slept, [0.3, 0.1])
+
+    def test_a_stream_with_no_dtr_is_left_alone(self):
+        self.assertFalse(serial_node.pulse_reset(io.StringIO()))
+
+    def test_open_serial_resets_after_opening(self):
+        """The board that stayed silent for twenty seconds until it was reset."""
+        reset = []
+
+        class FakePort:
+            def __init__(self):
+                self.flushed = 0
+
+            @property
+            def dtr(self):
+                return True
+
+            @dtr.setter
+            def dtr(self, value):
+                reset.append(value)
+
+            def reset_input_buffer(self):
+                self.flushed += 1
+
+        with mock.patch("serial.Serial", lambda *a, **kw: FakePort()):
+            stream = serial_node.open_serial("COM5", 115200)
+        self.assertEqual(reset[-2:], [False, True], reset)
+        self.assertIsInstance(stream, FakePort)
+        # A stale line left in the driver buffer would become the session's
+        # zero, putting every live frame tens of seconds into the schedule.
+        self.assertEqual(stream.flushed, 1)
+
+
+class TestReconnect(unittest.TestCase):
+    """A cable pulled mid-session must not end the session."""
+
+    class Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+        def sleep(self, seconds):
+            self.t += seconds
+
+    class Unplugging(io.StringIO):
+        """Lines, then an OSError: the adapter vanishing mid-read."""
+
+        def __init__(self, text, after):
+            super().__init__(text)
+            self.left = after
+
+        def readline(self):
+            if self.left <= 0:
+                raise OSError("device disconnected")
+            self.left -= 1
+            return super().readline()
+
+    def inner(self, text, after=2, **kwargs):
+        stream = self.Unplugging(text, after)
+        return serial_node.SerialSource(stream, port="COM5", **kwargs)
+
+    def test_frames_continue_after_the_board_resets(self):
+        clock = self.Clock()
+        opened = []
+        second = io.StringIO("S,0,1,2,3\nS,50,4,5,6\nS,100,7,8,9\n")
+
+        def opener():
+            opened.append(1)
+            return serial_node.SerialSource(second, port="COM5")
+
+        inner = self.inner("# banner\nS,0,10,11,12\nS,50,13,14,15\n", after=3)
+        source = serial_node.ReconnectingSource(
+            inner, opener, port="COM5", clock=clock, sleep=clock.sleep,
+            give_up_after=10.0, retry_seconds=1.0)
+        frames = [next(source) for _ in range(4)]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(source.reconnects, 1)
+        self.assertEqual(source.frames, 4)
+        self.assertTrue(all(b.t > a.t for a, b in zip(frames, frames[1:])), frames)
+
+    def test_a_reconnect_that_hands_back_a_bare_stream_still_makes_frames(self):
+        """A pyserial object iterates lines of bytes, not frames.
+
+        csi.open_source used to return the port itself from its reopen, so the
+        first reconnect replaced the working source with a raw stream: the next
+        frame failed and `describe()` raised. Found on the wire, not here.
+        """
+        clock = self.Clock()
+        first = self.inner("S,0,1,2\nS,50,3,4\n", after=2)
+        stream = io.StringIO("S,0,5,6\nS,50,7,8\n")
+        source = serial_node.ReconnectingSource(
+            first, lambda: stream, port="COM5", clock=clock,
+            sleep=clock.sleep, retry_seconds=1.0)
+        frames = [next(source) for _ in range(4)]
+        self.assertEqual(source.reconnects, 1)
+        self.assertEqual([f.values for f in frames],
+                         [[1, 2], [3, 4], [5, 6], [7, 8]])
+        self.assertIn("COM5", source.describe())
+        self.assertEqual(source.channels, 2)
+
+    def test_a_reconnect_opens_a_source_rather_than_a_port(self):
+        """The opener given to ReconnectingSource must return a source."""
+        def fake_open(port, baud=serial_node.DEFAULT_BAUD, timeout=0.2):
+            return io.StringIO("S,0,1,2\n")
+
+        with mock.patch.object(serial_node, "discover_baud",
+                               lambda port, **kw: (9600, [])), \
+                mock.patch.object(serial_node, "open_serial", fake_open), \
+                mock.patch.object(serial_node, "available_ports", lambda: []), \
+                mock.patch.object(serial_node, "choose_port",
+                                  lambda ports: mock.Mock(device="COM5")):
+            source = csi.open_source("serial:COM5:auto")
+            again = source._open()
+        self.assertTrue(hasattr(again, "describe"), type(again))
+        self.assertEqual(again.port, "COM5")
+
+    def test_the_session_clock_continues_instead_of_restarting(self):
+        """The board's millis() restarts at zero; the session's must not."""
+        clock = self.Clock()
+        second = io.StringIO("S,0,1,2,3\nS,50,4,5,6\nS,100,7,8,9\n")
+        inner = self.inner("S,0,10,11,12\nS,1000,13,14,15\n", after=2)
+        source = serial_node.ReconnectingSource(
+            inner, lambda: serial_node.SerialSource(second, port="COM5"),
+            port="COM5", clock=clock, sleep=clock.sleep, retry_seconds=2.0)
+        last_before = next(source)
+        next(source)
+        after = next(source)
+        self.assertGreater(after.t, 1.0)
+        self.assertGreater(after.t, 0.0)
+        self.assertGreater(after.t, last_before.t)
+
+    def test_a_board_that_never_comes_back_ends_the_session(self):
+        clock = self.Clock()
+
+        def opener():
+            raise OSError("no port")
+
+        source = serial_node.ReconnectingSource(
+            self.inner("S,0,1\nS,50,2\nS,100,3\n", after=2), opener,
+            port="COM5", clock=clock, sleep=clock.sleep,
+            give_up_after=3.0, retry_seconds=1.0)
+        with self.assertRaises(OSError):
+            while True:
+                next(source)
+        self.assertTrue(source.offline)
+        self.assertEqual(source.reconnects, 0)
+        self.assertIn("no port", source.describe())
+
+    def test_a_replay_that_ends_is_not_reconnected(self):
+        clock = self.Clock()
+        opened = []
+        source = serial_node.ReconnectingSource(
+            serial_node.SerialSource(io.StringIO("S,0,1\n"), port="file"),
+            lambda: opened.append(1), clock=clock, sleep=clock.sleep)
+        self.assertEqual(len(list(source)), 1)
+        self.assertEqual((source.reconnects, opened), (0, []))
+
+    def test_describe_counts_the_reconnects(self):
+        clock = self.Clock()
+        second = io.StringIO("S,0,1,2,3\nS,50,4,5,6\nS,100,7,8,9\n")
+        source = serial_node.ReconnectingSource(
+            self.inner("S,0,10,11,12\nS,50,13,14,15\n", after=2),
+            lambda: serial_node.SerialSource(second, port="COM5"),
+            port="COM5", clock=clock, sleep=clock.sleep, retry_seconds=1.0)
+        self.assertNotIn("reconnected", source.describe())
+        for _ in range(3):
+            next(source)
+        self.assertIn("reconnected 1x", source.describe())
+
+    def test_reconnects_are_announced(self):
+        clock = self.Clock()
+        seen = []
+        second = io.StringIO("S,0,1,2,3\nS,50,4,5,6\nS,100,7,8,9\n")
+        source = serial_node.ReconnectingSource(
+            self.inner("S,0,10,11,12\nS,50,13,14,15\n", after=2),
+            lambda: serial_node.SerialSource(second, port="COM5"),
+            port="COM5", clock=clock, sleep=clock.sleep, retry_seconds=1.0,
+            notify=seen.append)
+        for _ in range(3):
+            next(source)
+        self.assertTrue(any("stopped" in message for message in seen), seen)
+        self.assertTrue(any("reconnected" in message for message in seen), seen)
+
+    def test_open_source_reconnects_by_default_and_can_be_told_not_to(self):
+        with mock.patch.object(serial_node, "open_serial",
+                               lambda port, baud: io.StringIO("")):
+            wrapped = csi.open_source("serial:COM5")
+            bare = csi.open_source("serial:COM5", reconnect=False)
+        self.assertIsInstance(wrapped, serial_node.ReconnectingSource)
+        self.assertIsInstance(bare, serial_node.SerialSource)
+
+
+class TestThresholdSweep(unittest.TestCase):
+    """Choosing `on_sigma` by measurement, which is the only way to choose it."""
+
+    def test_a_quiet_room_clears_a_high_threshold(self):
+        from wifi_radar import thresholds
+
+        frames = list(csi.SyntheticSource(scenario="quiet", seconds=20.0, seed=9))
+        rows = thresholds.sweep(frames, [1.0, 10.0], calibration=None)
+        self.assertEqual(rows[1]["flagged"], 0)
+        self.assertGreaterEqual(rows[0]["flagged"], rows[1]["flagged"])
+
+    def test_the_pick_is_the_loosest_threshold_under_the_budget(self):
+        from wifi_radar import thresholds
+
+        rows = [{"sigma": 2.0, "rate": 0.2}, {"sigma": 4.0, "rate": 0.001},
+                {"sigma": 6.0, "rate": 0.0}]
+        self.assertEqual(thresholds.pick(rows, 0.01), 4.0)
+
+    def test_no_threshold_under_the_budget_says_so(self):
+        from wifi_radar import thresholds
+
+        self.assertIsNone(thresholds.pick([{"sigma": 2.0, "rate": 0.5}], 0.01))
+
+
+class TestDoctorContract(unittest.TestCase):
+    """What CI asserts about the doctor, tested where a pty may not exist."""
+
+    def test_a_printing_document_passes(self):
+        document = {"verdict": "printing",
+                    "sketch": {"samples": 39, "baud": 115200}}
+        self.assertEqual(fakeboard.check(document, 0), [])
+
+    def test_a_board_that_is_not_printing_fails_on_all_three_counts(self):
+        problems = fakeboard.check(
+            {"verdict": "silent_firmware", "sketch": {"samples": 0}}, 1)
+        self.assertTrue(any("exited 1" in problem for problem in problems), problems)
+        self.assertTrue(any("silent_firmware" in problem for problem in problems),
+                        problems)
+        self.assertTrue(any("no samples" in problem for problem in problems),
+                        problems)
+
+    def test_a_document_with_no_sketch_section_is_not_a_pass(self):
+        problems = fakeboard.check({"verdict": "printing"}, 0)
+        self.assertTrue(any("no samples" in problem for problem in problems), problems)
+
+
+class TestDoctorOnTheLivePage(unittest.TestCase):
+    """A board that is attached and silent says why on the page."""
+
+    def test_a_silent_serial_source_puts_the_verdict_on_the_page(self):
+        class Silent(csi.Source):
+            port = "COM5"
+            rate = 20.0
+            length = None
+
+            def describe(self):
+                return "serial COM5 at 115200 baud, waiting for lines"
+
+            def __next__(self):
+                raise TimeoutError("nothing readable on COM5 for 10s")
+
+        with mock.patch.object(live, "doctor_check",
+                               lambda port: ("silent_firmware",
+                                             "not printing — upload "
+                                             "arduino/mega_channel_node")):
+            session = live.RadarSession(Silent(), realtime=False)
+            session.start()
+            session._thread.join(timeout=10)
+            session.stop()
+            snapshot = session.snapshot()
+        self.assertIn("TimeoutError", snapshot["error"])
+        self.assertEqual(snapshot["diagnosis"]["verdict"], "silent_firmware")
+        self.assertIn("mega_channel_node", snapshot["diagnosis"]["message"])
+
+    def test_a_failing_source_without_a_port_does_not_run_the_doctor(self):
+        class Broken(csi.Source):
+            rate = 20.0
+            length = None
+
+            def __next__(self):
+                raise ValueError("not serial")
+
+        calls = []
+        with mock.patch.object(live, "doctor_check",
+                               lambda port: calls.append(port)):
+            session = live.RadarSession(Broken(), realtime=False)
+            session.start()
+            session._thread.join(timeout=10)
+            session.stop()
+        self.assertEqual(calls, [])
+        self.assertIsNone(session.snapshot()["diagnosis"])
+
+    def test_the_doctor_check_reads_the_json_verdict(self):
+        result = subprocess.CompletedProcess(
+            [], 1, json.dumps({"verdict": "silent_firmware",
+                               "message": "not printing"}), "")
+        with mock.patch.object(live.subprocess, "run", lambda *a, **k: result):
+            verdict, message = live.doctor_check("COM5")
+        self.assertEqual((verdict, message), ("silent_firmware", "not printing"))
+
+    def test_a_doctor_that_prints_nothing_does_not_crash_the_page(self):
+        result = subprocess.CompletedProcess([], 2, "", "boom")
+        with mock.patch.object(live.subprocess, "run", lambda *a, **k: result):
+            verdict, message = live.doctor_check("COM5")
+        self.assertEqual(verdict, "unknown")
+        self.assertIn("boom", message)
 
 
 class FakePort:
@@ -1165,6 +2440,428 @@ class TestBringUpCommands(unittest.TestCase):
         self.assertIn("no serial port", out.getvalue())
 
 
+class TestCalibrationOption(unittest.TestCase):
+    """`--calibrate` decides what the detector is willing to call an empty room."""
+
+    def test_watch_calibration_window_reaches_the_detector(self):
+        """A 2 s session with 0.5 s of calibration has measured frames; the 2 s
+        default would spend the whole session calibrating."""
+        from wifi_radar import watch
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = watch.main(["--source", "sim:walk", "--seconds", "2",
+                                 "--calibrate", "0.5", "--fast",
+                                 "--every", "10"])
+        self.assertEqual(status, 0)
+        text = out.getvalue()
+        self.assertIn("calibrated floor", text)
+        match = re.search(r"of (\d+) measured", text)
+        self.assertIsNotNone(match)
+        self.assertGreater(int(match.group(1)), 0)
+
+    def test_watch_defaults_to_an_automatic_window(self):
+        """No --calibrate, no guess: the run says how long it measured and why."""
+        from wifi_radar import watch
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = watch.main(["--source", "sim:quiet", "--seconds", "3",
+                                 "--fast", "--every", "10"])
+        self.assertEqual(status, 0)
+        self.assertIn("calibration     : 2.0s (auto, the floor had settled)",
+                      out.getvalue())
+
+    def test_watch_accepts_auto_by_name(self):
+        from wifi_radar import watch
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = watch.main(["--source", "sim:quiet", "--seconds", "3",
+                                 "--calibrate", "auto", "--fast",
+                                 "--every", "10"])
+        self.assertEqual(status, 0)
+        self.assertIn("auto, the floor had settled", out.getvalue())
+
+    def test_live_session_defaults_to_an_automatic_window(self):
+        from wifi_radar import live
+
+        session = live.RadarSession(
+            csi.SyntheticSource(scenario="quiet", seconds=1.0, seed=2),
+            realtime=False)
+        self.assertTrue(session.detector.calibrate_auto)
+
+    def test_watch_refuses_a_calibration_window_of_zero(self):
+        from wifi_radar import watch
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status = watch.main(["--calibrate", "0", "--source", "sim:walk"])
+        self.assertEqual(status, 2)
+        self.assertIn("--calibrate", err.getvalue())
+
+    def test_watch_refuses_a_negative_highpass(self):
+        from wifi_radar import watch
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status = watch.main(["--highpass", "-1", "--source", "sim:walk"])
+        self.assertEqual(status, 2)
+        self.assertIn("--highpass", err.getvalue())
+
+    def test_both_views_refuse_a_threshold_of_zero(self):
+        """Zero sigmas would call every frame movement, for ever."""
+        from wifi_radar import live, watch
+
+        for module in (watch, live):
+            # watch reports on stderr and live on stdout; both are the user's
+            # screen, so both are read here.
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                status = module.main(["--on-sigma", "0", "--source", "sim:walk"])
+            self.assertEqual(status, 2, module.__name__)
+            self.assertIn("--on-sigma", out.getvalue() + err.getvalue(),
+                          module.__name__)
+
+    def test_a_measured_threshold_reaches_the_detector(self):
+        from wifi_radar import live
+
+        session = live.RadarSession(
+            csi.SyntheticSource(scenario="quiet", seconds=1.0, seed=2),
+            realtime=False, on_sigma=6.5)
+        self.assertEqual(session.detector.on_sigma, 6.5)
+
+    def test_a_run_shorter_than_its_calibration_says_so(self):
+        """Otherwise a session that never left calibration reads as a quiet room."""
+        from wifi_radar import watch
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = watch.main(["--source", "sim:walk", "--seconds", "1",
+                                 "--calibrate", "30", "--fast", "--every", "10"])
+        self.assertEqual(status, 0)
+        text = out.getvalue()
+        self.assertIn("0 of 0 measured", text)
+        self.assertIn("no frames measured", text)
+
+    def test_live_refuses_a_calibration_window_of_zero(self):
+        from wifi_radar import live
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = live.main(["--calibrate", "0"])
+        self.assertEqual(status, 2)
+        self.assertIn("--calibrate", out.getvalue())
+
+    def test_live_main_passes_the_window_to_the_session(self):
+        """The flag has to survive the trip from the command line, not just the
+        constructor test below."""
+        from wifi_radar import live
+
+        captured = {}
+
+        def fake_build(session, host, port):
+            captured["session"] = session
+
+            class Server:
+                def serve_forever(self):
+                    raise KeyboardInterrupt
+
+                def server_close(self):
+                    pass
+
+            return Server()
+
+        original = live.build_server
+        live.build_server = fake_build
+        self.addCleanup(setattr, live, "build_server", original)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = live.main(["--source", "sim:walk", "--seconds", "1",
+                                "--calibrate", "25", "--highpass", "0.5",
+                                "--port", "0"])
+        self.assertEqual(status, 0)
+        self.assertEqual(captured["session"].detector.calibrate_frames, 500)
+        self.assertEqual(captured["session"].detector.highpass_seconds, 0.5)
+
+    def test_a_live_session_carries_the_calibration_window_to_the_detector(self):
+        """A wire's slow envelope needs 20-30 s of floor, which is 400-600 frames."""
+        session = live.RadarSession(serial_node.SerialSource(io.StringIO("")),
+                                    realtime=False, calibrate_seconds=25.0)
+        self.assertEqual(session.detector.calibrate_frames, 500)
+
+
+SILENT_REPORT = (
+    "bootloader : answered 18 syncs in 2.1s (status 0xc0 = OK)\n"
+    "sketch     : nothing arrived in 4.1s (0 bytes)\n\n"
+    "not printing — the cable, the port and the chip are all fine. Upload "
+    "arduino/mega_channel_node to the board, then run this again.\n")
+
+PRINTING_REPORT = (
+    "bootloader : answered 18 syncs in 2.1s (status 0xc0 = OK)\n"
+    "sketch     : 62 lines, 61 samples in 4.1s, 20.0/s on the board's own clock\n\n"
+    "ok — the board is identified, alive, and printing samples.\n")
+
+
+class FakeRunner:
+    """subprocess.run, scripted: uploads and doctor calls answered in order."""
+
+    def __init__(self, uploads, doctors):
+        self.uploads = list(uploads)
+        self.doctors = list(doctors)
+        self.calls = []
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(list(command))
+        if "--upload" in command:
+            code, out, err = self.uploads.pop(0)
+        else:
+            code, out = self.doctors.pop(0)
+            err = ""
+        return subprocess.CompletedProcess(command, code, out, err)
+
+
+class TestHardwareSelfTest(unittest.TestCase):
+    """The scripted hardware check: no board needed to test the script itself."""
+
+    def run_it(self, uploads, doctors, force=False):
+        runner = FakeRunner(uploads, doctors)
+        with tempfile.TemporaryDirectory() as root:
+            silent = selftest.write_silent_sketch(root)
+            firmware = root + "/mega_channel_node"
+            checks = selftest.run_selftest("COM5", "cli", silent, firmware,
+                                           run=runner, say=lambda *a, **k: None,
+                                           force=force)
+        return checks, runner
+
+    def test_a_whole_pass_reports_every_check_green(self):
+        checks, runner = self.run_it(
+            [(0, "ok", ""), (0, "ok", "")],
+            [(0, PRINTING_REPORT), (1, SILENT_REPORT), (0, PRINTING_REPORT)])
+        self.assertEqual(len(checks), 9, checks)
+        self.assertTrue(all(check["ok"] for check in checks), checks)
+        uploads = [call for call in runner.calls if "--upload" in call]
+        self.assertEqual(len(uploads), 2)
+        self.assertTrue(uploads[0][-1].endswith("silent"))
+        self.assertTrue(uploads[1][-1].endswith("mega_channel_node"))
+        # `arduino-cli upload` does not compile, and on a fresh sketch there is
+        # no cached build for it to find; this was a real failure on the bench.
+        self.assertEqual(uploads[0][1:3], ["compile", "--upload"])
+        self.assertEqual(uploads[1][1:3], ["compile", "--upload"])
+
+    def test_a_wrong_verdict_fails_and_the_firmware_is_still_restored(self):
+        checks, runner = self.run_it(
+            [(0, "ok", ""), (0, "ok", "")],
+            [(0, PRINTING_REPORT), (0, PRINTING_REPORT),
+             (0, PRINTING_REPORT)])
+        failed = [check["name"] for check in checks if not check["ok"]]
+        self.assertIn("the doctor exits 1 for a silent sketch", failed)
+        self.assertIn("the doctor says it is not printing", failed)
+        self.assertEqual(len([c for c in runner.calls if "--upload" in c]), 2)
+        self.assertTrue(any(c["name"] == "samples are arriving again"
+                            for c in checks))
+
+    def test_a_failed_restore_is_reported_and_not_papered_over(self):
+        checks, runner = self.run_it(
+            [(0, "ok", ""), (1, "", "boom")],
+            [(0, PRINTING_REPORT), (1, SILENT_REPORT)])
+        failed = [check["name"] for check in checks if not check["ok"]]
+        self.assertEqual(failed, ["mega_channel_node is restored"])
+        self.assertEqual(len([c for c in runner.calls if "--upload" in c]), 2)
+
+    def test_an_upload_that_fails_stops_the_verdict_checks(self):
+        """Nothing was flashed, so nothing about the doctor is meaningful."""
+        checks, runner = self.run_it([(1, "", "no board"), (0, "ok", "")],
+                                     [(0, PRINTING_REPORT), (0, PRINTING_REPORT)])
+        failed = [check["name"] for check in checks if not check["ok"]]
+        self.assertEqual(failed, ["the silent sketch uploads"])
+        self.assertFalse(any("not printing" in check["name"] for check in checks))
+
+    def test_a_board_that_is_not_printing_is_not_flashed_at_all(self):
+        """No working firmware to restore means no licence to overwrite it."""
+        checks, runner = self.run_it([], [(2, "error: cannot open COM5")])
+        self.assertEqual([check["name"] for check in checks],
+                         ["the board prints before the test starts"])
+        self.assertFalse(any("--upload" in call for call in runner.calls))
+
+    @staticmethod
+    def alive(pid):
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                                 capture_output=True, text=True).stdout
+            return str(pid) in out
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def test_a_timeout_kills_the_children_the_tool_started(self):
+        """The bug that wedged the board: avrdude outliving its parent."""
+        parent = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(60)'])\n"
+            "open(sys.argv[1], 'w').write(str(child.pid))\n"
+            "time.sleep(60)\n")
+        with tempfile.TemporaryDirectory() as root:
+            pidfile = os.path.join(root, "child.pid")
+            result = selftest.run_bounded(
+                [sys.executable, "-c", parent, pidfile], timeout=2.0)
+            with open(pidfile, encoding="utf-8") as handle:
+                grandchild = int(handle.read())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("timed out", result.stderr)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and self.alive(grandchild):
+            time.sleep(0.1)
+        self.assertFalse(self.alive(grandchild),
+                         "the grandchild outlived the timeout and still holds "
+                         "whatever port it opened")
+
+    def test_a_default_run_flashes_under_the_tree_killing_runner(self):
+        """The wiring, not just the helper: flash() must not fall back to run()."""
+        uploads = []
+
+        def fake_bounded(command, **kwargs):
+            uploads.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        reports = [(0, PRINTING_REPORT), (1, SILENT_REPORT),
+                   (0, PRINTING_REPORT)]
+
+        def fake_doctor(port, run=None, **kwargs):
+            return reports.pop(0)
+
+        with mock.patch.object(selftest, "run_bounded", fake_bounded), \
+                mock.patch.object(selftest, "ask_doctor", fake_doctor):
+            with tempfile.TemporaryDirectory() as root:
+                silent = selftest.write_silent_sketch(root)
+                checks = selftest.run_selftest(
+                    "COM5", "cli", silent, root + "/mega_channel_node",
+                    say=lambda *a, **k: None)
+        self.assertTrue(all(check["ok"] for check in checks), checks)
+        self.assertEqual(len(uploads), 2)
+        self.assertTrue(all("--upload" in command for command in uploads))
+
+    def test_the_failure_detail_starts_on_a_line_boundary(self):
+        """The one line that names the fault must not be inside a cut word."""
+        result = subprocess.CompletedProcess([], 1, "", "\n".join(
+            ["Error: timeout"] * 40 + ["Error during Upload: failed"]))
+        tail = selftest._tail(result, limit=120)
+        self.assertTrue(tail.startswith("Error:"), tail)
+        self.assertTrue(tail.endswith("Error during Upload: failed"), tail)
+
+    def test_force_overwrites_a_board_that_is_merely_missing_its_sketch(self):
+        """The one case where refusing is wrong: there is nothing to preserve."""
+        checks, runner = self.run_it(
+            [(0, "ok", ""), (0, "ok", "")],
+            [(1, SILENT_REPORT), (1, SILENT_REPORT), (0, PRINTING_REPORT)],
+            force=True)
+        self.assertTrue(all(check["ok"] for check in checks), checks)
+        self.assertTrue(checks[0]["name"].startswith("--force:"), checks[0])
+        self.assertNotIn("the board prints before the test starts",
+                         [check["name"] for check in checks])
+        self.assertEqual(len([c for c in runner.calls if "--upload" in c]), 2)
+
+    def test_force_does_not_override_a_port_that_will_not_open(self):
+        """A forced run over an unreachable port spends a timeout to learn nothing."""
+        checks, runner = self.run_it([], [(2, "could not open port 'COM5'")],
+                                     force=True)
+        self.assertEqual([check["name"] for check in checks],
+                         ["the board prints before the test starts"])
+        self.assertIn("will not open", checks[0]["detail"])
+        self.assertFalse(any("--upload" in call for call in runner.calls))
+
+    def test_force_still_restores_and_still_reports_a_failed_restore(self):
+        checks, _ = self.run_it(
+            [(0, "ok", ""), (1, "", "no board")],
+            [(1, SILENT_REPORT), (1, SILENT_REPORT)], force=True)
+        self.assertEqual(selftest.summary(checks)[-1][:7], "WARNING")
+
+    def test_the_json_result_carries_every_check(self):
+        checks, _ = self.run_it(
+            [(0, "ok", ""), (0, "ok", "")],
+            [(0, PRINTING_REPORT), (1, SILENT_REPORT), (0, PRINTING_REPORT)])
+        document = selftest.as_json(checks, "COM5", "cli", "fw")
+        self.assertEqual((document["passed"], document["total"]), (9, 9))
+        self.assertEqual(document["failed"], [])
+        self.assertEqual(document["exit_status"], 0)
+        self.assertEqual(len(document["checks"]), 9)
+        self.assertEqual(document["port"], "COM5")
+
+    def test_the_json_result_names_what_failed_and_why(self):
+        checks, _ = self.run_it([], [(2, "cannot open COM5")])
+        document = selftest.as_json(checks)
+        self.assertEqual(document["failed"],
+                         ["the board prints before the test starts"])
+        self.assertEqual(document["exit_status"], 1)
+        self.assertIn("exit 2", document["checks"][0]["detail"])
+        self.assertIn("will not open", document["checks"][0]["detail"])
+
+    def test_the_closing_lines_do_not_claim_a_restore_that_never_happened(self):
+        """A refusal that says "mega_channel_node is back" is the bug it tests for."""
+        refused, _ = self.run_it([], [(2, "error: cannot open COM5")])
+        self.assertEqual(selftest.summary(refused), [
+            "0/1 checks passed",
+            "failed: the board prints before the test starts",
+            "nothing was flashed: the board was not touched"])
+
+    def test_a_passing_run_ends_on_the_count_alone(self):
+        checks, _ = self.run_it(
+            [(0, "ok", ""), (0, "ok", "")],
+            [(0, PRINTING_REPORT), (1, SILENT_REPORT), (0, PRINTING_REPORT)])
+        self.assertEqual(selftest.summary(checks), ["9/9 checks passed"])
+
+    def test_a_failed_restore_warns_instead_of_reassuring(self):
+        checks, _ = self.run_it(
+            [(0, "ok", ""), (1, "", "no board")],
+            [(0, PRINTING_REPORT), (1, SILENT_REPORT)])
+        lines = selftest.summary(checks)
+        self.assertIn("WARNING: the restore failed", lines[-1])
+        self.assertIn("may still be silent", lines[-1])
+        self.assertFalse(any("was left with mega_channel_node" in line
+                             for line in lines))
+
+    def test_a_restore_that_failed_before_anything_was_flashed_says_only_that(self):
+        """"Compiled sketch not found" never touched the board; don't imply it did."""
+        checks, _ = self.run_it(
+            [(1, "", "Compiled sketch not found"), (1, "", "timed out")],
+            [(0, PRINTING_REPORT)])
+        lines = selftest.summary(checks)
+        self.assertIn("by hand", lines[-1])
+        self.assertNotIn("may still be silent", lines[-1])
+
+    def test_the_silent_sketch_is_named_the_way_arduino_expects(self):
+        with tempfile.TemporaryDirectory() as root:
+            sketch = selftest.write_silent_sketch(root)
+            self.assertEqual(sketch.name, "silent")
+            source = (sketch / "silent.ino").read_text(encoding="utf-8")
+            self.assertIn("void setup()", source)
+            self.assertNotIn("Serial", source)
+
+    def test_the_cli_can_be_named_explicitly_or_reported_missing(self):
+        self.assertEqual(selftest.find_arduino_cli("C:/tools/arduino-cli.exe"),
+                         "C:/tools/arduino-cli.exe")
+        with self.assertRaises(FileNotFoundError) as caught:
+            selftest.find_arduino_cli(None, env={}, which=lambda name: None,
+                                      candidates=[])
+        self.assertIn("arduino-cli", str(caught.exception))
+
+    def test_no_port_exits_2_before_anything_is_flashed(self):
+        original = serial_node.available_ports
+        serial_node.available_ports = lambda: []
+        self.addCleanup(setattr, serial_node, "available_ports", original)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status = selftest.main([])
+        self.assertEqual(status, 2)
+        self.assertIn("CH340", err.getvalue())
+
+
 class TestSerialSource(unittest.TestCase):
     def test_samples_become_frames_on_the_devices_own_clock(self):
         stream = io.StringIO("# banner\nS,5000,1,2\nS,5050,3,4\n")
@@ -1232,6 +2929,24 @@ class TestSerialSource(unittest.TestCase):
 
     def test_an_empty_stream_is_an_empty_session(self):
         self.assertEqual(list(serial_node.SerialSource(io.StringIO(""))), [])
+
+    def test_a_silent_port_shaped_like_an_iobase_still_times_out(self):
+        """
+        A real pyserial port is an IOBase, and it goes silent for the ~1.5 s
+        after opening it resets the board. Reading that silence as EOF reported
+        a printing Mega as `frames: 0`.
+        """
+        ticks = [0.0]
+
+        def clock():
+            ticks[0] += 1.0
+            return ticks[0]
+
+        source = serial_node.SerialSource(PortLikeFile(), port="COM5",
+                                          timeout=10.0, clock=clock)
+        with self.assertRaises(TimeoutError) as caught:
+            next(source)
+        self.assertIn("COM5", str(caught.exception))
 
     def test_a_channel_node_feeds_the_detector_without_inventing_speed(self):
         """
