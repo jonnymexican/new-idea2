@@ -496,7 +496,48 @@ The pin is confirmed the same way: the touch response peaks on A0 and falls
 monotonically to A7, which is the order the sketch reads pins in, so the wire is
 the one in A0 and the board is coupled to it.
 
-The first attempt at this trial, run without cues, found nothing at 2 cm either.
+### Measuring a new antenna
+
+The sweep above belongs to one piece of wire, so it is a reference point rather
+than a property of the board. A different antenna changes both numbers at once —
+how much of a hand it couples, and how much hum it collects as an idle floor —
+and the tables are comparable only if everything else is held still: same board,
+same sketch, same pin, same `--idle` and `--seconds`. The distance at which the
+hand stops registering is then the number that moved.
+
+```bash
+.venv/bin/python -m wifi_radar.handtrial --source serial:auto \
+    --record out/sweep-antenna2.jsonl --control 8 --control-distance 0 \
+    --idle 10 --seconds 8 --distances 0,0.5,1,1.5,2 --no-reconnect
+```
+
+That is the wire's sweep with the antenna swapped, and the control at contact is
+the reason it is cheap: `--control-distance 0` asks for a finger on the new
+antenna before the schedule starts, and an antenna that hears nothing costs
+twenty seconds rather than a minute and a half of waving at an empty room. The
+control's `A0..A7 level` line is the other half of it — a peak on A0 falling to
+A7 means the new antenna is on the pin the old one was on, while a peak anywhere
+else compares two pins rather than two antennas. `--no-reconnect` keeps a
+dropped board from rebasing the clock under a schedule nobody is being guided
+through.
+
+Re-derive the threshold from the new recording before trusting any of it:
+
+```bash
+.venv/bin/python -m wifi_radar.thresholds --record out/sweep-antenna2.jsonl
+```
+
+3 s and 4σ were measured against the wire's own drift and are not transferable;
+the antenna that collects more hum moves the floor, and the calibration window
+is chosen from the idle stretch of whatever was actually recorded.
+
+Read the comparison off the cliff, not off the maximum. A touch drives A0 into
+the floor, so contact saturates and cannot rank two antennas; what ranks them is
+the first distance whose `z > 4σ` share falls back to the idle's. That number
+came from one sweep for the wire, so run the new one twice — 8 s per stretch is
+one sample of a hand, and the 0.5 → 1 cm boundary here is one measurement wide.
+
+An earlier attempt, run without cues, found nothing at 2 cm either.
 The prompts were a segment late and the hand followed the prompts, so it was
 never where the marks said it was. `--no-reconnect` is the other guard here: a
 reconnect keeps the schedule aligned by rebasing the clock, which is right for a
