@@ -5,15 +5,20 @@ is a string written in this file.
     python -m unittest mediatop.test_mediatop -v
 """
 
+import io
 import json
+import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
+from datetime import datetime
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from . import extract, feeds, net, server, summary
+from . import digest, extract, feeds, net, server, summary
 
 
 RSS = """<?xml version="1.0"?>
@@ -403,6 +408,102 @@ class Summary(unittest.TestCase):
         self.assertEqual(card["method"], "article")
         self.assertEqual(card["note"], "")
         self.assertIn("214 to 98", card["point"])
+
+
+def sample_board():
+    """A board payload: one readable card, one that fell back, an empty genre."""
+    return {
+        "genres": [
+            {"key": "tech", "label": "Tech", "considered": 3, "cards": [
+                {"title": "Microsoft raises Xbox prices",
+                 "url": "https://example.test/x", "source": "The Verge",
+                 "point": "The cheapest console will cost $1 more.",
+                 "facts": ["A subsidy of $1.5 billion was approved."],
+                 "method": "article", "note": ""},
+                {"title": "A card that could not be read",
+                 "url": "https://example.test/y", "source": "Publisher",
+                 "point": "Something happened.", "facts": [],
+                 "method": "snippet", "note": "HTTP 403"},
+            ]},
+            {"key": "science", "label": "Science", "considered": 0, "cards": []},
+        ],
+        "failures": [{"genre": "science", "source": "Phys.org",
+                       "error": "FetchError: timed out"}],
+        "counts": {"stories": 2, "sources": 2},
+    }
+
+
+class Digest(unittest.TestCase):
+    when = datetime(2026, 10, 23, 7, 5)
+
+    def test_the_file_is_named_for_the_day(self):
+        self.assertEqual(digest.dated_path(None, self.when),
+                         Path("mediatop-2026-10-23.md"))
+        self.assertEqual(digest.dated_path("boards/", self.when),
+                         Path("boards") / "mediatop-2026-10-23.md")
+        self.assertEqual(digest.dated_path("notes/today.md", self.when),
+                         Path("notes/today.md"))
+
+    def test_the_digest_carries_the_point_and_the_facts(self):
+        text = digest.render(sample_board(), self.when)
+        self.assertTrue(text.startswith("# mediatop — Friday 23 October 2026"))
+        self.assertIn("2 stories from 2 sources", text)
+        self.assertIn("[Microsoft raises Xbox prices](https://example.test/x)", text)
+        self.assertIn("**Point.** The cheapest console will cost $1 more.", text)
+        self.assertIn("- A subsidy of $1.5 billion was approved.", text)
+        self.assertIn("## Tech", text)
+
+    def test_a_card_that_fell_back_says_so(self):
+        text = digest.render(sample_board(), self.when)
+        self.assertIn("summary only: HTTP 403", text)
+
+    def test_failed_feeds_and_empty_genres_are_stated(self):
+        text = digest.render(sample_board(), self.when)
+        self.assertIn("## Science\n\n*Nothing readable in this genre today.*", text)
+        self.assertIn("## Feeds that failed", text)
+        self.assertIn("science/Phys.org: FetchError: timed out", text)
+
+    def test_brackets_in_a_title_do_not_break_the_link(self):
+        board = sample_board()
+        board["genres"][0]["cards"][0]["title"] = "Netflix [finally] raises prices"
+        text = digest.render(board, self.when)
+        self.assertIn("(https://example.test/x)", text)
+        self.assertIn("Netflix \\[finally\\] raises prices", text)
+
+    def test_saving_twice_in_a_day_keeps_one_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first = digest.write(sample_board(), folder + "/", self.when)
+            second = digest.write(sample_board(), folder + "/", self.when)
+            self.assertEqual(first, second)
+            self.assertEqual(first.name, "mediatop-2026-10-23.md")
+            self.assertEqual(len(list(Path(folder).iterdir())), 1)
+            self.assertTrue(first.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_the_flag_saves_without_starting_a_server(self):
+        class Stub:
+            def board(self, genre=None, refresh=False):
+                return sample_board()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder:
+            out = io.StringIO()
+            with mock.patch.object(server, "Board", return_value=Stub()), \
+                    redirect_stdout(out):
+                self.assertEqual(server.main(["--save", folder + "/"]), 0)
+            written = list(Path(folder).iterdir())
+            self.assertEqual(len(written), 1)
+            self.assertIn("Microsoft raises Xbox prices",
+                          written[0].read_text(encoding="utf-8"))
+            self.assertIn("wrote", out.getvalue())
+
+            out = io.StringIO()
+            with mock.patch.object(server, "Board", return_value=Stub()), \
+                    redirect_stdout(out):
+                self.assertEqual(server.main(["--print"]), 0)
+            self.assertIn("POINT: The cheapest console will cost $1 more.",
+                          out.getvalue())
 
 
 class ServerRoutes(unittest.TestCase):

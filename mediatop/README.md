@@ -13,8 +13,17 @@ Genres: **Tech**, **Geopolitics**, **Canadian government**, **Science**.
 python -m mediatop.server            # http://127.0.0.1:8770/
 python -m mediatop.server --per-genre 8 --open
 python -m mediatop.server --print    # the same board, as text, no browser
+python -m mediatop.server --save     # the board as mediatop-2026-10-23.md
 python -m unittest mediatop.test_mediatop
 ```
+
+`--save` writes the board as Markdown, named for the day it was built, so a
+morning run leaves one file per morning rather than a growing list. No browser
+and no server are involved: it builds once, writes, and exits. `--save boards/`
+puts them in a directory instead, and `--save notes/today.md` uses an exact
+name. The file says the same things the page does — each card's point, its
+facts, the source, and `summary only` where the article could not be read —
+plus any feeds that failed, at the bottom.
 
 No dependencies beyond the standard library, no build step, no API key, no
 model. `python -m mediatop.server --print` is the fastest way to see what the
@@ -89,9 +98,10 @@ to loopback and serves whatever it fetched to anyone who can reach the port.
 | [`feeds.py`](feeds.py) | the twelve feeds, RSS/Atom/RDF parsing, dedupe by title or URL |
 | [`extract.py`](extract.py) | HTML → story paragraphs → sentences, and the furniture filters |
 | [`summary.py`](summary.py) | sentence scoring, the point, the facts, the fallback |
-| [`server.py`](server.py) | cache, board assembly, HTTP routes, `--print` |
+| [`server.py`](server.py) | cache, board assembly, HTTP routes, `--print`, `--save` |
+| [`digest.py`](digest.py) | the board as a dated Markdown file |
 | [`page.html`](page.html) | the single-screen board, and its Auto / Day / Night background switcher |
-| [`test_mediatop.py`](test_mediatop.py) | 41 tests: fixtures only, no network |
+| [`test_mediatop.py`](test_mediatop.py) | 48 tests: fixtures only, no network |
 
 ## Where it is weak
 

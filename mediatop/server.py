@@ -11,6 +11,7 @@ a sentence from the article, chosen rather than composed.
     python mediatop/server.py
     python mediatop/server.py --port 8770 --per-genre 8
     python mediatop/server.py --print          # the board, as text, then exit
+    python mediatop/server.py --save           # today's board, as a dated file
 
 Then open http://127.0.0.1:8770/ .
 
@@ -42,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import feeds, summary
+from . import digest, feeds, summary
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -231,9 +232,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found", "paths": ["/", "/api/top"]})
 
 
-def print_board(board):
+def print_board(payload):
     """The board as plain text, for a terminal check without a browser."""
-    payload = board.board(refresh=True)
     for genre in payload["genres"]:
         print(f"\n== {genre['label'].upper()} "
               f"({len(genre['cards'])} of {genre['considered']})")
@@ -259,13 +259,24 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=12.0)
     parser.add_argument("--print", action="store_true",
                         help="build once, print the board as text, exit")
+    parser.add_argument("--save", nargs="?", const="", metavar="PATH",
+                        help="build once, write the board as a dated Markdown "
+                             "file, exit. No PATH: ./mediatop-YYYY-MM-DD.md"
+                             " (a directory PATH keeps that name)")
     parser.add_argument("--open", action="store_true", help="open a browser")
     args = parser.parse_args(argv)
 
     board = Board(per_genre=args.per_genre, ttl=args.ttl, timeout=args.timeout)
-    if args.print:
+    if args.print or args.save is not None:
         try:
-            print_board(board)
+            payload = board.board(refresh=True)
+            if args.print:
+                print_board(payload)
+            if args.save is not None:
+                path = digest.write(payload, args.save or None)
+                print(f"\nwrote {path}  "
+                      f"({payload['counts']['stories']} stories, "
+                      f"{payload['counts']['sources']} sources)")
         finally:
             board.close()
         return 0
