@@ -22,6 +22,9 @@ runs/
 runs_*/
 *.pid
 
+# mediatop digests (regenerate with `python -m mediatop.server --save`)
+mediatop-*.md
+
 # Environment / secrets
 .env
 .env.*
