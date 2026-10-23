@@ -47,7 +47,12 @@ summariser actually does to a day's stories.
    adding a fact. A sentence opening with a quotation is somebody's remark, and
    becomes the point only if nothing else comes within 40% of it.
 5. **Take the point and a few non-duplicate facts**, then put the facts back in
-   document order so the card reads top-down.
+   document order so the card reads top-down. A candidate has to be a fact of
+   the story, not merely a specific sentence: related-story headlines
+   ("Scientists Examine Chornobyl's Radioactive Dust in Unprecedented Detail"),
+   the writer's asides ("My second thought: …") and fragments that begin or end
+   inside somebody's quotation are skipped, and the next sentence down takes the
+   place.
 
 ### What it refuses to do
 
@@ -86,7 +91,7 @@ to loopback and serves whatever it fetched to anyone who can reach the port.
 | [`summary.py`](summary.py) | sentence scoring, the point, the facts, the fallback |
 | [`server.py`](server.py) | cache, board assembly, HTTP routes, `--print` |
 | [`page.html`](page.html) | the single-screen board, and its Auto / Day / Night background switcher |
-| [`test_mediatop.py`](test_mediatop.py) | 38 tests: fixtures only, no network |
+| [`test_mediatop.py`](test_mediatop.py) | 41 tests: fixtures only, no network |
 
 ## Where it is weak
 
@@ -99,6 +104,11 @@ These are measured or observed, not hypothetical:
   is a proxy: "the company has been clear about the price" is not an event, and
   a plain-past event with no reporting verb ("the fire killed four soldiers")
   gets no credit for being one.
+- **A fact can still be colour.** "He was planning to sprout mustard seeds for
+  fresh samples, but he was impatient" can survive the filter when it is the
+  most specific line left on the page, because telling a scene from a fact is
+  the same judgement the point picker makes — and it makes it with a scoring
+  model, not one rule.
 - **A surname with no context can land among the facts.** "Rutland said 27
   soldiers are still in hospital" is true and specific, but a reader who
   skipped the paragraph above does not know who Rutland is. Headline anchoring

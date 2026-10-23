@@ -315,6 +315,50 @@ class Summary(unittest.TestCase):
         self.assertTrue(result["point"].startswith("Deemed"), result["point"])
         self.assertNotIn("hardest assignment", result["point"])
 
+    def test_related_story_headlines_are_not_facts(self):
+        # The ScienceDaily shape: link titles sit among the paragraphs, score
+        # well (they are all names) and used to be carried as facts.
+        paragraphs = [
+            "Four decades after the Chernobyl nuclear disaster, microscopic "
+            "radioactive particles remain scattered throughout the soil.",
+            "Scientists Examine Chornobyl's Radioactive Dust in Unprecedented Detail",
+            "A Surprising Discovery About 40-Year-Old Nuclear Fallout",
+            "Scientists have now taken a closer look at these tiny remnants and "
+            "uncovered a surprising finding: some have preserved much of their "
+            "original internal structure.",
+            "As the nuclear fuel melted, it combined with zirconium, a highly "
+            "resistant metal used in the fuel's protective outer layer.",
+        ]
+        result = summary.top_of(
+            paragraphs,
+            "40 years later, Chernobyl's nuclear fallout is not what scientists "
+            "expected")
+        joined = " ".join(result["facts"])
+        self.assertNotIn("Unprecedented Detail", joined)
+        self.assertNotIn("Surprising Discovery", joined)
+        self.assertIn("zirconium", joined)
+
+    def test_fact_filter_rejects_asides_and_fragments(self):
+        # A writer's aside.
+        self.assertFalse(summary.usable_as_fact(
+            "My second thought: Microsoft knows people won't pay that much."))
+        # A fragment that starts inside someone else's quotation.
+        self.assertFalse(summary.usable_as_fact(
+            'And I think very widely respected through his whole organization," '
+            'said the chairman of the wineries association.'))
+        # A sentence that ends inside one.
+        self.assertFalse(summary.usable_as_fact(
+            'She kept writing to him because: "I knew he knew about everything.'))
+        # And the shapes that must survive.
+        self.assertTrue(summary.usable_as_fact(
+            "Prime Medicine announced that it had treated the first person in "
+            "its trial earlier this month."))
+        self.assertTrue(summary.usable_as_fact(
+            "Miller spoke at McGill University's Democracy, Rebuilt conference "
+            "in Montreal on Thursday."))
+        self.assertTrue(summary.usable_as_fact(
+            'The minister said "the plan will work" and left the chamber.'))
+
     def test_a_date_is_one_fact_and_a_year_is_not_a_fact(self):
         self.assertEqual(
             summary.numeric_facts("On October 6, 2026, 377 results appeared."),

@@ -100,6 +100,19 @@ META = re.compile(
 NOVELTY = re.compile(
     r"\b(for the first time|the first (known|ever|time|person|human)|a first for|"
     r"unprecedented|never before|first-of-its-kind)\b", re.I)
+# A related-story headline or section label that the extractor kept. Title case
+# with no half of the sentence doing any work: "Scientists Examine Chornobyl's
+# Radioactive Dust in Unprecedented Detail" is a link to another story, not a
+# fact of this one.
+HEADING_STOP = set("""
+a an the of in on at to for and or by with from as is are was were be been
+it its his her their this that these those who what why how about into over
+after before than with without
+""".split())
+# The writer talking about the piece, or about themselves: "My second thought:
+# Microsoft knows people won't pay that much." Capitalised on purpose, because
+# "US" and "us" are different words.
+FIRST_PERSON = re.compile(r"^(I|I'm|I've|My|We|We're|Our)\b")
 HEDGE = re.compile(r"\b(appears?|appeared|seems?|seemed|may|might)\b", re.I)
 # A sentence that opens with a quotation is somebody's remark. It can be true
 # and still not be what happened, so `pick_point` treats it as a last resort.
@@ -180,6 +193,52 @@ def named(sentence):
     if found and sentence[:1].isupper():
         found.discard(sentence.split()[0].strip(".,\"'\u201c\u201d"))
     return found
+
+
+def is_heading(text):
+    """Whether a line reads like a headline rather than a sentence of the story.
+
+    Two things together, because either alone is wrong. It must have no closing
+    punctuation — link titles and labels do not end in a full stop, while prose
+    does — and nearly every content word must be capitalised. Capitalisation
+    alone would catch a sentence that is mostly names ("Miller spoke at McGill
+    University's Democracy, Rebuilt conference in Montreal on Thursday"), and
+    missing punctuation alone would catch the paragraph the publisher forgot to
+    finish. Numbers count as capitalised, since "40-Year-Old" is title case.
+    """
+    if text.rstrip()[-1:] in (".", "?", "!"):
+        return False
+    found = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\u2019-]*", text)
+    content = [word for word in found if word.lower() not in HEADING_STOP]
+    if len(content) < 4:
+        return False
+    capitalised = sum(1 for word in content
+                      if word[0].isupper() or word[0].isdigit())
+    return capitalised / len(content) >= 0.85
+
+
+def quote_marks(text):
+    """How many double quotation marks a sentence holds, of any style."""
+    return text.count('"') + text.count("\u201c") + text.count("\u201d")
+
+
+def usable_as_fact(sentence):
+    """Whether a selected sentence can stand as one of the card's facts.
+
+    Being specific is not enough. Three shapes read as noise next to a point:
+    a related-story headline, a first-person aside from the writer, and a
+    fragment that begins or ends inside a quotation — which the sentence
+    splitter cannot see, and which reads as nonsense without the words it was
+    cut from ("And I think very widely respected through his whole
+    organization," said the chairman of the wineries association).
+    """
+    if is_heading(sentence):
+        return False
+    if FIRST_PERSON.match(sentence):
+        return False
+    if quote_marks(sentence) % 2:
+        return False
+    return True
 
 
 def headline_share(stems, headline_stems, frequencies):
@@ -327,6 +386,8 @@ def top_of(paragraphs, headline="", description=""):
         if index == point_index or len(chosen) >= MAX_FACTS:
             continue
         candidate = story[index]
+        if not usable_as_fact(candidate):
+            continue
         if jaccard(content_words(candidate), content_words(point)) >= 0.45:
             continue
         if any(jaccard(content_words(candidate), content_words(other)) >= 0.45
