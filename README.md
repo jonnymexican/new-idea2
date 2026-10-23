@@ -25,6 +25,7 @@ the tokenizer and the training loop are all written here; only the backward pass
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
 | `runs/` | Generated output: metrics, checkpoint, sample, loss curve (not committed) |
 | [`wifi_radar/`](wifi_radar/) | A separate project in the same repo: WiFi CSI motion sensing, no hardware needed — [its own README](wifi_radar/README.md) |
+| [`mediatop/`](mediatop/) | A separate project in the same repo: the point of recent news, one screen, four genres — [its own README](mediatop/README.md) |
 
 ## Architecture
 
