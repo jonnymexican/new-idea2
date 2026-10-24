@@ -111,7 +111,7 @@ to loopback and serves whatever it fetched to anyone who can reach the port.
 | [`digest.py`](digest.py) | the board as a dated Markdown file |
 | [`livecheck.py`](livecheck.py) | today's board checked for colour and furniture; the daily CI job |
 | [`page.html`](page.html) | the single-screen board, and its Auto / Day / Night background switcher |
-| [`test_mediatop.py`](test_mediatop.py) | 55 tests: fixtures only, no network |
+| [`test_mediatop.py`](test_mediatop.py) | 56 tests: fixtures only, no network |
 
 ## Where it is weak
 

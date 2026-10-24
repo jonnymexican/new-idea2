@@ -462,14 +462,23 @@ def top_of(paragraphs, headline="", description=""):
 
 
 def _from_description(headline, description):
-    """Fallback: the feed's own summary, which is short but honest."""
+    """Fallback: the feed's own summary, which is short but honest.
+
+    The same fact filter applies here. A feed summary is written by the
+    publisher and is often the only text a card gets, so it was the one path
+    that could still put a scene on the board — "officials were preparing for a
+    difficult winter" is nobody's news. The point stays the summary's first
+    sentence even when it reads as colour: it is the sentence the publisher
+    chose to stand for the story, and the alternative is the headline.
+    """
     story = extract.sentences([description]) if description else []
     story = [sentence for sentence in story
              if jaccard(content_words(sentence), content_words(headline)) < 0.6]
     if not story:
         return {"point": headline, "facts": [], "method": "headline",
                 "chars": len(description or ""), "sentences": 0}
-    return {"point": story[0], "facts": story[1:1 + MAX_FACTS],
+    facts = [sentence for sentence in story[1:] if usable_as_fact(sentence)]
+    return {"point": story[0], "facts": facts[:MAX_FACTS],
             "method": "snippet", "chars": len(description),
             "sentences": len(story)}
 

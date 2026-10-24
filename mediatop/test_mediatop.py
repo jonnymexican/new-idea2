@@ -455,6 +455,20 @@ class Summary(unittest.TestCase):
         self.assertEqual(result["point"], "The government said it would act.")
         self.assertEqual(result["facts"], ["Opposition parties disagreed."])
 
+    def test_the_feed_summary_is_filtered_too(self):
+        # A page that cannot be read is shown from the feed's own summary, and
+        # that path skipped the fact filter: it was the last place a scene
+        # could reach the board.
+        result = self.top(
+            paragraphs=["Too short to be a story."],
+            description="The agency said it would act. Officials were preparing "
+                        "for a difficult winter. The rule takes effect in "
+                        "January and applies to every plant in the county.")
+        self.assertEqual(result["method"], "snippet")
+        self.assertEqual(result["facts"],
+                         ["The rule takes effect in January and applies to "
+                          "every plant in the county."])
+
     def test_no_description_reports_the_headline_only(self):
         result = summary.top_of([], headline="Something happened", description="")
         self.assertEqual(result["method"], "headline")
