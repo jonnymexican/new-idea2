@@ -14,6 +14,7 @@ python -m mediatop.server            # http://127.0.0.1:8770/
 python -m mediatop.server --per-genre 8 --open
 python -m mediatop.server --print    # the same board, as text, no browser
 python -m mediatop.server --save     # the board as mediatop-2026-10-23.md
+python -m mediatop.livecheck         # today's real board, checked for colour
 python -m unittest mediatop.test_mediatop
 ```
 
@@ -28,6 +29,14 @@ plus any feeds that failed, at the bottom.
 No dependencies beyond the standard library, no build step, no API key, no
 model. `python -m mediatop.server --print` is the fastest way to see what the
 summariser actually does to a day's stories.
+
+`livecheck` is the same rule asked of the live board rather than of a fixture:
+it builds today's stories, then fails if a scene-setting sentence or a line of
+page furniture reached a point or a fact. A publisher refusing a page is listed
+and not counted. The exit status is 1 only when something leaked, or when no
+story could be read at all.
+[`.github/workflows/live-mediatop.yml`](../.github/workflows/live-mediatop.yml)
+runs it every morning; the unit tests run on every push.
 
 ## How a card is made
 
@@ -100,8 +109,9 @@ to loopback and serves whatever it fetched to anyone who can reach the port.
 | [`summary.py`](summary.py) | sentence scoring, the point, the facts, the fallback |
 | [`server.py`](server.py) | cache, board assembly, HTTP routes, `--print`, `--save` |
 | [`digest.py`](digest.py) | the board as a dated Markdown file |
+| [`livecheck.py`](livecheck.py) | today's board checked for colour and furniture; the daily CI job |
 | [`page.html`](page.html) | the single-screen board, and its Auto / Day / Night background switcher |
-| [`test_mediatop.py`](test_mediatop.py) | 52 tests: fixtures only, no network |
+| [`test_mediatop.py`](test_mediatop.py) | 55 tests: fixtures only, no network |
 
 ## Where it is weak
 

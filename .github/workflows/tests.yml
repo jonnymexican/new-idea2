@@ -82,6 +82,23 @@ jobs:
             --build-path "$RUNNER_TEMP/mega-build" \
             wifi_radar/arduino/mega_channel_node
 
+  mediatop:
+    # Standard library only and every fixture is a string in the test file, so
+    # this job needs no install step and no network. It ran nowhere before: the
+    # board's own tests were green locally and unrun on every push.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: The board, its scoring and its digest
+        run: python -m unittest mediatop.test_mediatop -v
+
   provenance-lab:
     runs-on: ubuntu-latest
     timeout-minutes: 15

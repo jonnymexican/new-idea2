@@ -18,7 +18,7 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from . import digest, extract, feeds, net, server, summary
+from . import digest, extract, feeds, livecheck, net, server, summary
 
 
 RSS = """<?xml version="1.0"?>
@@ -717,6 +717,44 @@ class BoardCaching(unittest.TestCase):
                 board.board(genre="gossip")
         finally:
             board.close()
+
+
+class LiveCheck(unittest.TestCase):
+    """The scheduled check, on a board written here rather than fetched."""
+
+    def board(self, point, facts):
+        return {"genres": [{"key": "science", "label": "Science",
+                            "considered": 1, "cards": [
+                                {"title": "Cells", "url": "https://example.test/z",
+                                 "source": "Quanta", "point": point,
+                                 "facts": facts, "method": "article",
+                                 "note": ""}]}],
+                "failures": [], "counts": {"stories": 1, "sources": 1}}
+
+    def test_a_clean_board_reports_nothing(self):
+        problems, facts = livecheck.inspect(self.board(
+            "Hickey's video shows that mitochondria are more dynamic than "
+            "previously thought.",
+            ["Under the microscope, mitochondria darted around the cells."]))
+        self.assertEqual(problems, [])
+        self.assertEqual(facts, 1)
+
+    def test_colour_on_the_finished_board_is_a_problem(self):
+        # The filter is on the card; this is the check that nothing bypassed
+        # it — a fallback, a cache, a genre built by another path.
+        problems, _ = livecheck.inspect(self.board(
+            "Mitochondria are more dynamic than previously thought.",
+            ["He was planning to sprout mustard seeds for fresh samples."]))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("colour as a fact", problems[0][1])
+
+    def test_furniture_and_an_empty_point_are_problems(self):
+        problems, _ = livecheck.inspect(self.board(
+            "Click to tell Google to prioritize Quanta and see more of it.", []))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("furniture as the point", problems[0][1])
+        problems, _ = livecheck.inspect(self.board("", []))
+        self.assertIn("the point is empty", problems[0][1])
 
 
 if __name__ == "__main__":

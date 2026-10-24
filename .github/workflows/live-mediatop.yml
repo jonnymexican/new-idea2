@@ -1,0 +1,50 @@
+name: live mediatop
+
+# The unit tests prove the colour rule against fixtures. This runs the real
+# board — twelve feeds, whichever articles they are publishing now — and checks
+# that no scene-setting sentence and no page furniture reached a point or a
+# fact. It belongs on a schedule rather than on every push: the input is
+# somebody else's website, and a push cannot afford to depend on how twelve
+# publishers render their pages at that minute. Daily is enough to notice a
+# site's markup changing, which is the failure that started this: Quanta moved
+# a "Click to tell Google…" line above its lede.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      per_genre:
+        description: "Stories per genre to check"
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # A manual run during the scheduled one would fetch the same articles twice
+  # and disagree with itself about which of them were readable.
+  group: live-mediatop
+  cancel-in-progress: false
+
+jobs:
+  board:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # No install step: mediatop is standard library only, which is the one
+      # property that keeps this check cheap enough to run every morning.
+
+      - name: Check today's board for colour and furniture
+        # The step fails with the offending card, headline and sentence printed,
+        # so the log says which publisher changed rather than just that the rule
+        # broke. A 403 or a paywall is listed and not counted.
+        run: python -m mediatop.livecheck --per-genre "${{ inputs.per_genre || '3' }}"
