@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import c2pa
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -386,6 +386,37 @@ def make_fixture(path: Path) -> Path:
     d.text((84, 344), "synthetic / AI-generated", fill=(10, 10, 10))
     img.save(path, format="JPEG", quality=92, subsampling=2)
     return path
+
+
+def prepare_image(src: Path, dest: Path) -> tuple[Path, tuple[int, int]]:
+    """Turn a photo into the JPEG the lab signs, and report its size.
+
+    Anything Pillow can read is accepted. Two conversions matter. EXIF
+    orientation is applied before the original metadata is dropped -- otherwise
+    a phone photo would be signed sideways, because rotation usually lives in
+    that tag and not in the pixels. Transparency is flattened onto white, which
+    is what a viewer shows, rather than onto black, which is what `convert`
+    leaves behind.
+
+    The pixels are not resized: a platform's own rescale is the thing being
+    measured, so the lab must not pre-empt it. Re-encoding also drops EXIF, so
+    a photo's location is not published with the fixture.
+    """
+    src, dest = Path(src), Path(dest)
+    if not src.exists():
+        raise ValueError(f"no image at {src}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with Image.open(src) as opened:
+            upright = ImageOps.exif_transpose(opened)
+            img = upright.convert("RGBA")
+    except OSError as exc:
+        raise ValueError(f"cannot read {src} as an image: {exc}") from None
+
+    canvas = Image.new("RGB", img.size, (255, 255, 255))
+    canvas.paste(img, mask=img.split()[3])
+    canvas.save(dest, format="JPEG", quality=92, subsampling=2)
+    return dest, canvas.size
 
 
 # --------------------------------------------------------------------------

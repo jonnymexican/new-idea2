@@ -784,6 +784,65 @@ class TestLocalCdnEndToEnd(Base):
             self.assertIn("policy=", variant["url"])
 
 
+class TestProvidedImage(Base):
+    """`--image`: the caller's photo replaces the generated fixture.
+
+    The arm measures what a platform does to a credential, not what the fixture
+    looks like, so the pixels are the caller's business -- but they still have
+    to go through the same signing path, and a phone photo carries two things
+    the JPEG does not: an EXIF orientation instead of rotated pixels, and
+    possibly transparency.
+    """
+
+    def test_a_photo_replaces_the_fixture_and_keeps_its_size(self):
+        src = self.root / "photo.png"
+        Image.new("RGB", (123, 77), (200, 90, 40)).save(src, format="PNG")
+        out = self.root / "custom"
+        result = platforms.run(
+            out, ["local"], {}, self.ca,
+            {"ca": self.certs["ca"], "chain": self.certs["chain"],
+             "key": self.certs["key"]},
+            image=src,
+        )
+        self.assertEqual(result["meta"]["fixture"], "123x77")
+        self.assertEqual(result["meta"]["source_image"], "photo.png")
+        with Image.open(out / "assets" / "source.jpg") as prepared:
+            self.assertEqual(prepared.size, (123, 77))
+            self.assertEqual(prepared.mode, "RGB")
+        # The control row serves the signed bytes unchanged, so the size that
+        # reaches the verifier is the photo's own -- not the fixture's.
+        copy = next(r for r in result["rows"] if r["variant"] == "copy")
+        self.assertEqual(copy["served_dims"], [123, 77])
+        self.assertEqual(copy["verdict"], "valid")
+
+    def test_transparency_is_flattened_onto_white(self):
+        src = self.root / "clear.png"
+        Image.new("RGBA", (10, 10), (0, 0, 0, 0)).save(src, format="PNG")
+        dest, size = lab.prepare_image(src, self.root / "clear.jpg")
+        self.assertEqual(size, (10, 10))
+        with Image.open(dest) as prepared:
+            self.assertEqual(prepared.convert("RGB").getpixel((5, 5)),
+                             (255, 255, 255))
+
+    def test_a_rotated_photo_is_signed_upright(self):
+        """Orientation usually lives in EXIF, which the re-encode drops; it has
+        to be applied to the pixels first or the signed image is sideways."""
+        src = self.root / "rotated.jpg"
+        img = Image.new("RGB", (120, 80), (200, 30, 30))
+        exif = img.getexif()
+        exif[274] = 6                     # EXIF "rotate 90 degrees clockwise"
+        img.save(src, format="JPEG", exif=exif)
+        dest, size = lab.prepare_image(src, self.root / "rotated-out.jpg")
+        self.assertEqual(size, (80, 120))
+        with Image.open(dest) as prepared:
+            self.assertEqual(prepared.size, (80, 120))
+
+    def test_a_missing_image_is_a_clear_error(self):
+        with self.assertRaises(ValueError) as caught:
+            lab.prepare_image(self.root / "nope.jpg", self.root / "out.jpg")
+        self.assertIn("no image at", str(caught.exception))
+
+
 class TestSummarise(unittest.TestCase):
     def test_counts_and_ratios(self):
         rows = [

@@ -46,7 +46,7 @@ cd provenance_lab
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 
-.venv/bin/python -m unittest -v          # 132 tests
+.venv/bin/python -m unittest -v          # 138 tests
 .venv/bin/python lab.py run --out out/full
 ```
 
@@ -60,6 +60,28 @@ Other commands:
 .venv/bin/python lab.py run --modes as_is,rebind               # skip an arm
 .venv/bin/python lab.py verify out/full/assets/signed.jpg --ca out/full/certs/ca.cert.pem
 ```
+
+### One command: measure, build the page, look at it
+
+```bash
+.venv/bin/python demo.py                 # then open http://127.0.0.1:8788/
+```
+
+That runs the `local` adapter against its four-policy HTTP harness, writes the
+report to `out/demo/`, appends it as one column of the trend page in
+`out/site/`, and serves that page until Ctrl-C. Nothing leaves the machine —
+the live adapters are not involved — so it is the platform arm end to end
+without an account, and the page's matrix is visible before any credential
+exists.
+
+```bash
+.venv/bin/python demo.py --no-serve      # files only; no server
+.venv/bin/python demo.py --port 9000 --no-open
+.venv/bin/python demo.py --out out/elsewhere --site out/page
+```
+
+Each run adds a column, which is the page doing its job rather than a bug; both
+output directories are gitignored. `--port 0` picks a free port and prints it.
 
 ## Measured result
 
@@ -126,6 +148,23 @@ to the file between upload and the bytes a viewer actually downloads.
 .venv/bin/python platforms.py run --platforms catbox     # real third party
 .venv/bin/python platforms.py reuse --from out/platforms/platforms.json
 ```
+
+### Signing your own photo
+
+```bash
+.venv/bin/python platforms.py run --platforms discord --image ~/Pictures/test.jpg
+```
+
+`--image` replaces the generated fixture with a photo, through the same signing
+path. EXIF orientation is applied to the pixels first (rotation usually lives
+in that tag, and the re-encode drops it), transparency is flattened onto white,
+and the result is re-encoded to JPEG — which also drops EXIF, so the location
+does not travel with the upload. It is deliberately not resized: a platform's
+own rescale is the thing being measured, so a photo above a platform's size
+limit is reported as that platform's HTTP failure rather than shrunk to fit.
+The manifest still claims
+`TrainedAlgorithmicMedia`, so use a photo you are happy to label that way, and
+remember that the run publishes it.
 
 Every adapter is reduced to the same shape — an upload that yields served
 URLs — so the measurement is identical everywhere:
@@ -364,7 +403,7 @@ trying to scrub arbitrary credentials out of free text.
 - `tests.py` — 16 tests: credential validity and trust, APP11 round-trip,
   each arm, verdict classification, summary counts, matrix integration and
   mode filtering
-- `test_platforms.py` — 78 tests: format sniffing, URL/token redaction, config
+- `test_platforms.py` — 82 tests: format sniffing, URL/token redaction, config
   and environment handling, each adapter's response parsing against a stub,
   Facebook rendition ordering and duplication, the read-only credential checks,
   Telegram chat discovery and its non-consuming update read, refetch handling
@@ -376,5 +415,9 @@ trying to scrub arbitrary credentials out of free text.
   scrubbing of error text, history ordering and idempotence, HTML escaping,
   streak reporting, build idempotence, and publish against a throwaway bare
   repository
+- `demo.py` — one command from the local arm to a served page (stdlib only
+  itself; the arm it calls needs the signing stack)
+- `test_demo.py` — 2 tests: the arm → report → page path end to end, and one
+  column per measurement
 - `platforms.example.json` — credential template (the real file is gitignored)
 - `requirements.txt` — pinned c2pa-python, Pillow, cryptography, requests

@@ -36,6 +36,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -1089,11 +1090,19 @@ def run(
     ca_pem: str | None,
     certs: dict[str, Path],
     variants: Iterable[str] | None = None,
+    image: Path | None = None,
 ) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     signer = lab.load_signer(certs["chain"], certs["key"])
-    fixture = lab.make_fixture(out_dir / "assets" / "source.jpg")
+    # A photo passed with --image replaces the generated fixture, through the
+    # same signing path: the arm measures what a platform does to a credential,
+    # not what the fixture looks like, so the pixels are the caller's business.
+    if image is not None:
+        fixture, fixture_size = lab.prepare_image(image, out_dir / "assets" / "source.jpg")
+    else:
+        fixture = lab.make_fixture(out_dir / "assets" / "source.jpg")
+        fixture_size = lab.FIXTURE_SIZE
     signed = out_dir / "assets" / "signed.jpg"
     lab.sign_created(fixture, signed, signer)
 
@@ -1126,7 +1135,7 @@ def run(
             "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "c2pa_python": getattr(lab.c2pa, "__version__", "?"),
             "c2pa_sdk": lab.c2pa.sdk_version(),
-            "fixture": f"{lab.FIXTURE_SIZE[0]}x{lab.FIXTURE_SIZE[1]}",
+            "fixture": f"{fixture_size[0]}x{fixture_size[1]}",
             "signed_bytes": signed.stat().st_size,
             "elapsed_s": round(time.perf_counter() - started, 2),
             "signing_ca": "self-issued test CA (not a public trust anchor)",
@@ -1135,6 +1144,10 @@ def run(
         "rows": rows,
         "skipped": skipped,
     }
+    if image is not None:
+        # Enough to tell a report made from a photo apart from one made from
+        # the generated fixture; the manifest title carries it too.
+        result["meta"]["source_image"] = Path(image).name
     result["summary"] = summarise(rows)
     refetch_file, warning = write_refetch(out_dir / "refetch.json", refetch)
     result["meta"]["refetch_file"] = str(refetch_file)
@@ -1345,6 +1358,10 @@ def main(argv: list[str] | None = None) -> int:
         "--strict", action="store_true",
         help="exit 1 if a platform that had credentials could not be measured",
     )
+    p_run.add_argument(
+        "--image", default=None,
+        help="photo to sign and upload instead of the generated fixture",
+    )
 
     p_reuse = sub.add_parser("reuse", help="re-fetch the URLs from a previous run")
     p_reuse.add_argument("--from", dest="source", default="out/platforms/platforms.json")
@@ -1446,18 +1463,25 @@ def main(argv: list[str] | None = None) -> int:
             names = list(table)
         variants = args.variants.split(",") if args.variants else None
 
-        result = run(
-            out,
-            names,
-            config,
-            (certs / "ca.cert.pem").read_text(),
-            {
-                "ca": certs / "ca.cert.pem",
-                "chain": certs / "chain.pem",
-                "key": certs / "leaf.key.pem",
-            },
-            variants,
-        )
+        try:
+            result = run(
+                out,
+                names,
+                config,
+                (certs / "ca.cert.pem").read_text(),
+                {
+                    "ca": certs / "ca.cert.pem",
+                    "chain": certs / "chain.pem",
+                    "key": certs / "leaf.key.pem",
+                },
+                variants,
+                image=Path(args.image).expanduser() if args.image else None,
+            )
+        except ValueError as exc:
+            # `--image` pointing at something unreadable is a command-line
+            # mistake, and the message says which file and why.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print(json.dumps(result["summary"], indent=2) if args.json else render_markdown(result))
         if args.strict:
             # An adapter with no credentials is expected to be skipped; one that
