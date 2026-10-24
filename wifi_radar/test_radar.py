@@ -1931,7 +1931,14 @@ class TestOpeningAPort(unittest.TestCase):
             def reset_input_buffer(self):
                 self.flushed += 1
 
-        with mock.patch("serial.Serial", lambda *a, **kw: FakePort()):
+        # A stand-in module rather than the installed pyserial: the suite is
+        # meant to run on an interpreter with only the standard library, and
+        # patching the real module made this test need pyserial to exist just
+        # to be replaced. What is under test is open_serial's own behaviour, not
+        # whether the driver is present.
+        fake_serial = mock.Mock(Serial=lambda *a, **kw: FakePort(),
+                                SerialException=OSError)
+        with mock.patch.dict(sys.modules, {"serial": fake_serial}):
             stream = serial_node.open_serial("COM5", 115200)
         self.assertEqual(reset[-2:], [False, True], reset)
         self.assertIsInstance(stream, FakePort)
