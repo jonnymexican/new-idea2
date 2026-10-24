@@ -180,6 +180,10 @@ BOILERPLATE = (
     re.compile(r"\bsupport our journalism\b"),
     re.compile(r"\b(terms of (service|use)|privacy policy)\b"),
     re.compile(r"^(comments?|related|more from|trending|recommended)\b"),
+    # An instruction to the reader, not a sentence of the story. Quanta now
+    # puts "Click to tell Google to prioritize Quanta…" first in the article,
+    # which made it the lede and so the card's point.
+    re.compile(r"^(click|tap) (to|here)\b"),
     re.compile(r"^[\u00a9\u00ae]"),
     re.compile(r"^by [a-z]+ [a-z]+$"),
     re.compile(r"\b(subscriber|paywall)\b.*\b(only|exclusive)\b"),

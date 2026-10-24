@@ -101,7 +101,7 @@ to loopback and serves whatever it fetched to anyone who can reach the port.
 | [`server.py`](server.py) | cache, board assembly, HTTP routes, `--print`, `--save` |
 | [`digest.py`](digest.py) | the board as a dated Markdown file |
 | [`page.html`](page.html) | the single-screen board, and its Auto / Day / Night background switcher |
-| [`test_mediatop.py`](test_mediatop.py) | 48 tests: fixtures only, no network |
+| [`test_mediatop.py`](test_mediatop.py) | 52 tests: fixtures only, no network |
 
 ## Where it is weak
 
@@ -114,11 +114,18 @@ These are measured or observed, not hypothetical:
   is a proxy: "the company has been clear about the price" is not an event, and
   a plain-past event with no reporting verb ("the fire killed four soldiers")
   gets no credit for being one.
-- **A fact can still be colour.** "He was planning to sprout mustard seeds for
-  fresh samples, but he was impatient" can survive the filter when it is the
-  most specific line left on the page, because telling a scene from a fact is
-  the same judgement the point picker makes — and it makes it with a scoring
-  model, not one rule.
+- **Colour is recognised by grammar, which has an edge.** A sentence in the
+  past perfect or progressive past, or a quotation in the first person, is now
+  kept out of the facts unless it carries a figure, the present perfect, a
+  reported finding or novelty — that is how "he was planning to sprout mustard
+  seeds" stopped appearing beside a point about mitochondria. Two shapes still
+  get through: a scene told in the plain past ("the leaves in his garden were
+  dead by November"), and a quotation in the third person that sets one ("…said
+  Lillian Siu…, over a bistro lunch on Thursday with Terry Fox's family"), which
+  is a real line from this morning's board. Only a model that reads meaning
+  could separate those from news. Sentences whose backfill sits inside a
+  relative clause or somebody else's statement are deliberately spared, since
+  there the past tense qualifies a fact rather than replacing it.
 - **A surname with no context can land among the facts.** "Rutland said 27
   soldiers are still in hospital" is true and specific, but a reader who
   skipped the paragraph above does not know who Rutland is. Headline anchoring

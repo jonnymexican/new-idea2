@@ -150,6 +150,18 @@ class Extraction(unittest.TestCase):
         self.assertEqual(len(paragraphs), 5)
         self.assertTrue(paragraphs[0].startswith("OTTAWA"))
 
+    def test_a_prompt_to_the_reader_is_not_a_paragraph(self):
+        # Quanta puts "Click to tell Google to prioritize Quanta…" first in the
+        # article, above the lede, so extraction kept it and the card's point
+        # became an advertisement for the publisher.
+        self.assertTrue(extract.is_boilerplate(
+            "Click to tell Google to prioritize Quanta and see more of the best "
+            "coverage of science and math in your search and AI results."))
+        self.assertTrue(extract.is_boilerplate("Tap here to open the gallery."))
+        # A story that merely mentions a click is still a story.
+        self.assertFalse(extract.is_boilerplate(
+            "Users who click the link are taken to a page that sells the data."))
+
     def test_page_title(self):
         self.assertEqual(extract.page_title(PAGE), "Test article — Publisher")
 
@@ -363,6 +375,68 @@ class Summary(unittest.TestCase):
             "in Montreal on Thursday."))
         self.assertTrue(summary.usable_as_fact(
             'The minister said "the plan will work" and left the chamber.'))
+
+    def test_narrative_colour_is_not_a_fact(self):
+        # The Quanta card of 23 October 2026: three sentences from the
+        # paragraphs before the story, carried as facts beside a point about
+        # mitochondria. Each is true; none says what happened.
+        self.assertFalse(summary.usable_as_fact(
+            "On a frigid February morning in Edinburgh, Scotland, Patrick "
+            "Hickey had run out of living things to put under his microscope."))
+        self.assertFalse(summary.usable_as_fact(
+            "He was planning to sprout mustard seeds for fresh samples, but he "
+            "was impatient."))
+        self.assertFalse(summary.usable_as_fact(
+            '"I snipped off an inch or so, put it in my pocket, took it into '
+            'the lab, and was just amazed at what I saw," Hickey said.'))
+        # The observation under the microscope is the one line from that
+        # opening worth keeping, and it keeps its place.
+        self.assertTrue(summary.usable_as_fact(
+            "Under the microscope, mitochondria darted around the cells."))
+
+    def test_a_result_written_in_backfill_is_still_a_fact(self):
+        # The guards on the colour rule: a figure, the present perfect, a
+        # reported finding, novelty, and backfill inside a relative clause all
+        # mean the sentence is reporting something rather than setting a scene.
+        self.assertTrue(summary.usable_as_fact(
+            "The footage shows mitochondria moving through the cell far more "
+            "than textbooks describe, crowding past the chloroplasts at a rate "
+            "the researchers had not expected."))
+        self.assertTrue(summary.usable_as_fact(
+            "The bridge had been closed since March, cutting the town in two."))
+        self.assertTrue(summary.usable_as_fact(
+            '"I have watched this for 30 years," the director said.'))
+        self.assertTrue(summary.usable_as_fact(
+            "The company, which had warned of losses, cut 400 jobs in June."))
+        # Backfill inside somebody's statement is the report, not the scenery.
+        self.assertTrue(summary.usable_as_fact(
+            "But a lawyer representing the BBC said in court that Trump was "
+            "campaigning in Georgia that day."))
+
+    def test_a_scene_setter_never_reaches_the_facts(self):
+        paragraphs = [
+            "On a frigid February morning in Edinburgh, Scotland, Patrick "
+            "Hickey had run out of living things to put under his microscope.",
+            "He was planning to sprout mustard seeds for fresh samples, but he "
+            "was impatient.",
+            '"I snipped off an inch or so, put it in my pocket, took it into '
+            'the lab, and was just amazed at what I saw," Hickey said.',
+            "His time-lapse video of the dance inside a single cell has won "
+            "this year's Nikon Small World in Motion competition.",
+            "The footage shows mitochondria moving through the cell far more "
+            "than textbooks describe, crowding past the chloroplasts.",
+            "Hickey recorded the sequence on a commercial microscope fitted "
+            "with a standard camera, and it runs for 48 seconds.",
+        ]
+        result = summary.top_of(
+            paragraphs,
+            "See inside cells like never before in these microscopic images")
+        joined = " ".join(result["facts"])
+        self.assertNotIn("mustard", joined)
+        self.assertNotIn("frigid", joined)
+        self.assertNotIn("snipped", joined)
+        self.assertNotIn("impatient", joined)
+        self.assertIn("Nikon", result["point"])
 
     def test_a_date_is_one_fact_and_a_year_is_not_a_fact(self):
         self.assertEqual(

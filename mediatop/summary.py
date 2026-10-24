@@ -13,7 +13,10 @@ that nothing on it is made up. So the job is selection, not generation:
 * the point is the best sentence, with a mild preference for the earlier of two
   near-equal candidates;
 * the facts are the next few highest-scoring sentences that are not near
-  duplicates, put back into document order so the card reads top-down.
+  duplicates and not scene-setting, put back into document order so the card
+  reads top-down — a sentence in the past perfect, or a first-person quotation,
+  belongs to the paragraph before the story and is skipped unless it carries a
+  result.
 
 The scoring is the part that took work, so it is worth saying what it is trying
 to recognise. A sentence that is the point of a story usually does three things
@@ -117,6 +120,24 @@ HEDGE = re.compile(r"\b(appears?|appeared|seems?|seemed|may|might)\b", re.I)
 # A sentence that opens with a quotation is somebody's remark. It can be true
 # and still not be what happened, so `pick_point` treats it as a last resort.
 REMARK = re.compile(r"^[\"'\u201c\u2018]\s*")
+# Narrative colour: the tense of the paragraph *before* the story starts. The
+# past perfect ("had run out") and the progressive past ("was planning") say
+# what was already true when the news began, which is exactly the scene-setting
+# a card has no room for. The forms left out are the ones that carry a result:
+# "had been given the drug" is backfill around a fact, not the scenery, and
+# "had been trying" is somebody's afternoon.
+BACKFILL = re.compile(
+    r"\bhad\s+(?!been\b)(?:[a-z]{2,}(?:ed|en|wn|ne|lt|ld|nt|de)\b|"
+    r"(?:run|come|gone|seen|made|taken|given|written|known|begun|found|"
+    r"brought|thought|kept|held|left|lost|built|sent|spent|grown|drawn|"
+    r"shown|told|sold|paid|met|led|won|become|done|got|gotten)\b)"
+    r"|\bhad\s+been\s+[a-z]{2,}ing\b"
+    r"|\b(?:was|were)\s+[a-z]{2,}ing\b", re.I)
+# A quotation in the first person is somebody remembering. It can be true, and it
+# is still not a fact of the story: "I snipped off an inch or so, put it in my
+# pocket…" says how a photograph came about, not what was photographed.
+QUOTED_SELF = re.compile(r"[\"\u201c]\s*(?:I|I'm|I've|I'd|I'll|we|we're|we've|"
+                         r"my|our)\b")
 WEAK_START = re.compile(r"^(and|but|so|yet|still|however|meanwhile|also)\b", re.I)
 # A sentence that opens with a pronoun or a bare quotation depends on the one
 # before it: "He just had a lot of Yemeni Jewish friends..." is not a summary of
@@ -222,21 +243,61 @@ def quote_marks(text):
     return text.count('"') + text.count("\u201c") + text.count("\u201d")
 
 
+def is_colour(sentence):
+    """Whether a sentence sets a scene instead of stating a fact.
+
+    Not a tone problem: the sentence is usually true, often the warmest line on
+    the page, and says nothing a reader can carry away. "He was planning to
+    sprout mustard seeds for fresh samples, but he was impatient" is the
+    paragraph before the story, and on today's Quanta card it landed among the
+    facts beside a point about mitochondria.
+
+    Two shapes are treated as colour, each with a guard so that a real result
+    written in the same grammar survives:
+
+    * **Backfill** — past perfect or progressive past. Guarded by figures, the
+      present perfect, a reported finding and novelty, so "Prime Medicine
+      announced that it had treated the first person in its trial" is a fact.
+    * **A quotation in the first person** — somebody remembering. Guarded the
+      same way, so "I've never seen anything like it in 30 years" keeps its
+      number and its place.
+    """
+    settled = bool(numeric_facts(sentence) or EVENT.search(sentence)
+                   or FINDING.search(sentence) or NOVELTY.search(sentence))
+    if settled:
+        return False
+    backfill = BACKFILL.search(sentence)
+    # Backfill only counts as the sentence's own tense when it is not tucked
+    # into a relative clause: "at a rate the researchers had not expected" is a
+    # detail *inside* a finding, not a scene being set around one. Nor when it
+    # sits inside somebody's statement: "a lawyer said in court that Trump was
+    # campaigning in Georgia" reports an allegation, which is the fact.
+    report = REPORTING.search(sentence)
+    if backfill and not (report and report.start() < backfill.start()) \
+            and (FRAME_START.match(sentence)
+                 or "," not in sentence[:backfill.start()]):
+        return True
+    return bool(QUOTED_SELF.search(sentence) and not quote_marks(sentence) % 2)
+
+
 def usable_as_fact(sentence):
     """Whether a selected sentence can stand as one of the card's facts.
 
-    Being specific is not enough. Three shapes read as noise next to a point:
-    a related-story headline, a first-person aside from the writer, and a
+    Being specific is not enough. Four shapes read as noise next to a point:
+    a related-story headline, a first-person aside from the writer, a
     fragment that begins or ends inside a quotation — which the sentence
     splitter cannot see, and which reads as nonsense without the words it was
     cut from ("And I think very widely respected through his whole
-    organization," said the chairman of the wineries association).
+    organization," said the chairman of the wineries association) — and a
+    sentence that is scene-setting rather than news.
     """
     if is_heading(sentence):
         return False
     if FIRST_PERSON.match(sentence):
         return False
     if quote_marks(sentence) % 2:
+        return False
+    if is_colour(sentence):
         return False
     return True
 
