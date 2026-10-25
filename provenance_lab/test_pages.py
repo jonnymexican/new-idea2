@@ -425,6 +425,12 @@ class TestPublish(unittest.TestCase):
         self.assertIn("26 Oct", page)
         self.assertEqual(page.count('class="cell o-gone"'), 1)
         self.assertEqual(page.count('class="cell o-valid"'), 1)
+        # The freshly built directory is what a deployment uploads, so it must
+        # carry the merged series too rather than the single column it was built
+        # with; otherwise the published page stays a snapshot.
+        local = json.loads((fresh / "history.json").read_text())
+        self.assertEqual([run["id"] for run in local["runs"]], ["1", "2"])
+        self.assertIn("19 Oct", (fresh / "index.html").read_text())
 
     def test_a_re_run_replaces_its_column_without_dropping_the_others(self):
         self.build("1", "2026-10-19T06:00:00+00:00", "absent")

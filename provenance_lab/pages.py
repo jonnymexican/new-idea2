@@ -605,7 +605,9 @@ def publish(
     build starts from an empty directory and knows only the run that just
     finished, so copying that file over the branch would trade the whole series
     for one column. Runs are merged by id, so a re-run of the same id still
-    replaces its own column, and the page is re-rendered from the merged series.
+    replaces its own column, and the page is re-rendered from the merged series
+    and written back to ``site_dir``, since that directory is what a deployment
+    stages.
     """
     site_dir = Path(site_dir)
     repo = Path(repo or ".")
@@ -642,12 +644,15 @@ def publish(
         history = load_history(work / "history.json")
         for record in load_history(site_dir / "history.json")["runs"]:
             append(history, record, keep=keep)
-        (work / "history.json").write_text(
-            json.dumps(history, indent=2) + "\n", encoding="utf-8"
-        )
-        (work / "index.html").write_text(
-            render_page(history, title=title, max_runs=max_runs), encoding="utf-8"
-        )
+        merged = json.dumps(history, indent=2) + "\n"
+        page = render_page(history, title=title, max_runs=max_runs)
+        (work / "history.json").write_text(merged, encoding="utf-8")
+        (work / "index.html").write_text(page, encoding="utf-8")
+        # Written back as well as pushed: whoever stages the deployment uploads
+        # this directory, and an artifact of the single-column build would put
+        # the snapshot back on the page the merge was meant to fix.
+        (site_dir / "history.json").write_text(merged, encoding="utf-8")
+        (site_dir / "index.html").write_text(page, encoding="utf-8")
 
         for item in site_dir.iterdir():
             # Those two files come from the merge above; copying them would put
