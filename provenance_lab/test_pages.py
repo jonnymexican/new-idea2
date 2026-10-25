@@ -399,6 +399,58 @@ class TestPublish(unittest.TestCase):
         history = json.loads(self.published("history.json"))
         self.assertEqual([run["id"] for run in history["runs"]], ["1", "2"])
 
+    def test_a_fresh_site_dir_does_not_erase_published_columns(self):
+        # CI's case: there is no `out/site` from last week on the runner, so the
+        # build knows only the run that just finished. Publishing must add that
+        # column to the branch's series rather than trade the series for it.
+        self.build("1", "2026-10-19T06:00:00+00:00", "absent")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pages.publish(self.site, push_url=self.url)
+
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        report_path = self.root / "second.json"
+        report_path.write_text(json.dumps(report(
+            generated="2026-10-26T06:00:00+00:00",
+            rows=[row("discord", "photo", "valid")],
+        )))
+        pages.build(report_path, fresh, run_id="2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pages.publish(fresh, push_url=self.url)
+
+        history = json.loads(self.published("history.json"))
+        self.assertEqual([run["id"] for run in history["runs"]], ["1", "2"])
+        page = self.published("index.html")
+        self.assertIn("19 Oct", page)
+        self.assertIn("26 Oct", page)
+        self.assertEqual(page.count('class="cell o-gone"'), 1)
+        self.assertEqual(page.count('class="cell o-valid"'), 1)
+
+    def test_a_re_run_replaces_its_column_without_dropping_the_others(self):
+        self.build("1", "2026-10-19T06:00:00+00:00", "absent")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pages.publish(self.site, push_url=self.url)
+        self.build("2", "2026-10-26T06:00:00+00:00", "absent")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pages.publish(self.site, push_url=self.url)
+
+        # Same run id as the first column, re-measured, from an empty site dir.
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        report_path = self.root / "rerun.json"
+        report_path.write_text(json.dumps(report(
+            generated="2026-10-19T06:05:00+00:00",
+            rows=[row("discord", "photo", "valid")],
+        )))
+        pages.build(report_path, fresh, run_id="1")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pages.publish(fresh, push_url=self.url)
+
+        history = json.loads(self.published("history.json"))
+        self.assertEqual([run["id"] for run in history["runs"]], ["1", "2"])
+        first = history["runs"][0]["platforms"]["discord"]["outcome"]
+        self.assertEqual(first, "valid")
+
     def test_republishing_an_unchanged_page_commits_nothing(self):
         self.build("1", "2026-10-19T06:00:00+00:00", "absent")
         with contextlib.redirect_stdout(io.StringIO()):

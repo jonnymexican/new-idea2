@@ -46,7 +46,7 @@ cd provenance_lab
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 
-.venv/bin/python -m unittest -v          # 138 tests
+.venv/bin/python -m unittest -v          # 140 tests
 .venv/bin/python lab.py run --out out/full
 ```
 
@@ -362,7 +362,10 @@ GitHub Actions** — and a public repository, because Pages refuses private ones
 on a personal plan (`422 Your current plan does not support GitHub Pages for
 this repository`), which is why the page waited for the repo to be made public.
 Remembering is the `platform-history` branch, which the workflow writes *before*
-deploying so a failed deployment still leaves the run recorded. A branch Pages
+deploying so a failed deployment still leaves the run recorded. `publish`
+merges that branch's `history.json` with the run that just finished instead of
+copying over it: the runner builds from an empty directory, so a copy would
+leave the page with one column every week. A branch Pages
 source would not work here: GitHub documents that commits pushed by a workflow
 using `GITHUB_TOKEN` do not trigger a branch build, so the branch would fill
 with history that is never served. The branch also holds the rendered page,

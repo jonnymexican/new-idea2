@@ -43,6 +43,8 @@ VERSION = 1
 KEEP_RUNS = 104
 PAGE_RUNS = 26
 
+DEFAULT_TITLE = "Platform survival"
+
 # A run that exits before writing a report still deserves a column, so the
 # page does not quietly skip the week something broke.
 UNMEASURED = "unmeasured"
@@ -526,7 +528,7 @@ def build(
     expected: Iterable[str] = (),
     run_url: str | None = None,
     run_id: str | None = None,
-    title: str = "Platform survival",
+    title: str = DEFAULT_TITLE,
     max_runs: int = PAGE_RUNS,
     keep: int = KEEP_RUNS,
     now: datetime | None = None,
@@ -588,13 +590,22 @@ def publish(
     push_url: str | None = None,
     message: str | None = None,
     repo: Path | None = None,
+    title: str = DEFAULT_TITLE,
+    max_runs: int = PAGE_RUNS,
+    keep: int = KEEP_RUNS,
 ) -> int:
-    """Copy the freshly built page onto the history branch and push.
+    """Merge the freshly built page into the history branch and push.
 
     The branch is cloned rather than force-pushed over, so its commit history
     survives and a hand edit on the branch is not silently discarded. If the
     branch does not exist yet the repository is initialised empty, which is the
     first-run case.
+
+    Its ``history.json`` is merged rather than overwritten: on a CI runner the
+    build starts from an empty directory and knows only the run that just
+    finished, so copying that file over the branch would trade the whole series
+    for one column. Runs are merged by id, so a re-run of the same id still
+    replaces its own column, and the page is re-rendered from the merged series.
     """
     site_dir = Path(site_dir)
     repo = Path(repo or ".")
@@ -626,8 +637,22 @@ def publish(
                 f"cannot read branch {branch}: {scrub(exists.stderr or 'unknown error', 400)}"
             )
 
+        # The branch is the page's memory, so the series is what it already
+        # holds plus whatever this build added -- never just the latter.
+        history = load_history(work / "history.json")
+        for record in load_history(site_dir / "history.json")["runs"]:
+            append(history, record, keep=keep)
+        (work / "history.json").write_text(
+            json.dumps(history, indent=2) + "\n", encoding="utf-8"
+        )
+        (work / "index.html").write_text(
+            render_page(history, title=title, max_runs=max_runs), encoding="utf-8"
+        )
+
         for item in site_dir.iterdir():
-            if item.name == ".git":
+            # Those two files come from the merge above; copying them would put
+            # the single-column build back in charge of the series.
+            if item.name in (".git", "history.json", "index.html"):
                 continue
             target = work / item.name
             if item.is_dir():
