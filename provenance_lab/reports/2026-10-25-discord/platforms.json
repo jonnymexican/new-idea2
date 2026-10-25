@@ -7,7 +7,7 @@
     "signed_bytes": 916814,
     "elapsed_s": 4.11,
     "signing_ca": "self-issued test CA (not a public trust anchor)",
-    "source_image": "2008-09-22 002.jpg",
+    "source_image": "<private photo>",
     "refetch_file": "/home/jvoigt/.local/state/provenance-lab/refetch-632f9ea140c3.json"
   },
   "uploads": [
