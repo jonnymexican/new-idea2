@@ -1,0 +1,95 @@
+/* A dark console, because this page is a look through a lens rather than a
+   document. Hues are the ones the language-model pages already use. */
+:root{
+  color-scheme: dark;
+  --bg:#0d0f12; --panel:#14171c; --fg:#e7e9ec; --muted:#8e96a3;
+  --line:#252a33; --accent:#e0a04a; --cool:#3f6d8f; --hot:#d4543f;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:2.5rem 1.25rem 4rem;background:var(--bg);color:var(--fg);
+  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:60rem;margin:0 auto}
+h1{font-size:1.6rem;line-height:1.15;margin:.1rem 0 .6rem;letter-spacing:-.015em}
+h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);
+  margin:0 0 .5rem;font-weight:600}
+p{margin:0 0 .75rem}
+.eyebrow{margin:0 0 .35rem;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted)}
+.lede{color:var(--muted);max-width:46rem}
+.hint{color:var(--muted);font-size:.82rem}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;
+  color:var(--accent)}
+button{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--line);
+  border-radius:6px;padding:.3rem .8rem;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.on{border-color:var(--accent);color:var(--accent)}
+
+.ask{margin:1.4rem 0 .6rem}
+textarea{width:100%;resize:vertical;background:var(--panel);color:var(--fg);
+  border:1px solid var(--line);border-radius:8px;padding:.7rem .8rem;
+  font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+textarea:focus{outline:none;border-color:var(--accent)}
+.ask-row{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-top:.55rem}
+.chips{display:flex;flex-wrap:wrap;gap:.35rem}
+.chip{font-size:.78rem;padding:.15rem .55rem;border-radius:999px}
+
+/* --- the token strip ------------------------------------------------------ */
+.view{margin-top:1.5rem}
+.strip{display:flex;flex-wrap:wrap;gap:1px}
+.tok{position:relative;padding:.15rem .05rem;border-radius:3px;cursor:pointer;
+  font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;
+  align-self:flex-end;transition:outline-color .1s}
+.tok:hover{outline:1px solid var(--muted)}
+.tok.focus{outline:2px solid var(--accent)}
+.tok.read{outline:1px dashed var(--cool)}
+
+.legend{display:flex;align-items:center;gap:.5rem;margin:.8rem 0 1.4rem;
+  font-size:.76rem;color:var(--muted)}
+
+.matrix-wrap{margin:.2rem 0 1.4rem}
+#matrix{display:block;max-width:100%;border-radius:4px;background:#0a0c0f;
+  box-shadow:0 0 0 1px var(--line)}
+.matrix-wrap .hint{margin-top:.5rem;max-width:34rem}
+.ramp{flex:0 0 10rem;height:8px;border-radius:4px;
+  background:linear-gradient(90deg,hsl(205 70% 88%),hsl(150 60% 78%),hsl(35 85% 70%),hsl(5 80% 58%))}
+
+/* --- the gallery ---------------------------------------------------------- */
+
+/* Small enough to sit four or five to a row on a laptop, large enough that a
+   head's shape is readable without opening it. The canvas backs at four pixels
+   per token and is scaled down by CSS, so the browser does the resampling. */
+.heads{margin:0 0 1.4rem}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(7rem,1fr));
+  gap:.55rem;margin-top:.6rem}
+.head-tile{display:flex;flex-direction:column;gap:.3rem;padding:.35rem;
+  border-radius:8px;background:#0a0c0f;border:1px solid var(--line)}
+.head-tile canvas{display:block;width:100%;height:auto;border-radius:3px}
+.head-tile span{font-size:.7rem;color:var(--muted);letter-spacing:.05em;
+  font-variant-numeric:tabular-nums}
+.head-tile .read{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;font-size:.7rem;color:var(--fg);opacity:.82;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.head-tile:hover{border-color:var(--muted)}
+.head-tile[aria-pressed="true"]{border-color:var(--accent);
+  box-shadow:0 0 0 1px var(--accent)}
+.head-tile[aria-pressed="true"] span{color:var(--accent)}
+
+.controls{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
+  padding:.7rem 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.controls label{font-size:.8rem;color:var(--muted);display:flex;align-items:center;gap:.4rem}
+select{font:inherit;font-size:.8rem;color:var(--fg);background:var(--panel);
+  border:1px solid var(--line);border-radius:6px;padding:.15rem .4rem}
+
+.next{margin-top:1.6rem}
+.bars{display:grid;gap:.25rem;margin-top:.6rem}
+.bar{display:grid;grid-template-columns:4.5rem 1fr 3.5rem;align-items:center;gap:.7rem;
+  font-size:.85rem}
+.bar .tok-text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);
+  text-align:right;white-space:pre;overflow:hidden;text-overflow:ellipsis}
+.bar .track{height:14px;background:#191d23;border-radius:3px;overflow:hidden}
+.bar .fill{height:100%;background:linear-gradient(90deg,var(--cool),var(--accent));
+  border-radius:3px}
+.bar .p{color:var(--muted);font-variant-numeric:tabular-nums;text-align:right}
+
+footer{margin-top:3rem;padding-top:1.1rem;border-top:1px solid var(--line);
+  color:var(--muted);font-size:.8rem;max-width:52rem}

@@ -133,7 +133,8 @@ class CausalSelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, x, cache=None, layer=0, pos_offset=0, attend=None):
+    def forward(self, x, cache=None, layer=0, pos_offset=0, attend=None,
+                capture=None):
         """Attend over the new tokens, and over the cache of everything before.
 
         Without a cache this is the original full-window attention. With one,
@@ -145,6 +146,12 @@ class CausalSelfAttention(nn.Module):
         is what a batch of prompts of different lengths needs: the rows are
         right-padded to a common width, and the pads have to be invisible —
         both as queries and, more importantly, as keys.
+
+        `capture` is a list that receives this layer's attention weights, one
+        entry per layer in call order. It is observation only: the weights are
+        detached after the softmax they were already computed for, so a run
+        that captures and one that does not return identical logits. peek.py is
+        the reader; nothing in training asks for it.
         """
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
@@ -178,6 +185,8 @@ class CausalSelfAttention(nn.Module):
                 att = att.masked_fill(keys > queries, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.dropout(att)
+        if capture is not None:
+            capture.append(att.detach())
 
         y = att @ v                                     # (B, n_head, T, head_dim)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble heads
@@ -210,9 +219,11 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = FeedForward(n_embd, dropout)
 
-    def forward(self, x, cache=None, layer=0, pos_offset=0, attend=None):
+    def forward(self, x, cache=None, layer=0, pos_offset=0, attend=None,
+                capture=None):
         x = x + self.attn(self.ln1(x), cache=cache, layer=layer,
-                          pos_offset=pos_offset, attend=attend)
+                          pos_offset=pos_offset, attend=attend,
+                          capture=capture)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -248,7 +259,7 @@ class GPT(nn.Module):
         return KVCache(self.n_layer if n_layers is None else n_layers)
 
     def forward(self, idx, targets=None, cache=None, pos_offset=0, n_layers=None,
-                positions=None, attend=None):
+                positions=None, attend=None, capture=None):
         """Run the model on `idx`, which starts at absolute position `pos_offset`.
 
         `n_layers` stops after that many blocks and still applies the final norm
@@ -262,6 +273,10 @@ class GPT(nn.Module):
         Tk) replaces the causal mask, and is what hides the padding those rows
         need. Both default to None, which is the unchanged path every test in
         this file's suite exercises.
+
+        `capture`, a list, collects each block's attention weights as that block
+        computes them — one `(B, n_head, T, Tk)` tensor per layer, in order. It
+        is for looking at a trained model, not for training: see peek.py.
         """
         B, T = idx.shape
         if positions is None:
@@ -286,7 +301,7 @@ class GPT(nn.Module):
             if n_layers is not None and layer >= n_layers:
                 break
             x = block(x, cache=cache, layer=layer, pos_offset=pos_offset,
-                      attend=attend)
+                      attend=attend, capture=capture)
         x = self.ln_f(x)
         logits = self.lm_head(x)                        # (B, T, vocab_size)
         if cache is not None:

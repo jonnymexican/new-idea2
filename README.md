@@ -7,6 +7,21 @@ Tiny Shakespeare — no pretrained weights, no fine-tuning, and no GPU. The mode
 the tokenizer and the training loop are all written here; only the backward pass
 (autograd) is taken as given.
 
+## The benches
+
+Four projects share this repo and none of them depends on another. What each one
+asks, and where it stands:
+
+| Bench | The question it asks | Where it stands |
+| --- | --- | --- |
+| **the model** — [`model.py`](model.py), [`train.py`](train.py), [`serve.py`](serve.py), [`peek.py`](peek.py) | What does a transformer learn, on a laptop, from scratch? | Active — the attention viewer is the newest bench |
+| **[mediatop](mediatop/README.md)** — the news digest | What is the point of today's news, on one screen, in four genres? | Live — Actions run it daily at 07:00 UTC |
+| **[wifi_radar](wifi_radar/README.md)** — WiFi motion sensing | Can WiFi signal be read as motion, with no special hardware? | Quiet since 23 Oct — its tests still run on every push |
+| **[provenance_lab](provenance_lab/README.md)** — C2PA across platforms | Does a provenance credential survive a real platform? | Parked — the weekly job still measures on Mondays |
+
+The rest of this README is the model bench: training it, talking to it,
+measuring it, and looking inside it. Each of the others has its own README.
+
 ## What's here
 
 | File | Purpose |
@@ -19,8 +34,10 @@ the tokenizer and the training loop are all written here; only the backward pass
 | [`infer.py`](infer.py) | Decoding: the KV cache, the window policy, and speculative drafts |
 | [`chat.py`](chat.py) | Interactive prompt for a trained checkpoint |
 | [`serve.py`](serve.py) | Local web prompt: a stdlib server that streams tokens into the browser |
+| [`peek.py`](peek.py) | What the model is doing while it reads: attention, per-token surprise, the next-token distribution — a local page, read from the inside |
 | [`bench_decode.py`](bench_decode.py) | What the cache, speculation, batching and a sustained run actually buy, measured |
 | [`test_all.py`](test_all.py) | The test suite (standard library only) — run it after any change |
+| [`test_peek.py`](test_peek.py) | The viewer's tests: capture is inert, attention stays causal, the API's shape |
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
 | `runs/` | Generated output: metrics, checkpoint, sample, loss curve (not committed) |
@@ -494,11 +511,55 @@ to anyone who can reach the port, so the flag is there if you want it elsewhere.
 Loading a checkpoint takes a few seconds on this CPU, and the socket is not bound
 until that finishes — the banner says so rather than leaving you refreshing.
 
+## Watch it read
+
+```bash
+.venv/bin/python peek.py                          # then open http://127.0.0.1:8766/
+.venv/bin/python peek.py --checkpoint runs_v3/model.pt --port 9001
+```
+
+`serve.py` answers what the model says. `peek.py` answers what it was doing
+while it read, from the same weights, through the same `GPT.forward`:
+
+- **the strip** — every token shaded by the bits the model was wrong by *before*
+  it saw that token, `−log₂ p` for the token that actually came next. On the
+  512-token BPE checkpoint a newline after `ROMEO:` costs it 0.09 bits; the `But`
+  after it costs 5.97, which is what "no idea" looks like as a colour.
+- **the gallery** — every head of the chosen layer at once, a thumbnail per
+  head over the same window, so their different habits are compared by eye
+  rather than one click apart. The white line across each tile is the token you
+  are reading from, which is the one place all six can be compared at once, and
+  the line under it names that head's strongest read from that token: on the
+  Shakespeare window, from the question mark, head 2 reads `“M” 28%` where head
+  4 reads `“:” 17%` and head 5 only itself. The caption follows the token you
+  click, so the same six pictures answer “which head is doing what” for any
+  position without opening one.
+- **the matrix** — one square per reader/read pair for the chosen layer and
+  head: rows are the token doing the reading, columns the tokens read, brightest
+  where the attention is. The empty upper triangle is the causal mask as a
+  shape rather than an assertion, and the gallery makes it plain that the six
+  heads read for visibly different reasons.
+- **the bars** — the distribution it holds for the next token, with its entropy
+  in bits, so "how undecided is it" is a number rather than a feeling.
+
+Attention leaves the model through an optional `capture` list on
+`GPT.forward`, so nothing is recomputed: the weights are detached
+after the softmax they were already computed for, and the logits are bit-identical
+with and without it. The suite pins that, because a viewer that changed what it
+looks at would be worse than no viewer at all.
+
+A checkpoint's `block_size` is a hard ceiling, so a passage longer than the
+window is read from its tail and the page says how many tokens fell outside it —
+the same honesty the browser prompt applies to its context line. Everything runs
+in one stdlib process with plain JavaScript on the page: no framework, no build
+step, and the checkpoint never leaves the machine.
+
 ## Tests
 
 ```bash
 .venv/bin/python test_all.py            # the whole suite, about 90 seconds
 .venv/bin/python test_all.py TestBPE    # just one class
+.venv/bin/python -m unittest test_peek  # the attention viewer
 ```
 
 The suite runs on the standard library alone — no pytest — and covers the
@@ -530,6 +591,10 @@ and would quietly invalidate the results if it broke again:
 - the web server serves a self-contained page, streams NDJSON chunks over
   chunked framing, rejects bad settings with a reason, and stops a reply when the
   browser walks away instead of sampling on into a dead socket
+- the attention viewer observes without altering: capturing weights leaves the
+  logits bit-identical, the published matrix is still causal and sums to one per
+  row, the reported surprise matches the model's own probability for the token
+  that came next, and a passage longer than the window reports what it dropped
 - the window arithmetic the page reports is exact: a prompt of exactly
   `block_size` tokens drops nothing and one token more drops one, with the counts
   cross-checked against an independent `/api/tokens` encode

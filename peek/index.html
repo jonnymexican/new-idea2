@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What the model is reading</title>
+<link rel="stylesheet" href="peek.css">
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow" id="eyebrow">a checkpoint, read from the inside</p>
+    <h1>What the model is reading</h1>
+    <p class="lede">
+      Every token, shaded by how many bits the model was wrong by before it saw
+      it — the bright ones are where it was guessing. Click any token to see
+      what it attended to in that layer, and what the model expected next.
+    </p>
+  </header>
+
+  <div class="ask">
+    <textarea id="text" rows="3" spellcheck="false"
+      placeholder="Paste a passage, or press Read it."></textarea>
+    <div class="ask-row">
+      <button type="button" id="go">Read it</button>
+      <div class="chips" id="examples"></div>
+    </div>
+  </div>
+
+  <p class="hint" id="status">loading the checkpoint…</p>
+
+  <section class="view" id="view" hidden>
+    <div class="strip" id="strip"></div>
+
+    <div class="legend">
+      <span>0 bits — it knew</span>
+      <span class="ramp" aria-hidden="true"></span>
+      <span>8+ bits — it guessed</span>
+    </div>
+
+    <div class="matrix-wrap">
+      <canvas id="matrix" aria-label="attention matrix"></canvas>
+      <p class="hint">
+        Rows are the token reading, columns the tokens read; the empty upper
+        half is the future it cannot see. Hover a row to read it.
+      </p>
+    </div>
+
+    <div class="controls">
+      <label>layer <select id="layer"></select></label>
+      <span class="hint" id="focus-note">click a token to see what it read</span>
+    </div>
+
+    <section class="heads">
+      <h2>Every head in this layer</h2>
+      <p class="hint">
+        One square per head over the same window, so their different habits sit
+        next to each other instead of behind a click. The outlined one is drawn
+        large below; click another to swap it in. The white line is the token
+        you are reading from.
+      </p>
+      <div class="gallery" id="gallery"></div>
+    </section>
+
+    <section class="next">
+      <h2>What it expects next</h2>
+      <p class="hint" id="entropy"></p>
+      <div class="bars" id="bars"></div>
+    </section>
+  </section>
+
+  <footer>
+    <p id="model-meta"></p>
+    <p>
+      Each tile is one head's attention over the whole window and the large
+      square is the head you picked — or their mean. Surprise is
+      <code>−log₂ p</code> for the token that actually came next, before the
+      model was shown it, so it measures prediction rather than hindsight.
+    </p>
+  </footer>
+</main>
+<script type="module" src="peek.js"></script>
+</body>
+</html>

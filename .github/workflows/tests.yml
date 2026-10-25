@@ -42,10 +42,16 @@ jobs:
           python -c "import sys; print(sys.version)"
           python -c "import torch; print('torch', torch.__version__)"
 
-      # Two steps rather than one command: a failure then names the project it
-      # came from without opening the log.
+      # One step per project rather than one command: a failure then names the
+      # project it came from without opening the log.
       - name: Training, tokeniser and web server
         run: python -m unittest test_all -v
+
+      # The attention viewer's own guarantees: that capturing weights does not
+      # change the logits, that the published matrix is still causal, and that
+      # the API answers rather than crashing on a malformed body.
+      - name: Attention viewer
+        run: python -m unittest test_peek -v
 
       - name: WiFi radar
         run: python -m unittest wifi_radar.test_radar -v
