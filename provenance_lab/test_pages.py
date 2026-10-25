@@ -278,6 +278,11 @@ class TestRender(unittest.TestCase):
         page = pages.render_page(self.history())
         self.assertIn("The latest run, rendition by rendition", page)
 
+    def test_the_verifier_page_is_linked_from_the_page(self):
+        for history in ({"version": 1, "runs": []}, self.history()):
+            page = pages.render_page(history)
+            self.assertIn('href="verifier/"', page)
+
     def test_no_javascript(self):
         page = pages.render_page(self.history())
         self.assertNotIn("<script", page)
@@ -333,6 +338,27 @@ class TestBuild(unittest.TestCase):
         # The page is public, so served URLs are not carried at all.
         self.assertNotIn("http", written)
 
+    def test_build_stages_the_verifier_page_beside_the_trend_page(self):
+        report_path = self.write_report(
+            "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
+        )
+        pages.build(report_path, self.site, run_id="1")
+        self.assertTrue((self.site / "verifier" / "index.html").is_file())
+        self.assertTrue((self.site / "verifier" / "app.js").is_file())
+
+    def test_verifier_roots_put_the_runs_renditions_on_the_staged_page(self):
+        report_path = self.write_report(
+            "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
+        )
+        served = self.root / "live" / "served"
+        served.mkdir(parents=True)
+        (served / "discord__attachment.jpeg").write_bytes(b"JPEG")
+        pages.build(report_path, self.site, run_id="1", verifier_roots=[self.root / "live"])
+        payload = json.loads((self.site / "verifier" / "samples.json").read_text())
+        self.assertEqual(payload["runs"][0]["name"], "live")
+        self.assertEqual(payload["runs"][0]["files"][0]["url"],
+                         "samples/live/discord__attachment.jpeg")
+
     def test_build_is_idempotent_for_the_same_run(self):
         report_path = self.write_report(
             "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
@@ -387,6 +413,29 @@ class TestPublish(unittest.TestCase):
         self.assertIn("published", out.getvalue())
         self.assertIn("Platform survival", self.published("index.html"))
         self.assertEqual(self.commits(), 1)
+
+    def test_the_branch_carries_the_verifier_page_as_well(self):
+        # The branch is the readable copy of the site, so the page the trend
+        # page links to has to be on it, with the bytes it lists.
+        served = self.root / "live" / "served"
+        served.mkdir(parents=True)
+        (served / "discord__attachment.jpeg").write_bytes(b"JPEG")
+        report_path = self.root / "r.json"
+        report_path.write_text(json.dumps(report(rows=[row("discord", "photo", "absent")])))
+        pages.build(report_path, self.site, run_id="1",
+                    verifier_roots=[self.root / "live"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            pages.publish(self.site, push_url=self.url)
+
+        self.assertIn("Verify a content credential", self.published("verifier/index.html"))
+        payload = json.loads(self.published("verifier/samples.json"))
+        self.assertEqual(payload["runs"][0]["files"][0]["url"],
+                         "samples/live/discord__attachment.jpeg")
+        tree = subprocess.run(
+            ["git", "--git-dir", str(self.bare), "ls-tree", "-r", "--name-only", self.BRANCH],
+            capture_output=True, text=True,
+        ).stdout
+        self.assertIn("verifier/samples/live/discord__attachment.jpeg", tree)
 
     def test_later_publishes_append_and_keep_the_series(self):
         self.build("1", "2026-10-19T06:00:00+00:00", "absent")

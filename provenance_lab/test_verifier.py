@@ -51,6 +51,53 @@ class ServeCase(unittest.TestCase):
             return exc.code, exc.headers.get("Content-Type", ""), exc.read()
 
 
+class TestStaticBuild(ServeCase):
+    """The published copy: same files, plus a catalogue and its bytes."""
+
+    def build(self, roots=None):
+        return verifier.build_site(
+            roots if roots is not None else [self.root], self.root / "site"
+        )
+
+    def test_the_page_its_bytes_and_a_catalogue_are_staged_as_one_directory(self):
+        self.make_run(name="discord__attachment.jpeg", data=b"\xff\xd8JPEG")
+        target = self.build()
+        self.assertEqual(target, self.root / "site" / "verifier")
+        for name in verifier.PAGE_FILES:
+            self.assertTrue((target / name).is_file(), name)
+        staged = target / "samples" / "demo" / "discord__attachment.jpeg"
+        self.assertEqual(staged.read_bytes(), b"\xff\xd8JPEG")
+
+    def test_the_staged_catalogue_matches_what_the_server_would_list(self):
+        self.make_run(name="discord__attachment.jpeg")
+        self.make_run(name="discord__proxy_webp.webp")
+        payload = json.loads((self.build() / "samples.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload, verifier.listing([self.root]))
+
+    def test_every_url_is_relative_so_a_project_path_still_resolves(self):
+        # Pages serves the site from /<repo>/verifier/, not from the host root,
+        # so a leading slash would send the browser somewhere that 404s.
+        self.make_run(name="discord__attachment.jpeg")
+        payload = json.loads((self.build() / "samples.json").read_text(encoding="utf-8"))
+        url = payload["runs"][0]["files"][0]["url"]
+        self.assertEqual(url, "samples/demo/discord__attachment.jpeg")
+        self.assertFalse(url.startswith("/"))
+
+    def test_a_root_that_was_never_written_still_publishes_the_page(self):
+        # The trend page links to this one unconditionally, so a build that has
+        # no renditions to offer must still produce the page rather than fail.
+        target = self.build([self.root / "never-written"])
+        self.assertTrue((target / "index.html").is_file())
+        payload = json.loads((target / "samples.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload, {"runs": []})
+
+    def test_rebuilding_replaces_the_catalogue_instead_of_appending(self):
+        self.make_run(run="live", name="discord__attachment.jpeg")
+        self.build()
+        payload = json.loads((self.build() / "samples.json").read_text(encoding="utf-8"))
+        self.assertEqual([run["name"] for run in payload["runs"]], ["live"])
+
+
 class TestDiscovery(ServeCase):
     def test_a_run_lists_its_renditions_with_platform_and_variant(self):
         self.make_run(name="discord__attachment.jpeg")

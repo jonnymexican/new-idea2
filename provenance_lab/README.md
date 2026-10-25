@@ -417,6 +417,26 @@ first use. That is the opposite trade from the trend page, which loads nothing
 from anywhere; the difference is that this page is answering a client's
 question, and a client has the SDK.
 
+### The verifier on the published site
+
+The same page is deployed at `/verifier/` next to the trend page, and the trend
+page links to it. `pages.py build` stages it — the three files, a
+`samples.json` and the renditions it names — so one command produces the whole
+site and the link can never point at nothing:
+
+```bash
+.venv/bin/python pages.py build --report out/live/platforms.json --site out/site \
+    --verifier-out out/live
+```
+
+`--verifier-out` is what fills the chips; the weekly workflow passes
+`out/live`, so the published page lists the renditions that run downloaded and
+anyone can open one and see the client's verdict for themselves. Only the run
+named on the command line is published — the `out/` runs measured with a
+personal photo are never part of a build, and the page would have nothing of
+theirs to show anyway. Every URL written into the site is relative, because
+Pages serves it from `/<repo>/` rather than a host root.
+
 ## What this does not prove
 
 - The signing CA is generated locally, so `trusted` means trusted against that
@@ -447,18 +467,21 @@ question, and a client has the SDK.
   including the ignored-`chmod` fallback, summarisation, HTTP failures, and the
   full upload → fetch → verify path against the local harness
 - `pages.py` — the published trend page: outcome reduction, run history, HTML
-  rendering, and the branch publish (stdlib only)
-- `test_pages.py` — 40 tests: outcome classification and precedence, credential
+  rendering, staging the verifier beside it, and the branch publish (stdlib
+  only)
+- `test_pages.py` — 43 tests: outcome classification and precedence, credential
   scrubbing of error text, history ordering and idempotence, HTML escaping,
   streak reporting, build idempotence, and publish against a throwaway bare
   repository, including a fresh build directory keeping the published columns
 - `verifier.py` — serves the browser verifier and the renditions a run's
-  `served/` directory already holds (stdlib only)
+  `served/` directory already holds, and stages the static copy that ships
+  with the trend page (stdlib only)
 - `verifier/` — the page itself: `c2pa-web` 0.15.4 from a pinned CDN URL, no
   build step, no framework
-- `test_verifier.py` — 11 tests: rendition discovery and labels, run ordering,
-  single-file roots, duplicate run names, and the sample routes, including the
-  traversal attempts that must 404
+- `test_verifier.py` — 16 tests: rendition discovery and labels, run ordering,
+  single-file roots, duplicate run names, the sample routes including the
+  traversal attempts that must 404, and the static build's catalogue, relative
+  URLs and empty-root behaviour
 - `demo.py` — one command from the local arm to a served page (stdlib only
   itself; the arm it calls needs the signing stack)
 - `test_demo.py` — 2 tests: the arm → report → page path end to end, and one

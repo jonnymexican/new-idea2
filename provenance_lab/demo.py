@@ -12,8 +12,9 @@ wiring in one place:
 It measures the `local` adapter -- a real HTTP server that re-encodes the
 signed fixture under four policies -- writes the report to `out/demo/`, appends
 it as a column of the trend page in `out/site/`, and serves that page until
-Ctrl-C. Nothing leaves the machine: the live adapters are not involved, and
-none of them is configured by this command.
+Ctrl-C. The verifier page staged beside it lists the arm's four renditions, so
+the local run looks like the published one. Nothing leaves the machine: the
+live adapters are not involved, and none of them is configured here.
 
 Both output directories are gitignored. Repeating the command adds a column per
 measurement, which is the page doing its job rather than a bug; `--no-serve`
@@ -58,9 +59,19 @@ def measure(out_dir):
     return report
 
 
-def build_page(report, site, title=DEFAULT_TITLE):
-    """Append `report` as one column and render the page. Returns the record."""
-    return pages.build(Path(report), Path(site), title=title)
+def build_page(report, site, title=DEFAULT_TITLE, run=None):
+    """Append `report` as one column and render the page. Returns the record.
+
+    `run` is the directory the arm wrote, so the verifier page staged next to
+    the trend page lists this measurement's renditions rather than only
+    offering a drop zone.
+    """
+    return pages.build(
+        Path(report),
+        Path(site),
+        title=title,
+        verifier_roots=[Path(run)] if run else [],
+    )
 
 
 def serve(site, host=DEFAULT_HOST, port=DEFAULT_PORT, open_browser=True):
@@ -113,7 +124,7 @@ def main(argv=None):
 
     report = measure(args.out)
     try:
-        record = build_page(report, args.site, args.title)
+        record = build_page(report, args.site, args.title, run=args.out)
     except ValueError as exc:
         # A history file that is not JSON would otherwise be a traceback; pages
         # raises ValueError with the path and the reason.

@@ -82,6 +82,11 @@ jobs:
         # broke is the week the chart most needs a new column. If the
         # measurement never wrote a report, --expect still records the week as
         # not measured rather than leaving a silent gap in the series.
+        #
+        # --verifier-out stages the browser verifier beside the page, with the
+        # renditions this run downloaded as its chips. Only those bytes go up:
+        # the runs under out/ that were measured with a personal photo are
+        # never named here, so nothing of that kind reaches the site.
         id: page
         if: always()
         run: |
@@ -89,6 +94,7 @@ jobs:
             --report provenance_lab/out/live/platforms.json \
             --site provenance_lab/out/site \
             --expect "${{ inputs.platforms || 'discord,telegram,mastodon,bluesky,facebook' }}" \
+            --verifier-out provenance_lab/out/live \
             --run-id "${{ github.run_id }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 

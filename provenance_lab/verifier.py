@@ -19,6 +19,11 @@ page works too.
 Nothing is uploaded. The browser fetches the 9 MB verifier from a pinned CDN
 URL and checks the bytes in the tab; this server never sends a file anywhere
 but to that tab.
+
+``pages.py build`` stages the same page as ``<site>/verifier/`` -- the files
+plus a ``samples.json`` and the bytes it names -- so the published site carries
+both the trend page and this one. Everything there is a relative URL, because
+Pages serves the site from a project path rather than a host root.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import argparse
 import functools
 import json
 import mimetypes
+import shutil
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +45,10 @@ DEFAULT_OUT = "out"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 SUFFIXES = {".jpeg", ".jpg", ".png", ".webp"}
+
+# The three files that make up the page. The server maps them to routes and the
+# static build copies them; one list keeps the two from drifting apart.
+PAGE_FILES = ("index.html", "app.js", "style.css")
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -121,6 +131,46 @@ def listing(roots) -> dict:
             for name, files in catalogue(roots)
         ]
     }
+
+
+def build_site(roots, site_dir) -> Path:
+    """Stage the page and the renditions it lists as ``<site_dir>/verifier``.
+
+    This is the published copy: the same three files the local server serves,
+    plus a ``samples.json`` and the bytes it names, so the page that goes up
+    next to the trend page has renditions to open instead of only a drop zone.
+
+    A root that does not exist is skipped rather than refused. A page with
+    nothing to list still verifies dropped files, and a caller that points at a
+    run directory the measurement never wrote should get the page, not an
+    error -- that is also what keeps the trend page's link from dangling.
+
+    Every URL written here is relative (``samples/<run>/<file>``), because
+    Pages serves the site under a project path; a leading slash would resolve
+    against the host root and 404.
+    """
+    target = Path(site_dir) / "verifier"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in PAGE_FILES:
+        shutil.copy2(PAGE / name, target / name)
+
+    runs = []
+    for name, files in catalogue(roots):
+        entries = []
+        for label, url, path in files:
+            destination = target / url
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            entries.append(
+                {"label": label, "url": url, "bytes": path.stat().st_size}
+            )
+        runs.append({"name": name, "files": entries})
+
+    # Same shape the server answers on /samples.json, because the page reads
+    # whichever one it finds without knowing which served it.
+    payload = json.dumps({"runs": runs}, indent=2) + "\n"
+    (target / "samples.json").write_text(payload, encoding="utf-8")
+    return target
 
 
 class Handler(BaseHTTPRequestHandler):

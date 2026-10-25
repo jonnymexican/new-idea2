@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import verifier
+
 VERSION = 1
 
 # Two years of weekly runs. The page shows a window of this; nothing older is
@@ -376,6 +378,11 @@ def render_page(
         "real service, then the bytes the service actually served back, verified. "
         "A cell says whether the C2PA credential survived the platform on that day.",
         "</p>",
+        '<p class="lede">',
+        '<a href="verifier/">Verify a rendition in your browser</a> &mdash; the same '
+        "run's downloads, read by the CAI verifier a viewer would embed, or a file "
+        "of your own.",
+        "</p>",
     ]
 
     if not runs:
@@ -532,6 +539,7 @@ def build(
     max_runs: int = PAGE_RUNS,
     keep: int = KEEP_RUNS,
     now: datetime | None = None,
+    verifier_roots: Iterable[str | Path] = (),
 ) -> dict:
     site_dir = Path(site_dir)
     site_dir.mkdir(parents=True, exist_ok=True)
@@ -552,6 +560,11 @@ def build(
     (site_dir / "index.html").write_text(
         render_page(history, title=title, max_runs=max_runs), encoding="utf-8"
     )
+    # The site is both pages. Staging the verifier here rather than in a step of
+    # its own keeps the link from index.html from pointing at nothing: every
+    # build produces it, and `verifier_roots` only decides whether it has
+    # renditions to list alongside the drop zone.
+    verifier.build_site(verifier_roots, site_dir)
     return record
 
 
@@ -706,6 +719,13 @@ def main(argv: list[str] | None = None) -> int:
     build_parser.add_argument("--title", default="Platform survival")
     build_parser.add_argument("--max-runs", type=int, default=PAGE_RUNS)
     build_parser.add_argument("--keep", type=int, default=KEEP_RUNS)
+    build_parser.add_argument(
+        "--verifier-out",
+        action="append",
+        default=[],
+        help="run directory whose served/ renditions the verifier page lists "
+             "(repeatable; without it the page only verifies dropped files)",
+    )
 
     publish_parser = sub.add_parser("publish", help="push the page to a branch")
     publish_parser.add_argument("--site", default="out/site")
@@ -727,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             title=args.title,
             max_runs=args.max_runs,
             keep=args.keep,
+            verifier_roots=args.verifier_out,
         )
         outcomes = {
             name: data["outcome"] for name, data in sorted(record["platforms"].items())
