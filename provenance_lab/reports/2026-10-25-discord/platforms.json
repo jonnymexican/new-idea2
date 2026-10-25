@@ -1,0 +1,141 @@
+{
+  "meta": {
+    "generated": "2026-10-25T04:45:03+00:00",
+    "c2pa_python": "0.38.0",
+    "c2pa_sdk": "0.91.0",
+    "fixture": "2048x1536",
+    "signed_bytes": 916814,
+    "elapsed_s": 4.11,
+    "signing_ca": "self-issued test CA (not a public trust anchor)",
+    "source_image": "2008-09-22 002.jpg",
+    "refetch_file": "/home/jvoigt/.local/state/provenance-lab/refetch-632f9ea140c3.json"
+  },
+  "uploads": [
+    {
+      "platform": "discord",
+      "remote_id": "1563775363765768342",
+      "page_url": "https://cdn.discordapp.com/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&",
+      "variants": [
+        {
+          "name": "attachment",
+          "url": "https://cdn.discordapp.com/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&",
+          "note": ""
+        },
+        {
+          "name": "proxy",
+          "url": "https://media.discordapp.net/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&",
+          "note": ""
+        },
+        {
+          "name": "proxy_webp",
+          "url": "https://media.discordapp.net/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&&format=webp",
+          "note": ""
+        }
+      ],
+      "notes": [
+        "reported 2048x1536 image/jpeg 916814 bytes"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "platform": "discord",
+      "variant": "attachment",
+      "url": "https://cdn.discordapp.com/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&",
+      "note": "",
+      "status": 200,
+      "content_type": "image/jpeg",
+      "served_bytes": 916814,
+      "served_format": "jpeg",
+      "served_dims": [
+        2048,
+        1536
+      ],
+      "sha256_match": true,
+      "present": true,
+      "claim_readable": true,
+      "state": "Trusted",
+      "signature_ok": true,
+      "data_hash_ok": true,
+      "trusted": true,
+      "ai_claim": true,
+      "failures": [],
+      "verdict": "valid",
+      "download_ms": 523.9,
+      "uploaded_bytes": 916814
+    },
+    {
+      "platform": "discord",
+      "variant": "proxy",
+      "url": "https://media.discordapp.net/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&",
+      "note": "",
+      "status": 200,
+      "content_type": "image/jpeg",
+      "served_bytes": 916814,
+      "served_format": "jpeg",
+      "served_dims": [
+        2048,
+        1536
+      ],
+      "sha256_match": true,
+      "present": true,
+      "claim_readable": true,
+      "state": "Trusted",
+      "signature_ok": true,
+      "data_hash_ok": true,
+      "trusted": true,
+      "ai_claim": true,
+      "failures": [],
+      "verdict": "valid",
+      "download_ms": 468.2,
+      "uploaded_bytes": 916814
+    },
+    {
+      "platform": "discord",
+      "variant": "proxy_webp",
+      "url": "https://media.discordapp.net/attachments/1563774839238557706/1563775363765768342/signed.jpg?ex=6adedacc&is=6add894c&hm=<redacted>&&format=webp",
+      "note": "",
+      "status": 200,
+      "content_type": "image/webp",
+      "served_bytes": 278894,
+      "served_format": "webp",
+      "served_dims": [
+        2048,
+        1536
+      ],
+      "sha256_match": false,
+      "present": false,
+      "claim_readable": false,
+      "state": null,
+      "signature_ok": false,
+      "data_hash_ok": false,
+      "trusted": false,
+      "ai_claim": false,
+      "failures": [],
+      "verdict": "absent",
+      "download_ms": 510.6,
+      "uploaded_bytes": 916814
+    }
+  ],
+  "skipped": [],
+  "summary": {
+    "rows": 3,
+    "platforms": {
+      "discord": {
+        "variants": 3,
+        "absent": 1,
+        "invalid": 0,
+        "valid": 2,
+        "unavailable": 0,
+        "byte_identical": 2,
+        "formats": [
+          "jpeg",
+          "webp"
+        ],
+        "max_ratio": 1.0,
+        "stripped_but_still_claims_ai": 0
+      }
+    }
+  },
+  "refetch_warning": null
+}

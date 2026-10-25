@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 *.pem
 platforms.json
+# The copies under reports/ are redacted reports, not the credential file.
+!reports/**/platforms.json
