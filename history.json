@@ -36,6 +36,42 @@
       "run_url": "https://github.com/jonnymexican/new-idea2/actions/runs/40164171583",
       "fixture": "960x640",
       "signed_bytes": 60633
+    },
+    {
+      "id": "40164518917",
+      "generated": "2026-10-25T05:10:10+00:00",
+      "platforms": {
+        "discord": {
+          "variants": [
+            {
+              "name": "attachment",
+              "verdict": "valid",
+              "format": "jpeg",
+              "bytes": 60633,
+              "identical": true
+            },
+            {
+              "name": "proxy",
+              "verdict": "valid",
+              "format": "jpeg",
+              "bytes": 60633,
+              "identical": true
+            },
+            {
+              "name": "proxy_webp",
+              "verdict": "absent",
+              "format": "webp",
+              "bytes": 6050,
+              "identical": false
+            }
+          ],
+          "outcome": "valid",
+          "mixed": true
+        }
+      },
+      "run_url": "https://github.com/jonnymexican/new-idea2/actions/runs/40164518917",
+      "fixture": "960x640",
+      "signed_bytes": 60633
     }
   ]
 }
