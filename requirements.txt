@@ -6,8 +6,6 @@
 #
 torch>=2.14
 
-# Archil: a disk that outlives a run (archil_store.py, archil_check.py).
-# Wheels only, and pinned, because the SDK is the only thing here that talks to
-# the network and its API is what the module is written against.
-#   uv pip install --python .venv/bin/python --only-binary=:all: -r requirements.txt
-archil==0.17.0
+# Archil's client is pinned in requirements-archil.txt, not here: this file is
+# installed against the CPU torch index, which carries no PyPI packages, so a
+# PyPI-only dependency in it fails the install (as CI found).

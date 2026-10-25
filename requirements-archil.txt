@@ -1,0 +1,13 @@
+# Archil's client, kept out of requirements.txt on purpose.
+#
+# requirements.txt is installed against the CPU torch index
+# (https://download.pytorch.org/whl/cpu), which carries torch and nothing from
+# PyPI -- so a PyPI-only package listed there fails the install, which is
+# exactly what the tests workflow hit. This file is the one installed from PyPI:
+#
+#   uv pip install --python .venv/bin/python --only-binary=:all: -r requirements-archil.txt
+#
+# Pinned, because its API is what archil_store.py is written against, and wheels
+# only, because building it here would need a compiler this machine has no use
+# for otherwise.
+archil==0.17.0

@@ -8,9 +8,11 @@ else starts from nothing. Archil gives a directory that outlives the process
 that filled it, so a file written by one command is still there for the next
 one — from a different container, on a different machine.
 
-The SDK is `archil` (pinned in requirements.txt). This module is the one place
-it is configured and the one place a disk is reached for, so nothing else in the
-repo touches a key or a client. It is deliberately small, and it imports without
+The SDK is `archil`, pinned in requirements-archil.txt — kept out of
+requirements.txt because that file is installed against the CPU torch index, and
+that index carries no PyPI packages. This module is the one place it is
+configured and the one place a disk is reached for, so nothing else in the repo
+touches a key or a client. It is deliberately small, and it imports without
 a key: no environment is read until a disk is actually asked for.
 
 Credentials come from the environment, or from `.env` at the repo root
