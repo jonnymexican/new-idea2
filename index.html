@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Platform survival</title>
+<style>
+:root{
+  color-scheme: light dark;
+  --bg:#fbfbfa; --fg:#18181b; --muted:#5f6368; --line:#e4e4e7;
+  --valid:#b4690e; --invalid:#a3282d; --gone:#2f6f6a; --unavailable:#8a8a93;
+  --unconfigured:#d6d6da; --failed:#7f1d1d; --none:#f1f1f3;
+  --card:#ffffff;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#121214; --fg:#e8e8ea; --muted:#a1a1aa; --line:#2a2a2f;
+    --valid:#e0a04a; --invalid:#e06c72; --gone:#5fb3a8; --unavailable:#85858e;
+    --unconfigured:#3f3f46; --failed:#b4545a; --none:#1b1b1f;
+    --card:#18181b;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:2.5rem 1.25rem 4rem;background:var(--bg);color:var(--fg);
+  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:60rem;margin:0 auto}
+h1{font-size:1.5rem;line-height:1.2;margin:0 0 .4rem;letter-spacing:-.01em}
+h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+  margin:2.5rem 0 .75rem;font-weight:600}
+p{margin:0 0 .75rem}
+.lede{color:var(--muted);max-width:44rem}
+.scroll{overflow-x:auto;padding-bottom:.5rem}
+table{border-collapse:separate;border-spacing:3px}
+.matrix th{font-weight:500;font-size:.72rem;color:var(--muted)}
+.matrix thead th{writing-mode:vertical-rl;transform:rotate(180deg);text-align:left;
+  height:4.2rem;vertical-align:bottom;padding:0 0 .2rem;white-space:nowrap}
+.matrix thead th.latest{color:var(--fg);font-weight:600}
+.matrix thead th.nowhead{writing-mode:horizontal-tb;transform:none;height:auto;
+  vertical-align:bottom;padding-left:.5rem;font-size:.72rem}
+.matrix tbody th{text-align:left;padding-right:.75rem;white-space:nowrap;font-size:.85rem}
+.matrix tbody th code{font-size:.82rem}
+.cell{width:1.15rem;height:1.15rem;border-radius:3px;background:var(--none)}
+td.cell{min-width:1.15rem}
+.o-valid{background:var(--valid)} .o-invalid{background:var(--invalid)}
+.o-gone{background:var(--gone)} .o-unavailable{background:var(--unavailable)}
+.o-unconfigured{background:var(--unconfigured)}
+.o-failed{background:var(--failed)} .o-unmeasured{background:var(--none);
+  box-shadow:inset 0 0 0 1px var(--line)}
+.now{font-size:.78rem;color:var(--muted);padding-left:.5rem;white-space:nowrap}
+.legend{display:flex;flex-wrap:wrap;gap:.35rem 1rem;list-style:none;margin:1rem 0 0;
+  padding:0;font-size:.78rem;color:var(--muted)}
+.legend li{display:flex;align-items:center;gap:.4rem}
+.legend .swatch{width:.8rem;height:.8rem;border-radius:2px;display:inline-block}
+.summary{width:100%;font-size:.85rem}
+.summary th,.summary td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--line)}
+.summary th{font-weight:500;color:var(--muted);font-size:.72rem;text-transform:uppercase;
+  letter-spacing:.06em}
+.summary td:first-child{white-space:nowrap}
+details{margin-top:1rem}
+summary{cursor:pointer;color:var(--muted);font-size:.85rem}
+.caveats{color:var(--muted);font-size:.82rem;margin-top:2.5rem;border-top:1px solid var(--line);
+  padding-top:1rem}
+footer{color:var(--muted);font-size:.75rem;margin-top:1.5rem}
+a{color:inherit}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.empty{border:1px dashed var(--line);border-radius:8px;padding:2rem;text-align:center;
+  color:var(--muted)}
+</style>
+<link rel="alternate" type="application/json" href="history.json">
+</head>
+<body>
+<main>
+<h1>Platform survival</h1>
+<p class="lede">
+Each column is one run of the live adapters: a signed fixture uploaded to a real service, then the bytes the service actually served back, verified. A cell says whether the C2PA credential survived the platform on that day.
+</p>
+<div class="scroll"><table class="matrix">
+<caption class="sr-only">Credential outcome per platform over the last 1 of 1 runs, oldest first</caption>
+<thead><tr><th scope="col"><span>platform</span></th>
+<th scope="col" class="latest"><span><a href="https://github.com/jonnymexican/new-idea2/actions/runs/40163439540">25 Oct</a></span></th>
+<th scope="col" class="nowhead">now</th></tr></thead><tbody>
+<tr><th scope="row"><code>discord</code></th>
+<td class="cell o-valid" title="discord · 25 Oct 2026 · credential intact (variants disagree)"><span class="sr-only">discord · 25 Oct 2026 · credential intact (variants disagree)</span></td>
+<td class="now">credential intact since 25 Oct 2026</td>
+</tr>
+</tbody></table></div>
+<ul class="legend">
+<li><span class="swatch o-gone"></span>stripped</li>
+<li><span class="swatch o-valid"></span>credential intact</li>
+<li><span class="swatch o-invalid"></span>credential present but invalid</li>
+<li><span class="swatch o-unavailable"></span>served, could not be read</li>
+<li><span class="swatch o-unconfigured"></span>needs config</li>
+<li><span class="swatch o-failed"></span>run failed</li>
+<li><span class="swatch o-unmeasured"></span>not measured</li>
+</ul>
+<h2>Where each adapter stands</h2>
+<table class="summary">
+<thead><tr><th scope="col">platform</th><th scope="col">now</th><th scope="col">since</th><th scope="col">changes</th><th scope="col">runs measured</th></tr></thead><tbody>
+<tr><td><code>discord</code></td><td>credential intact</td><td>25 Oct 2026</td><td>0</td><td>1 of 1</td></tr>
+</tbody></table>
+<h2>The latest run, rendition by rendition</h2>
+<table class="summary">
+<thead><tr><th scope="col">platform</th><th scope="col">variant</th><th scope="col">credential</th><th scope="col">served</th><th scope="col">bytes</th><th scope="col">identical</th></tr></thead><tbody>
+<tr><td>discord</td><td>attachment</td><td>valid</td><td>jpeg</td><td>60633</td><td>yes</td></tr>
+<tr><td>discord</td><td>proxy</td><td>valid</td><td>jpeg</td><td>60633</td><td>yes</td></tr>
+<tr><td>discord</td><td>proxy_webp</td><td>absent</td><td>webp</td><td>6050</td><td>no</td></tr>
+</tbody></table>
+<p class="caveats">
+The signing certificate is a throwaway test anchor created by the lab. &ldquo;Credential intact&rdquo; means the signature verifies against that anchor and the hash still binds the image; it says nothing about a public trust list. &ldquo;Stripped&rdquo; is the ordinary result and the one the lab exists to measure. A grey cell means that adapter was skipped — usually no secret is configured — not that it passed.
+</p>
+<footer>
+Built from 1 recorded run · <a href="history.json">history.json</a>
+</footer>
+</main>
+</body>
+</html>
