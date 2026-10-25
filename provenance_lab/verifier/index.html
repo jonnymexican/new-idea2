@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify a content credential</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">provenance lab</p>
+    <h1>Verify a content credential</h1>
+    <p class="lede">
+      Drop an image here to read it the way a browser can: is there a manifest,
+      is its signature intact, and does the file claim it was AI-generated?
+      Nothing is uploaded — the bytes are checked in this tab.
+    </p>
+  </header>
+
+  <section class="drop" id="drop">
+    <input id="file" type="file" accept="image/*" multiple hidden>
+    <p><strong>Drop images here</strong> or <button type="button" id="pick">choose files</button></p>
+    <p class="hint">Drop an original and the rendition a platform served back to compare the two.</p>
+    <p class="hint" id="loading" hidden>Loading the verifier (about 9 MB of WebAssembly)…</p>
+  </section>
+
+  <section id="samples" hidden>
+    <h2>Renditions this lab downloaded</h2>
+    <p class="hint">
+      Served from the run directory you pointed <code>verifier.py</code> at, so you
+      can check what each platform actually gave back.
+    </p>
+    <div id="sample-list" class="chips"></div>
+  </section>
+
+  <section id="results" aria-live="polite"></section>
+
+  <footer>
+    <p>
+      <strong>Trust.</strong> <em>Trusted</em> means the signing certificate
+      chains to a trust list this page was given. It has none, so the lab's
+      self-issued test certificate reads <em>Valid</em> with a
+      <code>signingCredential.untrusted</code> finding — the signature and the
+      hash are still checked for real.
+    </p>
+    <p>
+      The verifier is <a href="https://github.com/contentauth/c2pa-js">c2pa-web</a>
+      0.15.4, loaded from a pinned CDN URL, so this page needs a network
+      connection the first time and nothing else.
+    </p>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

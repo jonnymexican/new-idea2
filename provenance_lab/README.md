@@ -46,7 +46,7 @@ cd provenance_lab
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 
-.venv/bin/python -m unittest -v          # 140 tests
+.venv/bin/python -m unittest -v          # 151 tests
 .venv/bin/python lab.py run --out out/full
 ```
 
@@ -385,6 +385,38 @@ as a path segment and a Telegram file URL carries one after `bot<id>:`, so the
 page keeps only the class of failure (`HTTP 401`, `network error`) instead of
 trying to scrub arbitrary credentials out of free text.
 
+### Reading a rendition the way a browser does
+
+```bash
+.venv/bin/python verifier.py --out out/photo-discord
+```
+
+`platforms.py` inspects the bytes it downloaded with c2pa-python. This serves
+`verifier/`, a static page that runs the Content Authenticity Initiative's own
+browser SDK, and lists every `served/` rendition under the run directories you
+give it, so a rendition can be read the way a viewer application would read it
+rather than through this repo's verifier.
+
+Four renditions from the local arm, as the browser reports them:
+
+| rendition | what a client sees |
+|---|---|
+| `copy` | `Valid`, `signingCredential.untrusted`, claims `trainedAlgorithmicMedia` |
+| `segments` | **`Invalid`** — `assertion.dataHash.mismatch`, though the manifest still parses |
+| `strip` | no credential |
+| `webp` | no credential |
+
+The `segments` row is the argument for verifying rather than sniffing: a
+checker that asks only "is there a manifest?" finds one here. The page is also
+honest about whose decision trust is — `Trusted` needs a trust list, this page
+has none, so the lab's self-issued certificate reads Valid with an `untrusted`
+finding.
+
+The verifier itself, about 9 MB of WebAssembly, comes from a pinned CDN URL on
+first use. That is the opposite trade from the trend page, which loads nothing
+from anywhere; the difference is that this page is answering a client's
+question, and a client has the SDK.
+
 ## What this does not prove
 
 - The signing CA is generated locally, so `trusted` means trusted against that
@@ -416,10 +448,17 @@ trying to scrub arbitrary credentials out of free text.
   full upload → fetch → verify path against the local harness
 - `pages.py` — the published trend page: outcome reduction, run history, HTML
   rendering, and the branch publish (stdlib only)
-- `test_pages.py` — 38 tests: outcome classification and precedence, credential
+- `test_pages.py` — 40 tests: outcome classification and precedence, credential
   scrubbing of error text, history ordering and idempotence, HTML escaping,
   streak reporting, build idempotence, and publish against a throwaway bare
-  repository
+  repository, including a fresh build directory keeping the published columns
+- `verifier.py` — serves the browser verifier and the renditions a run's
+  `served/` directory already holds (stdlib only)
+- `verifier/` — the page itself: `c2pa-web` 0.15.4 from a pinned CDN URL, no
+  build step, no framework
+- `test_verifier.py` — 11 tests: rendition discovery and labels, run ordering,
+  single-file roots, duplicate run names, and the sample routes, including the
+  traversal attempts that must 404
 - `demo.py` — one command from the local arm to a served page (stdlib only
   itself; the arm it calls needs the signing stack)
 - `test_demo.py` — 2 tests: the arm → report → page path end to end, and one

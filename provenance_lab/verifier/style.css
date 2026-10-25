@@ -1,0 +1,65 @@
+/* The trend page's palette, so the two halves of the lab look like one thing. */
+:root{
+  color-scheme: light dark;
+  --bg:#fbfbfa; --fg:#18181b; --muted:#5f6368; --line:#e4e4e7;
+  --card:#ffffff; --accent:#b4690e; --good:#2f6f6a; --bad:#a3282d;
+  --valid:#b4690e; --trusted:#2f6f6a; --invalid:#a3282d; --absent:#8a8a93;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#121214; --fg:#e8e8ea; --muted:#a1a1aa; --line:#2a2a2f;
+    --card:#18181b; --accent:#e0a04a; --good:#5fb3a8; --bad:#e06c72;
+    --valid:#e0a04a; --trusted:#5fb3a8; --invalid:#e06c72; --absent:#85858e;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:2.5rem 1.25rem 4rem;background:var(--bg);color:var(--fg);
+  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:52rem;margin:0 auto}
+h1{font-size:1.55rem;line-height:1.2;margin:.1rem 0 .6rem;letter-spacing:-.01em}
+h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+  margin:0 0 .5rem;font-weight:600}
+p{margin:0 0 .75rem}
+.eyebrow{margin:0 0 .35rem;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted)}
+.lede{color:var(--muted);max-width:44rem}
+.hint{color:var(--muted);font-size:.82rem}
+code{font-size:.88em}
+button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);
+  border-radius:6px;padding:.15rem .55rem;cursor:pointer}
+button:hover{border-color:var(--muted)}
+
+.drop{margin:1.6rem 0 2rem;padding:1.4rem 1.25rem;border:1.5px dashed var(--line);
+  border-radius:10px;text-align:center;background:var(--card)}
+.drop.over{border-color:var(--accent);background:color-mix(in srgb, var(--accent) 6%, var(--card))}
+.drop p:last-child{margin-bottom:0}
+
+.chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:.6rem 0 0}
+.chip{font-size:.82rem;padding:.25rem .6rem;border:1px solid var(--line);border-radius:999px;
+  background:var(--card);cursor:pointer;color:var(--fg)}
+.chip:hover{border-color:var(--accent)}
+.chip small{color:var(--muted)}
+
+#results{margin-top:1.5rem;display:grid;gap:1rem}
+.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:1rem 1.1rem}
+.card header{display:flex;align-items:baseline;gap:.75rem;flex-wrap:wrap;margin-bottom:.35rem}
+.card h2{font-size:.95rem;text-transform:none;letter-spacing:0;color:var(--fg);margin:0;
+  font-weight:600;word-break:break-all}
+.badge{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;padding:.1rem .45rem;
+  border-radius:4px;color:#fff;background:var(--absent)}
+.badge.trusted{background:var(--trusted)} .badge.valid{background:var(--valid)}
+.badge.invalid{background:var(--invalid)}
+.meta{color:var(--muted);font-size:.82rem;margin-bottom:.6rem}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:.2rem .9rem;margin:.6rem 0 0;
+  font-size:.86rem}
+dt{color:var(--muted)}
+dd{margin:0;word-break:break-word}
+.findings{list-style:none;padding:0;margin:.7rem 0 0;display:grid;gap:.3rem;font-size:.84rem}
+.findings li{padding-left:1rem;position:relative;color:var(--bad)}
+.findings li.good{color:var(--good)}
+.findings li::before{content:"•";position:absolute;left:.2rem}
+.ai{margin-top:.7rem;font-size:.86rem;padding:.5rem .65rem;border-radius:6px;
+  border:1px solid var(--line);background:color-mix(in srgb, var(--accent) 8%, var(--card))}
+footer{margin-top:3rem;padding-top:1.2rem;border-top:1px solid var(--line);
+  color:var(--muted);font-size:.82rem}
+footer p{max-width:46rem}
