@@ -2,8 +2,8 @@
   "version": 1,
   "runs": [
     {
-      "id": "40163439540",
-      "generated": "2026-10-25T04:52:18+00:00",
+      "id": "40163799571",
+      "generated": "2026-10-25T04:58:22+00:00",
       "platforms": {
         "discord": {
           "variants": [
@@ -11,14 +11,14 @@
               "name": "attachment",
               "verdict": "valid",
               "format": "jpeg",
-              "bytes": 60633,
+              "bytes": 60634,
               "identical": true
             },
             {
               "name": "proxy",
               "verdict": "valid",
               "format": "jpeg",
-              "bytes": 60633,
+              "bytes": 60634,
               "identical": true
             },
             {
@@ -33,9 +33,9 @@
           "mixed": true
         }
       },
-      "run_url": "https://github.com/jonnymexican/new-idea2/actions/runs/40163439540",
+      "run_url": "https://github.com/jonnymexican/new-idea2/actions/runs/40163799571",
       "fixture": "960x640",
-      "signed_bytes": 60633
+      "signed_bytes": 60634
     }
   ]
 }
