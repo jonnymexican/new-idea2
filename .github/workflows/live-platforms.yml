@@ -17,11 +17,13 @@ on:
         default: "discord,telegram,mastodon,bluesky,facebook"
         type: string
 
-# contents: write keeps the page's memory on a branch. Nothing else here needs
-# more than read: the page is read from that branch rather than served by a
-# Pages deployment, which a private repository on a personal plan cannot have.
+# contents: write keeps the page's memory on a branch; pages and id-token are
+# what actions/deploy-pages needs to publish. Nothing else here needs more than
+# read.
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
   # A manual run started during the scheduled one would upload the same fixture
@@ -34,6 +36,9 @@ jobs:
   measure:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     env:
       # Every one of these is optional. An unset secret expands to an empty
@@ -88,12 +93,11 @@ jobs:
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Keep this run in the page's history
-        # The branch is both the page's memory and where it is read from: there
-        # is no deployment after this step, because a private repository on a
-        # personal plan cannot publish Pages at all. A branch Pages source would
-        # not serve it either — a push made with GITHUB_TOKEN does not trigger a
-        # branch build (GitHub documents this) — so the rendered page on the
-        # branch is the record, not a website.
+        # The branch is the page's memory, not its publishing source: a push
+        # made with GITHUB_TOKEN does not trigger a branch Pages build (GitHub
+        # documents this), so publishing is deploy-pages below. Writing the
+        # branch first means a deployment that fails still leaves the run
+        # recorded for the next one.
         # Gated on the build rather than on the job: a failed build must leave
         # the previous page alone instead of publishing half of one. The push
         # URL carries the workflow token, which git would otherwise print in
@@ -106,6 +110,17 @@ jobs:
             --branch platform-history \
             --message "platform report ${{ github.run_id }}" \
             --push-url "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+      - name: Stage the page
+        if: always() && steps.history.outcome == 'success'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: provenance_lab/out/site
+
+      - name: Deploy the page
+        id: deployment
+        if: always() && steps.history.outcome == 'success'
+        uses: actions/deploy-pages@v5
 
       - name: Upload the report
         # Even when --strict failed the job, the rows from the adapters that did

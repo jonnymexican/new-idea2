@@ -356,18 +356,17 @@ can be rebuilt from the history without the signing stack installed.
 `publish` clones the branch and commits onto it rather than force-pushing, so
 the branch keeps its history and a hand edit there is not discarded.
 
-Remembering and publishing are the same mechanism here: `pages.py publish`
-commits the rendered page and its `history.json` onto `platform-history`, so the
-newest column is readable on that branch without any deployment. A pair of
-`actions/deploy-pages` steps used to follow it, and were removed because Pages
-refuses this repository — `POST /pages` answers `422 Your current plan does not
-support GitHub Pages for this repository`, since it is private and a personal
-account can only publish Pages from a public one. The job had been failing at
-that last step every week. A branch as the Pages source would not work either:
-GitHub documents that a push made by a workflow with `GITHUB_TOKEN` does not
-trigger a branch build, so the branch would fill with history that is never
-served. Serving the page as a website therefore needs GitHub Pro, a public
-repository, or another host — and then the deploy steps can come back.
+Publishing and remembering are two different mechanisms, on purpose. Publishing
+is `actions/deploy-pages` and needs one setting: **Settings → Pages → Source:
+GitHub Actions** — and a public repository, because Pages refuses private ones
+on a personal plan (`422 Your current plan does not support GitHub Pages for
+this repository`), which is why the page waited for the repo to be made public.
+Remembering is the `platform-history` branch, which the workflow writes *before*
+deploying so a failed deployment still leaves the run recorded. A branch Pages
+source would not work here: GitHub documents that commits pushed by a workflow
+using `GITHUB_TOKEN` do not trigger a branch build, so the branch would fill
+with history that is never served. The branch also holds the rendered page,
+which is readable in the repository without a deployment.
 
 Four verdicts collapse to one colour per platform: `valid` if any rendition kept
 a verifiable credential — the noteworthy result, not the normal one — `invalid`
