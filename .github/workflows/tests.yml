@@ -65,8 +65,28 @@ jobs:
       # The disk module, with the SDK faked: `.env` parsing and precedence, a
       # refusal that names the missing credential before any network call, and
       # the key/region/id wiring. No account and no network are involved.
+      #
+      # Driven from a wrapper instead of `python -m unittest`, because that
+      # command cannot tell this apart from a pass: the module skips itself when
+      # the SDK will not import, and a skip exits 0. A green step that ran
+      # nothing is the failure this checks for — it already happened once, when
+      # the Install step above resolved against an index that has no archil.
+      # Every skip here is a failure, not just the SDK one: a future
+      # skipUnless would otherwise reopen the same hole.
       - name: Disk store
-        run: python -m unittest test_archil_store -v
+        run: |
+          python - <<'PY'
+          import sys
+          import unittest
+
+          suite = unittest.defaultTestLoader.loadTestsFromName("test_archil_store")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if result.skipped:
+              names = ", ".join(test.id() for test, _ in result.skipped)
+              print(f"::error::{len(result.skipped)} skipped, so this suite did not "
+                    f"run: {names}", file=sys.stderr)
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
 
       - name: WiFi radar
         run: python -m unittest wifi_radar.test_radar -v
