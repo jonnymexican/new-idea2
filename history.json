@@ -164,6 +164,62 @@
       "run_url": "https://github.com/jonnymexican/new-idea2/actions/runs/40179456249",
       "fixture": "960x640",
       "signed_bytes": 60633
+    },
+    {
+      "id": "40323112150",
+      "generated": "2026-10-26T12:31:15+00:00",
+      "platforms": {
+        "telegram": {
+          "outcome": "unconfigured",
+          "reason": "needs config: telegram_bot_token, telegram_chat_id",
+          "variants": []
+        },
+        "mastodon": {
+          "outcome": "unconfigured",
+          "reason": "needs config: mastodon_instance, mastodon_token",
+          "variants": []
+        },
+        "bluesky": {
+          "outcome": "unconfigured",
+          "reason": "needs config: bluesky_handle, bluesky_app_password",
+          "variants": []
+        },
+        "facebook": {
+          "outcome": "unconfigured",
+          "reason": "needs config: facebook_page_id, facebook_token",
+          "variants": []
+        },
+        "discord": {
+          "variants": [
+            {
+              "name": "attachment",
+              "verdict": "valid",
+              "format": "jpeg",
+              "bytes": 60634,
+              "identical": true
+            },
+            {
+              "name": "proxy",
+              "verdict": "valid",
+              "format": "jpeg",
+              "bytes": 60634,
+              "identical": true
+            },
+            {
+              "name": "proxy_webp",
+              "verdict": "absent",
+              "format": "webp",
+              "bytes": 6050,
+              "identical": false
+            }
+          ],
+          "outcome": "valid",
+          "mixed": true
+        }
+      },
+      "run_url": "https://github.com/jonnymexican/new-idea2/actions/runs/40323112150",
+      "fixture": "960x640",
+      "signed_bytes": 60634
     }
   ]
 }
