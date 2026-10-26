@@ -35,6 +35,15 @@ jobs:
           python -m pip install -r requirements.txt \
             --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Install the Archil SDK
+        # Its own file, installed from PyPI: requirements.txt is resolved
+        # against the CPU torch index above, which carries no PyPI packages.
+        # archil_store.py imports the SDK at the top, so the disk tests cannot
+        # even load without this wheel — they never call it.
+        # Quoted: `--only-binary=:all:` is a plain scalar YAML parsers read as
+        # a mapping unless it is in quotes.
+        run: 'python -m pip install --only-binary=:all: -r requirements-archil.txt'
+
       - name: Report the environment
         # When a test fails here and not locally, the versions are the first
         # thing worth reading, so print them before anything that can fail.
@@ -52,6 +61,12 @@ jobs:
       # the API answers rather than crashing on a malformed body.
       - name: Attention viewer
         run: python -m unittest test_peek -v
+
+      # The disk module, with the SDK faked: `.env` parsing and precedence, a
+      # refusal that names the missing credential before any network call, and
+      # the key/region/id wiring. No account and no network are involved.
+      - name: Disk store
+        run: python -m unittest test_archil_store -v
 
       - name: WiFi radar
         run: python -m unittest wifi_radar.test_radar -v

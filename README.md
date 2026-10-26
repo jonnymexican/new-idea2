@@ -40,6 +40,7 @@ measuring it, and looking inside it. Each of the others has its own README.
 | [`test_peek.py`](test_peek.py) | The viewer's tests: capture is inert, attention stays causal, the API's shape |
 | [`archil_store.py`](archil_store.py) | A disk that outlives a run: the Archil SDK, configured from `ARCHIL_API_KEY` / `ARCHIL_REGION` / `ARCHIL_DISK_ID` |
 | [`archil_check.py`](archil_check.py) | Proves it: writes a line in one exec on the disk and reads it back in a second, separate one |
+| [`test_archil_store.py`](test_archil_store.py) | The store offline: `.env` parsing and precedence, the no-key refusal, the SDK wiring, all against a fake SDK |
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
 | `runs/` | Generated output: metrics, checkpoint, sample, loss curve (not committed) |
@@ -562,6 +563,7 @@ step, and the checkpoint never leaves the machine.
 .venv/bin/python test_all.py            # the whole suite, about 90 seconds
 .venv/bin/python test_all.py TestBPE    # just one class
 .venv/bin/python -m unittest test_peek  # the attention viewer
+.venv/bin/python -m unittest test_archil_store  # the disk store, no key and no network
 ```
 
 The suite runs on the standard library alone — no pytest — and covers the
