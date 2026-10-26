@@ -1,5 +1,14 @@
 name: tests
 
+# Every job pins the image its green builds have been running on, rather than
+# `ubuntu-latest`. The `-latest` label follows GitHub's own migration schedule:
+# when it moves to a new Ubuntu release the toolchain under this workflow
+# changes without a commit, and a red build then has to be bisected against
+# something that left no trace in the repository. Pinning makes the upgrade a
+# decision — a commit that can be read and reverted — and the day 24.04 is
+# retired the job fails naming the label instead of quietly running somewhere
+# new. Move all five jobs together when it is time.
+
 on:
   push:
   pull_request:
@@ -14,7 +23,7 @@ concurrency:
 
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -111,7 +120,7 @@ jobs:
         run: python ci_tests.py wifi_radar.test_radar
 
   firmware:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
@@ -146,7 +155,7 @@ jobs:
     # Standard library only and every fixture is a string in the test file, so
     # this job needs no install step and no network. It ran nowhere before: the
     # board's own tests were green locally and unrun on every push.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -162,7 +171,7 @@ jobs:
         run: python ci_tests.py mediatop.test_mediatop
 
   provenance-lab:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
@@ -209,7 +218,7 @@ jobs:
     # "printing" when `S,` lines arrive — is enforced against the real port
     # code rather than a fake object. It has already caught one crash that the
     # unit tests could not: a driver that refuses the DTR ioctl.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
