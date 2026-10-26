@@ -29,6 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The pin above says which image was asked for; this says which one
+      # arrived, in every job. It goes out as a notice rather than a log line
+      # because the log needs admin rights to download and the run summary does
+      # not — so "did the image actually change?" is answerable from the API.
+      - name: Report the runner image
+        # Sourced, not substituted: if the file is missing the step fails here
+        # rather than printing an empty notice that reads like a pass.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
+
       - uses: actions/setup-python@v7
         with:
           # The interpreter the checkpoint was trained and served under.
@@ -126,6 +137,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Report the runner image
+        # Sourced, not substituted: if the file is missing the step fails here
+        # rather than printing an empty notice that reads like a pass.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
+
       # The sketch is the only part of the project a test cannot exercise: it
       # needs a compiler and a board. The compiler is ordinary software, so it
       # is worth pinning that the firmware at least builds for the chip it
@@ -161,6 +179,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Report the runner image
+        # Sourced, not substituted: if the file is missing the step fails here
+        # rather than printing an empty notice that reads like a pass.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
+
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -176,6 +201,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Report the runner image
+        # Sourced, not substituted: if the file is missing the step fails here
+        # rather than printing an empty notice that reads like a pass.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
 
       - uses: actions/setup-python@v7
         with:
@@ -223,6 +255,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Report the runner image
+        # Sourced, not substituted: if the file is missing the step fails here
+        # rather than printing an empty notice that reads like a pass.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
 
       - uses: actions/setup-python@v7
         with:
