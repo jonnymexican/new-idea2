@@ -85,10 +85,26 @@ jobs:
       # with the guard above a skip there would fail the job — correctly, but
       # about the image rather than the code, which is a worse thing to learn
       # from a red build.
+      #
+      # Install first and refresh the index only if that fails. The image ships
+      # the apt lists it was built with, so the install alone normally resolves
+      # and takes seconds; a refresh is most of a minute on this runner. When
+      # the lists are too stale to resolve the package the install fails at
+      # once, and the fallback below then does exactly what a plain
+      # `apt-get update && apt-get install` would — a fast path with the slow,
+      # always-correct one behind it, rather than a bet on the image's cache.
+      # Which path ran is a notice on the run, so the next person can tell a
+      # fast step from a stale-index one without downloading the log.
       - name: Install a speech engine
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends espeak-ng
+          export DEBIAN_FRONTEND=noninteractive
+          if sudo -E apt-get install -y -q --no-install-recommends espeak-ng; then
+            echo "::notice::espeak-ng installed from the image's own apt lists"
+          else
+            echo "::notice::the image's apt lists did not resolve espeak-ng; refreshed them"
+            sudo -E apt-get update -q
+            sudo -E apt-get install -y -q --no-install-recommends espeak-ng
+          fi
           espeak-ng --version
 
       - name: WiFi radar
