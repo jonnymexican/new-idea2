@@ -53,43 +53,46 @@ jobs:
 
       # One step per project rather than one command: a failure then names the
       # project it came from without opening the log.
+      #
+      # Every step below runs through ci_tests.py rather than `python -m
+      # unittest`, which cannot tell a pass from a skip: a suite that skips
+      # itself exits 0, so a step that ran nothing is green. It fails on any
+      # skip, and on a suite that ran no tests at all. The log is not where a
+      # reader of a red run looks first, and it needs admin rights to download;
+      # the annotation the runner prints does not.
       - name: Training, tokeniser and web server
-        run: python -m unittest test_all -v
+        run: python ci_tests.py test_all
 
       # The attention viewer's own guarantees: that capturing weights does not
       # change the logits, that the published matrix is still causal, and that
       # the API answers rather than crashing on a malformed body.
       - name: Attention viewer
-        run: python -m unittest test_peek -v
+        run: python ci_tests.py test_peek
 
       # The disk module, with the SDK faked: `.env` parsing and precedence, a
       # refusal that names the missing credential before any network call, and
       # the key/region/id wiring. No account and no network are involved.
       #
-      # Driven from a wrapper instead of `python -m unittest`, because that
-      # command cannot tell this apart from a pass: the module skips itself when
-      # the SDK will not import, and a skip exits 0. A green step that ran
-      # nothing is the failure this checks for — it already happened once, when
-      # the Install step above resolved against an index that has no archil.
-      # Every skip here is a failure, not just the SDK one: a future
-      # skipUnless would otherwise reopen the same hole.
+      # This is also the step that first needed the skip guard: the module skips
+      # itself when the SDK will not import, so it was green through a run in
+      # which the Install step above resolved against an index with no archil in
+      # it. It is the step to look at when wondering what the guard is for.
       - name: Disk store
-        run: |
-          python - <<'PY'
-          import sys
-          import unittest
+        run: python ci_tests.py test_archil_store
 
-          suite = unittest.defaultTestLoader.loadTestsFromName("test_archil_store")
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
-          if result.skipped:
-              names = ", ".join(test.id() for test, _ in result.skipped)
-              print(f"::error::{len(result.skipped)} skipped, so this suite did not "
-                    f"run: {names}", file=sys.stderr)
-          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)
-          PY
+      # A speech engine, so the cue test can ask a real one for its command
+      # line rather than skipping. The runner image has none installed, and
+      # with the guard above a skip there would fail the job — correctly, but
+      # about the image rather than the code, which is a worse thing to learn
+      # from a red build.
+      - name: Install a speech engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends espeak-ng
+          espeak-ng --version
 
       - name: WiFi radar
-        run: python -m unittest wifi_radar.test_radar -v
+        run: python ci_tests.py wifi_radar.test_radar
 
   firmware:
     runs-on: ubuntu-latest
@@ -137,8 +140,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Through the runner like the job above, so every job answers the same
+      # way: a skip fails, and a green step is one whose tests ran.
       - name: The board, its scoring and its digest
-        run: python -m unittest mediatop.test_mediatop -v
+        run: python ci_tests.py mediatop.test_mediatop
 
   provenance-lab:
     runs-on: ubuntu-latest
@@ -174,9 +179,13 @@ jobs:
 
       # The suite signs with a generated test CA and serves the platform arm
       # from a loopback HTTP server, so nothing here reaches the internet.
+      # Discovery rather than a list of modules, so a new test file in the lab
+      # is covered the moment it is committed. The runner is one level up
+      # because the lab is the working directory; it reads the suites from
+      # there, which is what `python -m unittest` did.
       - name: C2PA provenance lab
         working-directory: provenance_lab
-        run: python -m unittest -v
+        run: python ../ci_tests.py --discover .
 
   doctor:
     # The radar's one hardware-facing command, pinned without hardware: a pty
