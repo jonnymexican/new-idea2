@@ -2,10 +2,24 @@
 # run is small enough that CPU inference is comfortably fast.
 #
 # Install with:
-#   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   uv pip install --python .venv/bin/python -r requirements.txt \
+#     --index-url https://download.pytorch.org/whl/cpu
 #
 torch>=2.14
 
+# torch's NumPy interop is decided at import and stays off when numpy is absent.
+# `torch.from_numpy` then raises at the call site instead of here, and the only
+# warning is a "Failed to initialize NumPy" line at import that reads like
+# noise. Nothing in this repo imports numpy today, so a missing one is invisible
+# until the first ad-hoc conversion -- which is how a rebuilt venv ended up with
+# a torch that could not do this. Listed explicitly rather than left to arrive
+# as a dependency: the CPU index's torch wheel does not declare it. The index
+# does mirror numpy's own wheels, so the install above carries it too.
+numpy>=2.5
+
 # Archil's client is pinned in requirements-archil.txt, not here: this file is
-# installed against the CPU torch index, which carries no PyPI packages, so a
-# PyPI-only dependency in it fails the install (as CI found).
+# installed against the CPU torch index, which mirrors torch's own dependency
+# set (numpy, requests) but not everything on PyPI -- archil's path there
+# answers 403, and a package the index does not carry fails the whole install,
+# which is what CI found. The tests workflow installs that file from PyPI,
+# separately.
