@@ -30,11 +30,19 @@ concurrency:
 
 jobs:
   board:
-    runs-on: ubuntu-latest
+    # Pinned for the reason tests.yml records: `ubuntu-latest` moves from 24.04
+    # to 26.04 across October-November 2026, so the same check could run against
+    # a different image on two consecutive mornings.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Report the runner image
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
 
       - uses: actions/setup-python@v7
         with:

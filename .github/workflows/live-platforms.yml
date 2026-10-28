@@ -34,7 +34,12 @@ concurrency:
 
 jobs:
   measure:
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`, for the reason tests.yml records: the
+    # latest label moves from 24.04 to 26.04 across October-November 2026, so
+    # two runs of the same code can land on different images. This job publishes
+    # the public page, where a changed transcode would read as a platform
+    # changing its behaviour.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:
       name: github-pages
@@ -57,6 +62,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      # The image that arrived, not the label that was asked for: a published
+      # week is only comparable with the last one if this line matches.
+      - name: Report the runner image
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
 
       - uses: actions/setup-python@v7
         with:
