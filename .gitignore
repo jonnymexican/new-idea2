@@ -22,6 +22,10 @@ runs/
 runs_*/
 *.pid
 
+# Trial output: wifi radar captures and lab runs, written where --out points.
+# Regenerate by re-running the trial; the captures are megabytes of jsonl.
+out/
+
 # mediatop digests (regenerate with `python -m mediatop.server --save`)
 mediatop-*.md
 
