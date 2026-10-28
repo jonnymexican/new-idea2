@@ -20,6 +20,10 @@ h1{font-size:1.55rem;line-height:1.2;margin:.1rem 0 .6rem;letter-spacing:-.01em}
 h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
   margin:0 0 .5rem;font-weight:600}
 p{margin:0 0 .75rem}
+.back{margin:0 0 1.1rem;font-size:.82rem}
+.back a{color:var(--accent);text-decoration:none}
+.back a:hover{text-decoration:underline}
+
 .eyebrow{margin:0 0 .35rem;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
   color:var(--muted)}
 .lede{color:var(--muted);max-width:44rem}

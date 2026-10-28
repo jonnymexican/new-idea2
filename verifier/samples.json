@@ -20,5 +20,9 @@
         }
       ]
     }
-  ]
+  ],
+  "home": {
+    "href": "../",
+    "label": "Platform survival"
+  }
 }

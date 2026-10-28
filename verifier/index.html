@@ -8,6 +8,10 @@
 </head>
 <body>
 <main>
+  <!-- Filled from samples.json: only the published page has a trend page
+       above it, so the local server leaves this hidden. -->
+  <nav class="back" id="home" hidden></nav>
+
   <header>
     <p class="eyebrow">provenance lab</p>
     <h1>Verify a content credential</h1>
@@ -33,7 +37,13 @@
       measurement on the published page.
     </p>
     <div id="sample-list" class="chips"></div>
+    <p class="hint">
+      Each chip has its own address — opening one puts the rendition in the URL,
+      so a single result can be linked to or sent to someone.
+    </p>
   </section>
+
+  <p class="hint" id="notice" hidden></p>
 
   <section id="results" aria-live="polite"></section>
 
