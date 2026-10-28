@@ -79,10 +79,16 @@ The environment is a Python 3.12 virtual environment. It was created with
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python .venv/bin/python -r requirements.txt \
+  --index-url https://download.pytorch.org/whl/cpu
 ```
 
 The CPU build of PyTorch is deliberate — there is no CUDA device on this machine.
+`requirements.txt` is the list rather than the bare name `torch` because the CPU
+wheel does not declare `numpy`, and a torch without it has its array interop
+switched off at import: `torch.from_numpy` then raises at the call site and the
+only symptom is a warning that reads like noise. The index mirrors numpy, so the
+same command brings it, and CI reports the version it got.
 
 ## Train
 

@@ -1,9 +1,11 @@
 # Archil's client, kept out of requirements.txt on purpose.
 #
 # requirements.txt is installed against the CPU torch index
-# (https://download.pytorch.org/whl/cpu), which carries torch and nothing from
-# PyPI -- so a PyPI-only package listed there fails the install, which is
-# exactly what the tests workflow hit. This file is the one installed from PyPI:
+# (https://download.pytorch.org/whl/cpu), which mirrors torch's own dependency
+# set -- numpy, sympy, requests and the rest resolve there, and everything
+# beyond it answers 403, archil included. A package the index does not mirror
+# fails the whole install rather than being skipped, which is exactly what the
+# tests workflow hit. This file is the one installed from PyPI:
 #
 #   uv pip install --python .venv/bin/python --only-binary=:all: -r requirements-archil.txt
 #

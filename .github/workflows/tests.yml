@@ -57,7 +57,10 @@ jobs:
 
       - name: Install the Archil SDK
         # Its own file, installed from PyPI: requirements.txt is resolved
-        # against the CPU torch index above, which carries no PyPI packages.
+        # against the CPU torch index above, which mirrors torch's own
+        # dependency set -- numpy, sympy, requests and the rest -- and 403s
+        # anything outside it, archil among them. So a PyPI package listed in
+        # requirements.txt fails the whole install, which is what this job hit.
         # archil_store.py imports the SDK at the top, so the disk tests cannot
         # even load without this wheel — they never call it.
         # Quoted: `--only-binary=:all:` is a plain scalar YAML parsers read as
