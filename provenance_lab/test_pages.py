@@ -346,6 +346,20 @@ class TestBuild(unittest.TestCase):
         self.assertTrue((self.site / "verifier" / "index.html").is_file())
         self.assertTrue((self.site / "verifier" / "app.js").is_file())
 
+    def test_the_staged_verifier_links_back_to_the_trend_page(self):
+        # The trend page links forward; the verifier page has to lead back, and
+        # to this page's own title rather than a second name for it.
+        report_path = self.write_report(
+            "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
+        )
+        pages.build(report_path, self.site, run_id="1", title="Platform survival")
+        payload = json.loads((self.site / "verifier" / "samples.json").read_text())
+        self.assertEqual(payload["home"], {"href": "../", "label": "Platform survival"})
+
+        pages.build(report_path, self.site, run_id="2", title="What platforms keep")
+        payload = json.loads((self.site / "verifier" / "samples.json").read_text())
+        self.assertEqual(payload["home"]["label"], "What platforms keep")
+
     def test_verifier_roots_put_the_runs_renditions_on_the_staged_page(self):
         report_path = self.write_report(
             "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]

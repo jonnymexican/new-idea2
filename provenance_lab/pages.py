@@ -563,8 +563,11 @@ def build(
     # The site is both pages. Staging the verifier here rather than in a step of
     # its own keeps the link from index.html from pointing at nothing: every
     # build produces it, and `verifier_roots` only decides whether it has
-    # renditions to list alongside the drop zone.
-    verifier.build_site(verifier_roots, site_dir)
+    # renditions to list alongside the drop zone. `home` is the way back, one
+    # directory up, and carries this page's own title so the two agree.
+    verifier.build_site(
+        verifier_roots, site_dir, home={"href": "../", "label": title}
+    )
     return record
 
 

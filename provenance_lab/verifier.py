@@ -117,23 +117,33 @@ def catalogue(roots):
     return [(name, files) for name, files, _ in runs]
 
 
+def _payload(runs, home=None) -> dict:
+    """The catalogue the page reads, from either the server or a build."""
+    payload: dict = {"runs": runs}
+    if home:
+        payload["home"] = dict(home)
+    return payload
+
+
 def listing(roots) -> dict:
-    """What the page sees: names, labels and sizes, but no host file paths."""
-    return {
-        "runs": [
-            {
-                "name": name,
-                "files": [
-                    {"label": label, "url": url, "bytes": path.stat().st_size}
-                    for label, url, path in files
-                ],
-            }
-            for name, files in catalogue(roots)
-        ]
-    }
+    """What the page sees: names, labels and sizes, but no host file paths.
+
+    No ``home``: the server serves the verifier alone, with no trend page above
+    it, and a link back would land on the page the reader is already on.
+    """
+    return _payload([
+        {
+            "name": name,
+            "files": [
+                {"label": label, "url": url, "bytes": path.stat().st_size}
+                for label, url, path in files
+            ],
+        }
+        for name, files in catalogue(roots)
+    ])
 
 
-def build_site(roots, site_dir) -> Path:
+def build_site(roots, site_dir, *, home=None) -> Path:
     """Stage the page and the renditions it lists as ``<site_dir>/verifier``.
 
     This is the published copy: the same three files the local server serves,
@@ -147,7 +157,9 @@ def build_site(roots, site_dir) -> Path:
 
     Every URL written here is relative (``samples/<run>/<file>``), because
     Pages serves the site under a project path; a leading slash would resolve
-    against the host root and 404.
+    against the host root and 404. ``home`` names the trend page, which sits one
+    directory up, so the two pages link to each other rather than one of them
+    being a dead end.
     """
     target = Path(site_dir) / "verifier"
     target.mkdir(parents=True, exist_ok=True)
@@ -167,8 +179,9 @@ def build_site(roots, site_dir) -> Path:
         runs.append({"name": name, "files": entries})
 
     # Same shape the server answers on /samples.json, because the page reads
-    # whichever one it finds without knowing which served it.
-    payload = json.dumps({"runs": runs}, indent=2) + "\n"
+    # whichever one it finds without knowing which served it -- plus `home`,
+    # which only a build knows: the local server has no trend page to link to.
+    payload = json.dumps(_payload(runs, home=home), indent=2) + "\n"
     (target / "samples.json").write_text(payload, encoding="utf-8")
     return target
 

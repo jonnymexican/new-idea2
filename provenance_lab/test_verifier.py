@@ -54,10 +54,15 @@ class ServeCase(unittest.TestCase):
 class TestStaticBuild(ServeCase):
     """The published copy: same files, plus a catalogue and its bytes."""
 
-    def build(self, roots=None):
+    HOME = {"href": "../", "label": "Platform survival"}
+
+    def build(self, roots=None, home=None):
         return verifier.build_site(
-            roots if roots is not None else [self.root], self.root / "site"
+            roots if roots is not None else [self.root], self.root / "site", home=home
         )
+
+    def catalogue(self, target):
+        return json.loads((target / "samples.json").read_text(encoding="utf-8"))
 
     def test_the_page_its_bytes_and_a_catalogue_are_staged_as_one_directory(self):
         self.make_run(name="discord__attachment.jpeg", data=b"\xff\xd8JPEG")
@@ -90,6 +95,34 @@ class TestStaticBuild(ServeCase):
         self.assertTrue((target / "index.html").is_file())
         payload = json.loads((target / "samples.json").read_text(encoding="utf-8"))
         self.assertEqual(payload, {"runs": []})
+
+    def test_the_published_page_names_the_trend_page_it_belongs_to(self):
+        # The two pages are one site, so neither is a dead end: a build that
+        # knows the trend page stages the way back to it, one directory up.
+        self.make_run(name="discord__attachment.jpeg")
+        payload = self.catalogue(self.build(home=self.HOME))
+        self.assertEqual(payload["home"], self.HOME)
+
+    def test_the_local_server_does_not_offer_a_link_to_itself(self):
+        # `verifier.py` serves this page alone, with no trend page above it, so
+        # `../` would land on the page you are already reading.
+        self.make_run(name="discord__attachment.jpeg")
+        self.assertNotIn("home", self.catalogue(self.build()))
+        status, _, body = self.get(self.start([self.root]) + "/samples.json")
+        self.assertEqual(status, 200)
+        self.assertNotIn("home", json.loads(body))
+
+    def test_every_rendition_has_its_own_address(self):
+        # A chip opens by naming its URL in the fragment, so two renditions
+        # sharing one URL would make a link open whichever came first. Two
+        # roots can each hold a run called `live`; their names must differ.
+        for root in (self.root / "a", self.root / "b"):
+            (root / "live" / "served").mkdir(parents=True)
+            (root / "live" / "served" / "local__copy.jpeg").write_bytes(b"JPEG")
+        payload = self.catalogue(self.build([self.root / "a", self.root / "b"]))
+        urls = [entry["url"] for run in payload["runs"] for entry in run["files"]]
+        self.assertEqual(len(urls), len(set(urls)))
+        self.assertEqual(len(urls), 2)
 
     def test_rebuilding_replaces_the_catalogue_instead_of_appending(self):
         self.make_run(run="live", name="discord__attachment.jpeg")

@@ -20,6 +20,8 @@ const els = {
   loading: document.getElementById("loading"),
   samples: document.getElementById("samples"),
   sampleList: document.getElementById("sample-list"),
+  notice: document.getElementById("notice"),
+  home: document.getElementById("home"),
   results: document.getElementById("results"),
 };
 
@@ -88,7 +90,13 @@ function escapeHtml(text) {
   }[ch]));
 }
 
-function card(name, blob, outcome) {
+// A card names the rendition it came from, so following the same link twice
+// replaces the card instead of stacking a second copy of it.
+function keyed(key) {
+  return key ? ` data-sample="${escapeHtml(key)}"` : "";
+}
+
+function card(name, blob, outcome, key) {
   const head = `
     <header>
       <h2>${escapeHtml(name)}</h2>
@@ -97,7 +105,7 @@ function card(name, blob, outcome) {
     <p class="meta">${bytes(blob.size)} · ${escapeHtml(blob.type || "unknown type")}</p>`;
 
   if (!outcome.present) {
-    return `<article class="card">${head}
+    return `<article class="card"${keyed(key)}>${head}
       <p>This file carries no content credential. Either it never had one, or
       the service that served it re-encoded the image and left the manifest
       behind — which is the failure this lab measures.</p>
@@ -133,25 +141,29 @@ function card(name, blob, outcome) {
           .join(", ")} on a stated action.</p>`
     : "";
 
-  return `<article class="card">${head}
+  return `<article class="card"${keyed(key)}>${head}
     ${aiNote}
     <dl>${rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("")}</dl>
     <ul class="findings">${findings}</ul>
   </article>`;
 }
 
-async function show(name, blob) {
+async function show(name, blob, key) {
+  const previous = key && document.querySelector(`[data-sample="${CSS.escape(key)}"]`);
+  if (previous) previous.remove();
+
   const placeholder = document.createElement("article");
   placeholder.className = "card";
+  if (key) placeholder.dataset.sample = key;
   placeholder.innerHTML = `<header><h2>${escapeHtml(name)}</h2></header>
     <p class="meta">reading ${bytes(blob.size)}…</p>`;
   els.results.prepend(placeholder);
 
   try {
     const outcome = await inspect(blob, blob.type);
-    placeholder.outerHTML = card(name, blob, outcome);
+    placeholder.outerHTML = card(name, blob, outcome, key);
   } catch (error) {
-    placeholder.outerHTML = `<article class="card">
+    placeholder.outerHTML = `<article class="card"${keyed(key)}>
       <header><h2>${escapeHtml(name)}</h2><span class="badge invalid">error</span></header>
       <ul class="findings"><li>${escapeHtml(error?.message || String(error))}</li></ul>
     </article>`;
@@ -188,6 +200,66 @@ function wireDrop() {
   });
 }
 
+// --- the catalogue, and the address that names one of its files -------------
+
+let samples = [];
+
+function backTo(home) {
+  // Only the published page has a trend page above it. The local server serves
+  // this page alone, so it sends no `home` and the link stays hidden rather
+  // than pointing at the page you are already on.
+  if (!home?.href) return;
+  els.home.innerHTML =
+    `← <a href="${escapeHtml(home.href)}">${escapeHtml(home.label || "the trend page")}</a>`;
+  els.home.hidden = false;
+}
+
+function say(text) {
+  els.notice.hidden = !text;
+  els.notice.textContent = text || "";
+}
+
+function decodeHash() {
+  // The fragment is a rendition's catalogue URL. A browser percent-encodes
+  // what goes into a hash -- a duplicate run is `live (2)` -- so decode before
+  // comparing, or the link would not match its own chip.
+  try {
+    return decodeURIComponent(location.hash.slice(1));
+  } catch {
+    return location.hash.slice(1);
+  }
+}
+
+function linkedSample() {
+  const wanted = decodeHash();
+  return wanted ? samples.find((file) => file.url === wanted) || null : null;
+}
+
+function open(file) {
+  // Setting the fragment is what opens it: `hashchange` does the work, so the
+  // address bar always names what is on screen and the URL is worth sending.
+  if (decodeHash() === file.url) openSample(file);
+  else location.hash = file.url;
+}
+
+async function openSample(file) {
+  say("");
+  try {
+    const reply = await fetch(file.url);
+    if (!reply.ok) throw new Error(`HTTP ${reply.status}`);
+    await show(`${file.run} · ${file.label}`, await reply.blob(), file.url);
+  } catch (error) {
+    say(`could not read ${file.label}: ${error?.message || error}`);
+  }
+}
+
+async function followHash() {
+  const file = linkedSample();
+  if (file) return openSample(file);
+  const wanted = decodeHash();
+  say(wanted ? `this page has no rendition at “${wanted}”` : "");
+}
+
 async function loadSamples() {
   let payload;
   try {
@@ -198,24 +270,24 @@ async function loadSamples() {
     return; // Served by a plain static server: there is nothing to list.
   }
 
-  const files = (payload.runs ?? []).flatMap((run) =>
+  backTo(payload.home);
+
+  samples = (payload.runs ?? []).flatMap((run) =>
     (run.files ?? []).map((file) => ({ ...file, run: run.name })));
-  if (!files.length) return;
+  if (!samples.length) return;
 
   els.samples.hidden = false;
-  for (const file of files) {
+  for (const file of samples) {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "chip";
     chip.innerHTML = `${escapeHtml(file.label)} <small>${escapeHtml(file.run)}</small>`;
-    chip.addEventListener("click", async () => {
-      const reply = await fetch(file.url);
-      const blob = await reply.blob();
-      show(`${file.run} · ${file.label}`, blob);
-    });
+    chip.addEventListener("click", () => open(file));
     els.sampleList.append(chip);
   }
 }
 
 wireDrop();
-loadSamples();
+loadSamples().then(followHash);
+// A shared link arrives as a fragment, and so does Back: both land here.
+window.addEventListener("hashchange", followHash);

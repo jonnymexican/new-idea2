@@ -437,6 +437,20 @@ personal photo are never part of a build, and the page would have nothing of
 theirs to show anyway. Every URL written into the site is relative, because
 Pages serves it from `/<repo>/` rather than a host root.
 
+The two pages link to each other. The trend page's paragraph points forward;
+`pages.py` writes this page's title into `samples.json` as `home` and the
+verifier renders the way back from it. That is data rather than markup because
+only the published site has a trend page above it — `verifier.py` serves this
+page alone, sends no `home`, and the link stays hidden instead of pointing at
+the page you are already reading.
+
+Each chip is also an address. Opening a rendition puts its catalogue URL in the
+fragment — `#samples/live/discord__attachment.jpeg` — so one verdict can be sent
+to someone and is already open when they follow it, and a link to a name the
+catalogue does not have says so rather than doing nothing. A second chip
+replaces the card for the file it opens, so clicking around does not pile up
+copies of the same verdict.
+
 ## What this does not prove
 
 - The signing CA is generated locally, so `trusted` means trusted against that
@@ -469,19 +483,21 @@ Pages serves it from `/<repo>/` rather than a host root.
 - `pages.py` — the published trend page: outcome reduction, run history, HTML
   rendering, staging the verifier beside it, and the branch publish (stdlib
   only)
-- `test_pages.py` — 43 tests: outcome classification and precedence, credential
+- `test_pages.py` — 45 tests: outcome classification and precedence, credential
   scrubbing of error text, history ordering and idempotence, HTML escaping,
-  streak reporting, build idempotence, and publish against a throwaway bare
-  repository, including a fresh build directory keeping the published columns
+  streak reporting, build idempotence, the staged verifier's link back to this
+  page, and publish against a throwaway bare repository, including a fresh
+  build directory keeping the published columns
 - `verifier.py` — serves the browser verifier and the renditions a run's
   `served/` directory already holds, and stages the static copy that ships
   with the trend page (stdlib only)
 - `verifier/` — the page itself: `c2pa-web` 0.15.4 from a pinned CDN URL, no
   build step, no framework
-- `test_verifier.py` — 16 tests: rendition discovery and labels, run ordering,
+- `test_verifier.py` — 19 tests: rendition discovery and labels, run ordering,
   single-file roots, duplicate run names, the sample routes including the
   traversal attempts that must 404, and the static build's catalogue, relative
-  URLs and empty-root behaviour
+  URLs, addressable renditions, the link back to the trend page, and the fact
+  that the local server sends no such link, plus empty-root behaviour
 - `demo.py` — one command from the local arm to a served page (stdlib only
   itself; the arm it calls needs the signing stack)
 - `test_demo.py` — 2 tests: the arm → report → page path end to end, and one
