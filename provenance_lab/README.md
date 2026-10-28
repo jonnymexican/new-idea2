@@ -46,9 +46,14 @@ cd provenance_lab
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 
-.venv/bin/python -m unittest -v          # 151 tests
+.venv/bin/python -m unittest -v          # 164 tests, no network, no account
 .venv/bin/python lab.py run --out out/full
 ```
+
+The lab keeps its own environment on purpose: these pins never have to agree
+with the root `requirements.txt`, and CI gives them their own job for the same
+reason. Running these suites from the root `.venv` fails on `import c2pa`, not
+on anything they assert.
 
 Outputs `out/full/report.md` (readable) and `out/full/report.json` (raw rows),
 plus every generated file under `out/full/assets/`.
