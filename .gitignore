@@ -29,6 +29,12 @@ out/
 # mediatop digests (regenerate with `python -m mediatop.server --save`)
 mediatop-*.md
 
+# The bench map page (regenerate with `python bench_map.py`)
+bench-map.html
+
+# Screenshots taken while reviewing a change; not part of the repo
+screenshots/
+
 # Environment / secrets
 .env
 .env.*

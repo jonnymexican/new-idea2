@@ -18,10 +18,17 @@ asks, and where it stands:
 | **[mediatop](mediatop/README.md)** — the news digest | What is the point of today's news, on one screen, in four genres? | Live — Actions run it daily at 07:00 UTC |
 | **[wifi_radar](wifi_radar/README.md)** — WiFi motion sensing | Can WiFi signal be read as motion, with no special hardware? | Quiet since 23 Oct — its tests still run on every push |
 | **[provenance_lab](provenance_lab/README.md)** — C2PA across platforms | Does a provenance credential survive a real platform? | Parked — the weekly job still measures on Mondays |
-| **[othello](othello/README.md)** — the engine | How strong can a from-scratch Othello player get on one CPU? | New — rules pinned to perft counts, ladder at depth 4 |
+| **[othello](othello/README.md)** — the engine | How strong can a from-scratch Othello player get on one CPU? | Parked 28 Oct — rules pinned to perft counts, ladder at depth 4 |
 
 The rest of this README is the model bench: training it, talking to it,
 measuring it, and looking inside it. Each of the others has its own README.
+
+**Othello is the last bench in this repo.** Five is where the map stops
+answering "what is this?" and starts listing hobbies, so the next experiment
+starts its own repository instead of a sixth folder here. Nothing in
+`othello/` imports the rest of the repo and it needs only the standard library,
+so lifting it out (`git subtree split -P othello`) stays cheap if the theme
+mismatch ever stops being tolerable.
 
 ## What's here
 
@@ -44,6 +51,8 @@ measuring it, and looking inside it. Each of the others has its own README.
 | [`test_archil_store.py`](test_archil_store.py) | The store offline: `.env` parsing and precedence, the no-key refusal, the SDK wiring, all against a fake SDK |
 | [`venv_check.py`](venv_check.py) | Whether a `.venv` here is still an interpreter or only a directory shaped like one — run by the test entrypoints before they start |
 | [`ci_tests.py`](ci_tests.py) | Runs a suite and fails on a skip, so a green CI step means the tests ran — the workflow runs every suite through it |
+| [`bench_map.py`](bench_map.py) | The benches table as one page: a tile per bench, coloured by whether it is alive, built from `README.md` so the two cannot disagree |
+| [`test_bench_map.py`](test_bench_map.py) | The page's tests: table and tiles agree, counted tests match the folder, a CI claim names a job that exists, cells are escaped |
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
 | `runs/` | Generated output: metrics, checkpoint, sample, loss curve (not committed) |

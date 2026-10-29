@@ -121,6 +121,13 @@ jobs:
       - name: Environment check
         run: python ci_tests.py test_venv_check
 
+      # The map page is generated from the README table and from this workflow
+      # file, so this is the step that notices when either has moved on: a
+      # bench with no tile, a tile with no bench, a "runs on every push" claim
+      # naming a job that no longer does.
+      - name: Bench map
+        run: python ci_tests.py test_bench_map
+
       # A speech engine, so the cue test can ask a real one for its command
       # line rather than skipping. The runner image has none installed, and
       # with the guard above a skip there would fail the job — correctly, but
