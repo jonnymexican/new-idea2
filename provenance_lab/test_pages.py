@@ -346,6 +346,21 @@ class TestBuild(unittest.TestCase):
         self.assertTrue((self.site / "verifier" / "index.html").is_file())
         self.assertTrue((self.site / "verifier" / "app.js").is_file())
 
+    def test_the_trend_page_links_to_the_bench_map(self):
+        # The map is built into this same directory by the workflow, and this
+        # page is the only door in: a link that is missing (or spelled
+        # differently from the file) leaves the map at its URL with nothing
+        # pointing at it.
+        report_path = self.write_report(
+            "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
+        )
+        pages.build(report_path, self.site, run_id="1")
+        page = (self.site / "index.html").read_text()
+        self.assertIn('href="bench-map.html"', page)
+        # Relative, like the verifier link: the site is served under a project
+        # path, so a leading slash would resolve against the host root.
+        self.assertNotIn('href="/bench-map.html"', page)
+
     def test_the_staged_verifier_links_back_to_the_trend_page(self):
         # The trend page links forward; the verifier page has to lead back, and
         # to this page's own title rather than a second name for it.

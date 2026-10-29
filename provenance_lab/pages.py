@@ -383,6 +383,16 @@ def render_page(
         "run's downloads, read by the CAI verifier a viewer would embed, or a file "
         "of your own.",
         "</p>",
+        # The site's front door is this page, so it is where the rest of the
+        # repository gets a way in. The map is built by bench_map.py in the
+        # same workflow step order as the folder above it; the link is written
+        # unconditionally because a missing file is a broken deploy, which the
+        # workflow fails on rather than serving.
+        '<p class="lede">',
+        '<a href="bench-map.html">What this repository contains</a> &mdash; one tile '
+        "per experiment, from the README's own table: the question each one asks, "
+        "how many tests stand behind it, and whether it is still running.",
+        "</p>",
     ]
 
     if not runs:

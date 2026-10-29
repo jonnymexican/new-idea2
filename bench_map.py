@@ -289,14 +289,28 @@ footer {
 """
 
 
-def tile(bench):
+def href(bench, base=""):
+    """Where a tile points: relative in a checkout, absolute on a site.
+
+    Served from Pages the page sits under a project path, and the READMEs are
+    not part of that artifact -- a relative `othello/README.md` would 404. A
+    `--base` naming the repository's rendered tree turns each tile into a link
+    that works from anywhere, which is also the only way a reader of the
+    published page can act on it.
+    """
+    if not base:
+        return bench.target
+    return f"{base.rstrip('/')}/{bench.target.lstrip('/')}"
+
+
+def tile(bench, base=""):
     """One card. Everything user-visible is escaped; the accent comes from us."""
     tests = f"{bench.tests} tests" if bench.tests else "no tests"
     # A missing job is dimmed rather than hidden: "no CI job" is information
     # about the bench, and a blank space would read as an oversight.
     job = (f"<li>{html.escape('CI: ' + bench.job)}</li>" if bench.job
            else '<li class="quiet">no CI job</li>')
-    link = bench.target
+    link = href(bench, base)
     return f"""    <a class="tile" href="{html.escape(link)}" style="--accent: {bench.colour}">
       <p class="status">{html.escape(bench.status.split()[0] if bench.status.split() else "bench")}</p>
       <p class="question">{html.escape(bench.question)}</p>
@@ -306,7 +320,7 @@ def tile(bench):
     </a>"""
 
 
-def render(benches):
+def render(benches, base=""):
     """The whole page: a header, the tiles, and where they came from."""
     total = len(benches)
     words = {}
@@ -331,7 +345,7 @@ def render(benches):
   <p class="counts">{html.escape(summary)} · {covered} with a CI job · generated from README.md</p>
 </header>
 <main>
-{chr(10).join(tile(bench) for bench in benches)}
+{chr(10).join(tile(bench, base) for bench in benches)}
 </main>
 <footer>
   Written by <code>bench_map.py</code> from the table in <code>README.md</code>,
@@ -350,6 +364,9 @@ def main(argv=None):
         description="Render the README bench table as one bright page.")
     parser.add_argument("--out", default="bench-map.html",
                         help="where to write the page (default: %(default)s)")
+    parser.add_argument("--base", default="",
+                        help="absolute tree URL to link tiles at, e.g. "
+                             "https://github.com/o/r/blob/main (default: relative)")
     parser.add_argument("--json", action="store_true",
                         help="print the gathered rows as json instead")
     args = parser.parse_args(argv)
@@ -360,7 +377,8 @@ def main(argv=None):
         return 0
 
     output = Path(args.out)
-    output.write_text(render(benches), encoding="utf-8")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(render(benches, base=args.base), encoding="utf-8")
     print(f"{len(benches)} benches -> {output}")
     for bench in benches:
         job = f"ci:{bench.job}" if bench.job else "no CI job"

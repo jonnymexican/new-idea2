@@ -155,6 +155,24 @@ class RendersAPage(unittest.TestCase):
             self.assertIn(f'href="{bench.target}"', self.page)
             self.assertTrue(bench.target.endswith("README.md"), bench.name)
 
+    def test_base_turns_every_tile_into_an_absolute_link(self):
+        # Served from Pages, a relative link points into the site artifact,
+        # which has no READMEs; the base is what makes a tile usable there.
+        base = "https://github.com/o/r/blob/main"
+        page = bench_map.render(self.benches, base=base)
+        for bench in self.benches:
+            self.assertIn(f'href="{base}/{bench.target}"', page)
+        self.assertNotIn('href="othello/README.md"', page)
+
+    def test_a_trailing_slash_in_the_base_does_not_double_up(self):
+        page = bench_map.render(self.benches, base="https://github.com/o/r/blob/main/")
+        self.assertIn('href="https://github.com/o/r/blob/main/othello/README.md"', page)
+        self.assertNotIn("blob/main//", page)
+
+    def test_default_rendering_stays_relative(self):
+        for bench in self.benches:
+            self.assertIn(f'href="{bench.target}"', self.page)
+
     def test_the_root_bench_links_to_the_readme_that_documents_it(self):
         # Its table cell links to model.py first; a map should not send a
         # reader into a source file when the prose is right there.
@@ -221,6 +239,20 @@ class EscapesUntrustedCells(unittest.TestCase):
 
 
 class WritesAFile(unittest.TestCase):
+    def test_main_creates_the_directory_it_is_pointed_at(self):
+        # The site build stages the page inside a directory that only exists
+        # because the trend page was built into it first; a fresh --out should
+        # not be a crash waiting for the step order to change.
+        import contextlib
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "site" / "bench-map.html"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bench_map.main(["--out", str(target)]), 0)
+            self.assertTrue(target.is_file())
+
     def test_main_writes_the_page_and_reports_the_benches(self):
         import contextlib
         import io
@@ -234,6 +266,19 @@ class WritesAFile(unittest.TestCase):
             self.assertTrue(target.is_file())
             self.assertIn("<!doctype html>", target.read_text(encoding="utf-8"))
             self.assertIn("othello", out.getvalue())
+
+    def test_base_reaches_the_written_file(self):
+        import contextlib
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "map.html"
+            with contextlib.redirect_stdout(io.StringIO()):
+                bench_map.main(["--out", str(target),
+                                "--base", "https://github.com/o/r/blob/main"])
+            page = target.read_text(encoding="utf-8")
+            self.assertIn('href="https://github.com/o/r/blob/main/othello/README.md"', page)
 
     def test_json_arm_is_machine_readable(self):
         import contextlib

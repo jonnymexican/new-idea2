@@ -110,18 +110,36 @@ jobs:
             --run-id "${{ github.run_id }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+      - name: Build the bench map
+        # The site's front door links to this page, so it is built into the
+        # same directory rather than published separately -- one artifact, no
+        # chance of a deploy where the link points at nothing.
+        #
+        # --base is what makes the tiles work from here: Pages serves the site
+        # under a project path and does not carry the READMEs, so a relative
+        # link would 404. The map is generated from the README table, so its
+        # links go to GitHub's rendered copy of it, on the default branch,
+        # which is where a reader of the site expects them to lead.
+        id: map
+        if: always() && steps.page.outcome == 'success'
+        run: |
+          python bench_map.py \
+            --out provenance_lab/out/site/bench-map.html \
+            --base "${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.repository.default_branch }}"
+
       - name: Keep this run in the page's history
         # The branch is the page's memory, not its publishing source: a push
         # made with GITHUB_TOKEN does not trigger a branch Pages build (GitHub
         # documents this), so publishing is deploy-pages below. Writing the
         # branch first means a deployment that fails still leaves the run
         # recorded for the next one.
-        # Gated on the build rather than on the job: a failed build must leave
-        # the previous page alone instead of publishing half of one. The push
-        # URL carries the workflow token, which git would otherwise print in
-        # an error message; pages.py scrubs it.
+        # Gated on the builds rather than on the job: a failed build must leave
+        # the previous page alone instead of publishing half of one, and the
+        # trend page links to the map, so a run where that failed has nothing
+        # publishable in it. The push URL carries the workflow token, which git
+        # would otherwise print in an error message; pages.py scrubs it.
         id: history
-        if: always() && steps.page.outcome == 'success'
+        if: always() && steps.page.outcome == 'success' && steps.map.outcome == 'success'
         run: |
           python provenance_lab/pages.py publish \
             --site provenance_lab/out/site \
