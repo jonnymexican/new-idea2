@@ -218,6 +218,46 @@ def rebuild_hint(venv):
     return [f"uv venv --clear --python 3.12 {venv}", install]
 
 
+def check_standard(paths=None):
+    """The documented environments that are actually here, checked.
+
+    Ones that were never created are left out rather than reported: CI builds no
+    venv, and a checkout that never needed the lab's environment should not be
+    told it is broken. A path named on the command line is a different matter,
+    and `check` says so about a missing one.
+    """
+    paths = STANDARD_VENVS if paths is None else paths
+    return [check(path) for path in paths if os.path.isdir(path)]
+
+
+def explain(report, stream=None, width=0):
+    """Print one broken environment, and the fix, in the wording both callers use."""
+    if stream is None:
+        stream = sys.stderr
+    label = f"{report.path:<{width}}" if width else report.path
+    print(f"{label}  BROKEN  {report.problem}", file=stream)
+    if report.rebuild:
+        print("  rebuild it:", file=stream)
+        for line in rebuild_hint(report.path):
+            print(f"    {line}", file=stream)
+
+
+def report_broken(paths=None, stream=None):
+    """Write out every unusable environment; True if there was one.
+
+    What the test runner calls before it builds a suite. A suite started from an
+    environment that cannot import anything fails some way into itself, and the
+    error names a package instead of the directory that is broken; this says it
+    at the top, in the same words as `python3 venv_check.py`.
+    """
+    if stream is None:
+        stream = sys.stderr
+    broken = [report for report in check_standard(paths) if not report.ok]
+    for report in broken:
+        explain(report, stream=stream)
+    return bool(broken)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Check that this repo's environments can still run anything.")
@@ -227,19 +267,19 @@ def main(argv=None):
              + ", ".join(STANDARD_VENVS) + " exist)")
     args = parser.parse_args(argv)
 
-    targets = list(args.venvs)
-    if not targets:
-        # Only the ones that exist, so a checkout that never needed the lab's
-        # environment is not red for not having made one. A path named on the
-        # command line is checked whether or not it is there.
-        targets = [path for path in STANDARD_VENVS if os.path.isdir(path)]
-        if not targets:
+    # A path named on the command line is checked whether or not it is there;
+    # with none named, only the documented ones that were actually created are,
+    # which is what `check_standard` is for.
+    if args.venvs:
+        reports = [check(venv) for venv in args.venvs]
+    else:
+        reports = check_standard()
+        if not reports:
             print(f"no environment here; looked in {', '.join(STANDARD_VENVS)}",
                   file=sys.stderr)
             print("see README.md for the commands that create one", file=sys.stderr)
             return 1
 
-    reports = [check(venv) for venv in targets]
     width = max(len(report.path) for report in reports)
 
     for report in reports:
@@ -250,11 +290,7 @@ def main(argv=None):
 
     broken = [report for report in reports if not report.ok]
     for report in broken:
-        print(f"{report.path:<{width}}  BROKEN  {report.problem}", file=sys.stderr)
-        if report.rebuild:
-            print("  rebuild it:", file=sys.stderr)
-            for line in rebuild_hint(report.path):
-                print(f"    {line}", file=sys.stderr)
+        explain(report, width=width)
 
     if broken:
         print(f"\n{len(broken)} of {len(reports)} environments cannot run anything",

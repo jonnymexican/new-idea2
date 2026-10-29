@@ -103,6 +103,11 @@ one where the venv's own interpreter cannot be started at all. The usual cause
 is a `pyvenv.cfg` pointing into a uv cache under a home directory that has since
 been rebuilt under another one.
 
+`ci_tests.py` and `test_all.py` run that check themselves before building a
+suite, so a stale environment stops a test run at the top, with the same
+message, instead of failing somewhere inside it on a package that is not
+there.
+
 ## Train
 
 ```bash

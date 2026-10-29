@@ -13,6 +13,10 @@ whole job is to be runnable when that is exactly what is not working.
 The one thing not faked is the filesystem: dangling links, missing
 `pyvenv.cfg`, empty site-packages are the failure modes, so they are real files
 in a temporary directory.
+
+The last class covers the wiring rather than the verdicts: that the test runner
+asks before it builds a suite, and that a machine with no environment at all —
+the CI runner — is left alone to run the tests it does have.
 """
 
 import contextlib
@@ -22,6 +26,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import ci_tests
 import venv_check
 
 
@@ -289,6 +294,92 @@ class MainTest(Case):
         self.assertEqual(code, 1)
         self.assertIn(".venv", err)
         self.assertNotIn("absent", err)
+
+
+class StandardTest(Case):
+    """The environments a caller gets when it names none."""
+
+    def test_only_the_documented_environments_that_exist_are_checked(self):
+        here = self.make_venv(name="here")
+        never = os.path.join(self.tmp.name, "never-made")
+        with mock.patch.object(venv_check, "probe_interpreter",
+                               self.as_itself()):
+            reports = venv_check.check_standard((here, never))
+
+        self.assertEqual([report.path for report in reports], [here])
+        self.assertTrue(reports[0].ok)
+
+    def test_nothing_to_report_is_false_and_silent(self):
+        stream = io.StringIO()
+        with mock.patch.object(venv_check, "probe_interpreter",
+                               self.as_itself()):
+            broken = venv_check.report_broken((), stream=stream)
+        self.assertFalse(broken)
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_a_broken_environment_is_reported_with_its_fix(self):
+        stale = self.make_venv(name="stale", interpreter=False)
+        stream = io.StringIO()
+        with mock.patch.object(venv_check, "probe_interpreter",
+                               self.as_itself()):
+            broken = venv_check.report_broken((stale,), stream=stream)
+
+        self.assertTrue(broken)
+        self.assertIn("BROKEN", stream.getvalue())
+        self.assertIn("uv venv --clear", stream.getvalue())
+
+
+class FakeResult:
+    """What the runner would hand back: one test, and it passed."""
+
+    skipped = []
+    testsRun = 1
+
+    def wasSuccessful(self):
+        return True
+
+
+class PreflightTest(Case):
+    """The runner checks first, and only stops when there is something to stop for."""
+
+    def run_ci(self, names, paths):
+        """`ci_tests.main`, with the environments and the runner both replaced."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(venv_check, "STANDARD_VENVS", paths), \
+                mock.patch.object(venv_check, "probe_interpreter",
+                                  self.as_itself()), \
+                mock.patch.object(unittest.TextTestRunner, "run",
+                                  return_value=FakeResult()) as run, \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = ci_tests.main(names)
+        return code, run, err.getvalue()
+
+    def test_a_broken_environment_stops_the_run_before_the_first_test(self):
+        broken = self.make_venv(name="stale", interpreter=False)
+        code, run, err = self.run_ci(["test_venv_check.PreflightTest"],
+                                     (broken,))
+
+        self.assertEqual(code, 1)
+        # The point of the gate: not one test was asked to run.
+        self.assertFalse(run.called)
+        self.assertIn(broken, err)
+
+    def test_a_working_environment_lets_the_suite_run(self):
+        fine = self.make_venv(name="fine")
+        code, run, err = self.run_ci(["some.module"], (fine,))
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(run.called)
+
+    def test_no_environment_at_all_is_not_an_error(self):
+        # The runner has no `.venv`, so a gate that needed one would fail every
+        # build on it. Nothing to check means nothing to say.
+        code, run, err = self.run_ci(["some.module"], ())
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(run.called)
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

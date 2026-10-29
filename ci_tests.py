@@ -19,11 +19,18 @@ if nothing ran at all.
 The skips are named in a GitHub `::error::` annotation, so the reason is on the
 run summary instead of half a log down — the log needs admin rights to download,
 the summary does not.
+
+Before any of that it asks `venv_check` whether this repo's environments can run
+anything at all, and stops if one cannot. Same argument as the skip guard, one
+step earlier: the problem is the install, not the code, so it should be said
+before the run rather than from inside it.
 """
 
 import argparse
 import sys
 import unittest
+
+import venv_check
 
 #: GitHub reads this prefix on a line of output as an annotation on the run.
 ANNOTATION = "::error::"
@@ -54,6 +61,15 @@ def main(argv=None):
         parser.error("give test names or --discover, not both")
     if args.discover is None and not args.names:
         parser.error("give at least one test name, or --discover")
+
+    # Before the suite, not during it. An environment that only looks like one
+    # fails somewhere inside the run, and the error it produces names a package
+    # rather than the directory that cannot import it -- the failure this repo
+    # lost ten minutes to. Nothing is checked where no environment was ever
+    # made, which is the runner's case: CI has no `.venv`. The wording is
+    # `venv_check.py`'s, so running the check by hand says the same thing.
+    if venv_check.report_broken():
+        return 1
 
     suite = build(unittest.defaultTestLoader, args.names, args.discover,
                   args.pattern)

@@ -55,6 +55,16 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import venv_check
+
+# Before `torch`, because a broken environment fails at that import, and a
+# traceback naming torch reads as a missing package rather than a directory that
+# cannot import anything. Only when this file is the entrypoint: loaded by
+# `ci_tests.py`, that runner has already asked, and a test module should not
+# have opinions about the machine it is collected on.
+if __name__ == "__main__" and venv_check.report_broken():
+    raise SystemExit(1)
+
 import torch
 
 from bpe import BYTE_VOCAB, BPETokenizer
