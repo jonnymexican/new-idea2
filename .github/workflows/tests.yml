@@ -300,3 +300,30 @@ jobs:
         # counted samples — and prints the JSON it judged, so a red log says
         # what the doctor actually saw.
         run: python -m wifi_radar.fakeboard --verbose
+
+  othello:
+    # Standard library only and three seconds long. The suite checks the rules
+    # against published perft counts and the search against a brute-force
+    # reference, so a green step here means the pruning did not change an
+    # answer -- the one thing an engine can get wrong without failing anything.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Report the runner image
+        # Sourced, not substituted: if the file is missing the step fails here
+        # rather than printing an empty notice that reads like a pass.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Through the runner like every other job, so a skip fails and a green
+      # step is one whose tests ran.
+      - name: Rules, search and ladder
+        run: python ci_tests.py othello.test_othello

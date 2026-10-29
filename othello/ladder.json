@@ -1,0 +1,78 @@
+{
+  "games_per_pair": 20,
+  "pairings": [
+    {
+      "a": "depth1",
+      "b": "depth2",
+      "draws": 0,
+      "wins_a": 2,
+      "wins_b": 18
+    },
+    {
+      "a": "depth1",
+      "b": "depth3",
+      "draws": 0,
+      "wins_a": 0,
+      "wins_b": 20
+    },
+    {
+      "a": "depth1",
+      "b": "depth4",
+      "draws": 0,
+      "wins_a": 0,
+      "wins_b": 20
+    },
+    {
+      "a": "depth2",
+      "b": "depth3",
+      "draws": 0,
+      "wins_a": 2,
+      "wins_b": 18
+    },
+    {
+      "a": "depth2",
+      "b": "depth4",
+      "draws": 0,
+      "wins_a": 1,
+      "wins_b": 19
+    },
+    {
+      "a": "depth3",
+      "b": "depth4",
+      "draws": 0,
+      "wins_a": 0,
+      "wins_b": 20
+    }
+  ],
+  "ratings": {
+    "depth1": {
+      "draws": 0,
+      "games": 60,
+      "losses": 58,
+      "rating": 898.8,
+      "wins": 2
+    },
+    "depth2": {
+      "draws": 0,
+      "games": 60,
+      "losses": 39,
+      "rating": 1306.0,
+      "wins": 21
+    },
+    "depth3": {
+      "draws": 0,
+      "games": 60,
+      "losses": 22,
+      "rating": 1634.0,
+      "wins": 38
+    },
+    "depth4": {
+      "draws": 0,
+      "games": 60,
+      "losses": 1,
+      "rating": 2161.3,
+      "wins": 59
+    }
+  },
+  "updated": "2026-10-29T01:16:32Z"
+}

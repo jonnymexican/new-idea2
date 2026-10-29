@@ -9,7 +9,7 @@ the tokenizer and the training loop are all written here; only the backward pass
 
 ## The benches
 
-Four projects share this repo and none of them depends on another. What each one
+Five projects share this repo and none of them depends on another. What each one
 asks, and where it stands:
 
 | Bench | The question it asks | Where it stands |
@@ -18,6 +18,7 @@ asks, and where it stands:
 | **[mediatop](mediatop/README.md)** — the news digest | What is the point of today's news, on one screen, in four genres? | Live — Actions run it daily at 07:00 UTC |
 | **[wifi_radar](wifi_radar/README.md)** — WiFi motion sensing | Can WiFi signal be read as motion, with no special hardware? | Quiet since 23 Oct — its tests still run on every push |
 | **[provenance_lab](provenance_lab/README.md)** — C2PA across platforms | Does a provenance credential survive a real platform? | Parked — the weekly job still measures on Mondays |
+| **[othello](othello/README.md)** — the engine | How strong can a from-scratch Othello player get on one CPU? | New — rules pinned to perft counts, ladder at depth 4 |
 
 The rest of this README is the model bench: training it, talking to it,
 measuring it, and looking inside it. Each of the others has its own README.
@@ -41,12 +42,14 @@ measuring it, and looking inside it. Each of the others has its own README.
 | [`archil_store.py`](archil_store.py) | A disk that outlives a run: the Archil SDK, configured from `ARCHIL_API_KEY` / `ARCHIL_REGION` / `ARCHIL_DISK_ID` |
 | [`archil_check.py`](archil_check.py) | Proves it: writes a line in one exec on the disk and reads it back in a second, separate one |
 | [`test_archil_store.py`](test_archil_store.py) | The store offline: `.env` parsing and precedence, the no-key refusal, the SDK wiring, all against a fake SDK |
+| [`venv_check.py`](venv_check.py) | Whether a `.venv` here is still an interpreter or only a directory shaped like one — run by the test entrypoints before they start |
 | [`ci_tests.py`](ci_tests.py) | Runs a suite and fails on a skip, so a green CI step means the tests ran — the workflow runs every suite through it |
 | [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Walkthrough of the mechanics, from tokenising to sampling |
 | [`data/input.txt`](data/input.txt) | Tiny Shakespeare (~1.1 MB), the corpus |
 | `runs/` | Generated output: metrics, checkpoint, sample, loss curve (not committed) |
 | [`wifi_radar/`](wifi_radar/) | A separate project in the same repo: WiFi CSI motion sensing, no hardware needed — [its own README](wifi_radar/README.md) |
 | [`mediatop/`](mediatop/) | A separate project in the same repo: the point of recent news, one screen, four genres — [its own README](mediatop/README.md) |
+| [`othello/`](othello/) | A separate project in the same repo: an Othello engine and the ladder that rates it — [its own README](othello/README.md) |
 
 ## Architecture
 
