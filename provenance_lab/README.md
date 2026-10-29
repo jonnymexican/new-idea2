@@ -464,6 +464,33 @@ catalogue does not have says so rather than doing nothing. A second chip
 replaces the card for the file it opens, so clicking around does not pile up
 copies of the same verdict.
 
+### Publishing without measuring
+
+The site can also be republished without asking any platform anything, which
+is what a change to the page itself needs: an edited README that moves the
+bench map, or a change to the renderer. `pages.py render` rebuilds the trend
+page from the `history.json` already on disk, so a checkout of the history
+branch is enough to stage the whole site again:
+
+```bash
+git clone --depth 1 --branch platform-history . site
+.venv/bin/python pages.py render --site site
+python ../bench_map.py --out site/bench-map.html \
+    --base https://github.com/<owner>/<repo>/blob/main
+```
+
+That is what the `pages` workflow does — run by hand, or automatically on a
+push that touches the README, the map, this file or the renderer. It appends
+no column: no adapter was asked anything, and a publish that invented one
+would put a week on the page that was never measured. The verifier's `samples`
+are left exactly as the last real run staged them, for the same reason — a
+doc-only build has no renditions of its own and must not replace them with
+none.
+
+The weekly `live platforms` job remains the only thing that measures, and it
+still deploys its own site at the end. Both workflows share one `pages`
+concurrency group so the two cannot deploy over each other.
+
 ## What this does not prove
 
 - The signing CA is generated locally, so `trusted` means trusted against that

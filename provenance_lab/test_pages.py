@@ -346,6 +346,55 @@ class TestBuild(unittest.TestCase):
         self.assertTrue((self.site / "verifier" / "index.html").is_file())
         self.assertTrue((self.site / "verifier" / "app.js").is_file())
 
+    def test_render_rebuilds_the_page_from_the_series_on_disk(self):
+        # The doc-only publish path: no measurement, no new column, just the
+        # same series rendered again after the page's markup changed.
+        first = self.write_report("a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")])
+        second = self.write_report("b.json", "2026-10-26T06:00:00+00:00", [row("discord", "photo", "valid")])
+        pages.build(first, self.site, run_id="1")
+        pages.build(second, self.site, run_id="2")
+        before = json.loads((self.site / "history.json").read_text())
+
+        (self.site / "index.html").write_text("stale")
+        path = pages.render_site(self.site)
+
+        page = path.read_text()
+        self.assertNotIn("stale", page)
+        # Both weeks are still there: rendering is not a rebuild of the series.
+        self.assertEqual(page.count('class="cell o-gone"'), 1)
+        self.assertEqual(page.count('class="cell o-valid"'), 1)
+        after = json.loads((self.site / "history.json").read_text())
+        self.assertEqual(len(after["runs"]), len(before["runs"]))
+
+    def test_render_invents_no_run(self):
+        # A publish that touched no adapter must not add a column saying the
+        # platforms were measured.
+        report_path = self.write_report(
+            "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
+        )
+        pages.build(report_path, self.site, run_id="1")
+        history_before = (self.site / "history.json").read_text()
+        pages.render_site(self.site)
+        self.assertEqual((self.site / "history.json").read_text(), history_before)
+
+    def test_render_says_what_is_missing_when_there_is_no_series(self):
+        self.site.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(pages.PublishError) as raised:
+            pages.render_site(self.site)
+        self.assertIn("history.json", str(raised.exception))
+
+    def test_render_leaves_the_verifier_where_it_was(self):
+        # The samples beside the page are the last measurement's downloads, and
+        # a doc-only publish has none of its own -- so it must not stage an
+        # empty verifier over them.
+        report_path = self.write_report(
+            "a.json", "2026-10-19T06:00:00+00:00", [row("discord", "photo", "absent")]
+        )
+        pages.build(report_path, self.site, run_id="1")
+        samples = (self.site / "verifier" / "samples.json").read_text()
+        pages.render_site(self.site)
+        self.assertEqual((self.site / "verifier" / "samples.json").read_text(), samples)
+
     def test_the_trend_page_links_to_the_bench_map(self):
         # The map is built into this same directory by the workflow, and this
         # page is the only door in: a link that is missing (or spelled

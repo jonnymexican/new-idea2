@@ -29,7 +29,12 @@ concurrency:
   # A manual run started during the scheduled one would upload the same fixture
   # twice and produce two reports that disagree about the same hour. Queuing is
   # cheap; cancelling would abandon a half-finished matrix.
-  group: live-platforms
+  #
+  # The group is shared with the `pages` workflow, which publishes the site
+  # without measuring. Both end at deploy-pages, so a doc publish landing in
+  # the middle of a weekly one would leave whichever finished last on the site
+  # rather than the newer of the two.
+  group: pages
   cancel-in-progress: false
 
 jobs:

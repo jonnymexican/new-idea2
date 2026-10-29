@@ -585,6 +585,37 @@ class PublishError(RuntimeError):
     pass
 
 
+def render_site(
+    site_dir: Path,
+    *,
+    title: str = DEFAULT_TITLE,
+    max_runs: int = PAGE_RUNS,
+) -> Path:
+    """Rewrite ``index.html`` from the series already in the directory.
+
+    Publishing used to mean measuring: the deploy was the last step of the
+    weekly job, so a change that touched no adapter -- a README edit that
+    changes the bench map, a tweak to this renderer -- had to wait for Monday
+    and upload a fixture to five services before it could reach the page.
+
+    This renders what the history branch already holds, so the same series can
+    be redeployed from a checkout alone. Nothing is appended on purpose: a
+    doc-only publish that invented a column would claim the platforms were
+    measured when they were not, which is the one thing the trend page exists
+    to be right about.
+    """
+    site_dir = Path(site_dir)
+    history_path = site_dir / "history.json"
+    if not history_path.is_file():
+        raise PublishError(
+            f"{site_dir} has no history.json to render from -- the series lives "
+            "on the page's history branch, so check that out first"
+        )
+    page = render_page(load_history(history_path), title=title, max_runs=max_runs)
+    (site_dir / "index.html").write_text(page, encoding="utf-8")
+    return site_dir / "index.html"
+
+
 def _git(args: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess:
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     try:
@@ -740,6 +771,14 @@ def main(argv: list[str] | None = None) -> int:
              "(repeatable; without it the page only verifies dropped files)",
     )
 
+    render_parser = sub.add_parser(
+        "render",
+        help="re-render the page from the series already on disk (no new run)",
+    )
+    render_parser.add_argument("--site", default="out/site")
+    render_parser.add_argument("--title", default=DEFAULT_TITLE)
+    render_parser.add_argument("--max-runs", type=int, default=PAGE_RUNS)
+
     publish_parser = sub.add_parser("publish", help="push the page to a branch")
     publish_parser.add_argument("--site", default="out/site")
     publish_parser.add_argument("--branch", default="platform-history")
@@ -768,6 +807,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"appended {record['generated']}")
         for name, outcome in outcomes.items():
             print(f"  {name}: {outcome}")
+        return 0
+
+    if args.cmd == "render":
+        path = render_site(Path(args.site), title=args.title, max_runs=args.max_runs)
+        runs = len(load_history(Path(args.site) / "history.json")["runs"])
+        print(f"rendered {path} from {runs} run(s)")
         return 0
 
     if args.cmd == "publish":

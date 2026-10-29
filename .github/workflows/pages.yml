@@ -1,0 +1,101 @@
+name: pages
+
+# Publishing the site used to be the last step of `live platforms`: the only
+# way to put a page up was to measure every adapter first. That is the right
+# order for a measurement, and the wrong one for a README edit that changes the
+# bench map -- it would wait for Monday and post a fixture to five services to
+# publish a paragraph.
+#
+# So this publishes the site as it already stands: the series from the page's
+# history branch, the renditions the verifier lists, and a freshly built map.
+# It appends no column, because no platform was asked anything, and it does not
+# write to the branch: the branch is the series' memory and nothing here
+# changes the series.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Only files that change the page itself. A code change under a bench is
+    # the weekly job's business, and redeploying for it would be noise.
+    paths:
+      - README.md
+      - bench_map.py
+      - provenance_lab/pages.py
+      - provenance_lab/verifier.py
+      - provenance_lab/verifier/**
+      - .github/workflows/pages.yml
+
+permissions:
+  # Read the history branch; the deploy itself needs pages and id-token. No
+  # write, because a doc-only publish has nothing to record.
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  # Shared with `live platforms` so the two cannot deploy over each other: a
+  # weekly run finishing while a doc publish is midway would otherwise leave
+  # whichever deployed last on the site regardless of which is newer.
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Report the runner image
+        # Same reason as the other workflows: a failure that only happens here
+        # is a question about the image first.
+        run: |
+          . /etc/os-release
+          echo "::notice::runner image is $PRETTY_NAME"
+
+      # Before the checkouts, so a missing interpreter is the first thing said
+      # rather than the third.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - uses: actions/checkout@v7
+
+      - name: Check out the page's history
+        # The branch holds the site as last published: history.json, the
+        # rendered index.html, and the verifier with its samples. Without it
+        # there is no series to render, and the step below says so by name
+        # instead of publishing an empty page.
+        uses: actions/checkout@v7
+        with:
+          ref: platform-history
+          path: site
+
+      - name: Drop the checkout's git directory
+        # The artifact is uploaded whole; a .git tree would put the branch's
+        # history in it for no reader's benefit.
+        run: rm -rf site/.git
+
+      - name: Render the trend page from the history it has
+        # Re-rendered rather than copied, so a change to the renderer reaches
+        # the page on this path too. No run is appended.
+        run: python provenance_lab/pages.py render --site site
+
+      - name: Rebuild the bench map beside it
+        # Same command and same --base as the weekly job: the tiles point at
+        # GitHub's rendered READMEs because the site carries none of them, and
+        # a relative link would 404 under the project path.
+        run: |
+          python bench_map.py \
+            --out site/bench-map.html \
+            --base "${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.repository.default_branch }}"
+
+      - name: Stage the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Deploy the site
+        id: deployment
+        uses: actions/deploy-pages@v5
