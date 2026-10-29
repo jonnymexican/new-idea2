@@ -90,6 +90,19 @@ switched off at import: `torch.from_numpy` then raises at the call site and the
 only symptom is a warning that reads like noise. The index mirrors numpy, so the
 same command brings it, and CI reports the version it got.
 
+Before trusting either environment, ask it:
+
+```bash
+python3 venv_check.py
+```
+
+It answers whether each `.venv` here is still an interpreter or only a directory
+shaped like one, and names the two commands that rebuild anything it cannot use.
+Run it with the system `python3`, not with a venv: the failure it looks for is
+one where the venv's own interpreter cannot be started at all. The usual cause
+is a `pyvenv.cfg` pointing into a uv cache under a home directory that has since
+been rebuilt under another one.
+
 ## Train
 
 ```bash

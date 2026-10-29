@@ -55,6 +55,14 @@ with the root `requirements.txt`, and CI gives them their own job for the same
 reason. Running these suites from the root `.venv` fails on `import c2pa`, not
 on anything they assert.
 
+Both environments are checked together from the repo root, which is quicker
+than finding out which one is broken by watching a test suite fail on it:
+
+```bash
+cd ..
+python3 venv_check.py
+```
+
 Outputs `out/full/report.md` (readable) and `out/full/report.json` (raw rows),
 plus every generated file under `out/full/assets/`.
 

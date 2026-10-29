@@ -112,6 +112,15 @@ jobs:
       - name: Disk store
         run: python ci_tests.py test_archil_store
 
+      # The venv check, tested where it cannot be run for real: this job builds
+      # no environment, and the machine the check protects is a developer's. So
+      # its guarantees are pinned here instead — a `pyvenv.cfg` naming a home
+      # that is gone, a link with no interpreter behind it, an interpreter that
+      # is not the environment — so it cannot rot into a script that prints
+      # "ok" whatever it is shown.
+      - name: Environment check
+        run: python ci_tests.py test_venv_check
+
       # A speech engine, so the cue test can ask a real one for its command
       # line rather than skipping. The runner image has none installed, and
       # with the guard above a skip there would fail the job — correctly, but
