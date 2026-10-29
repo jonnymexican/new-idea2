@@ -35,6 +35,11 @@ bench-map.html
 # Screenshots taken while reviewing a change; not part of the repo
 screenshots/
 
+# ditherlab is its own repository (its own .git, its own CI). Never add it here:
+# git would either embed it as a half-submodule or flatten it and lose its
+# history, and a directory with a .git inside shows as untracked either way.
+ditherlab/
+
 # Environment / secrets
 .env
 .env.*
