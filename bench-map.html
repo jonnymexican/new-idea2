@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The benches — new-idea2</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 48px 28px 64px;
+  background: #fbf8f3; color: #14110f;
+  font: 16px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header, main, footer { max-width: 1080px; margin: 0 auto; }
+h1 {
+  margin: 0 0 6px; font: 600 2.6rem/1.1 Georgia, "Times New Roman", serif;
+  letter-spacing: -0.02em;
+}
+.lede { margin: 0 0 4px; font-size: 1.05rem; color: #4a443c; }
+.counts {
+  margin: 14px 0 0; font: 500 0.78rem/1.4 ui-monospace, Menlo, monospace;
+  letter-spacing: 0.08em; text-transform: uppercase; color: #6b655c;
+}
+main {
+  display: grid; gap: 18px; margin-top: 34px;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+}
+.tile {
+  position: relative; display: flex; flex-direction: column;
+  background: #fff; border: 1px solid #e6ddd0; border-radius: 10px;
+  padding: 20px 20px 18px; text-decoration: none; color: inherit;
+  box-shadow: 0 1px 0 rgba(20, 17, 15, 0.04);
+}
+.tile::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 5px; border-radius:
+  10px 10px 0 0; background: var(--accent);
+}
+.tile:hover { border-color: var(--accent); box-shadow: 0 6px 18px rgba(20, 17, 15, 0.09); }
+.tile:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.status {
+  margin: 6px 0 12px; font: 600 0.7rem/1 ui-monospace, Menlo, monospace;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent);
+}
+.question {
+  margin: 0 0 14px; font: 500 1.3rem/1.28 Georgia, "Times New Roman", serif;
+  letter-spacing: -0.01em;
+}
+.name { margin: 0 0 2px; font-weight: 650; }
+.where {
+  margin: 0; font-size: 0.86rem; color: #6b655c;
+  min-height: 1.5em;  /* one line's height even when empty, so rows line up */
+}
+.facts {
+  display: flex; flex-wrap: wrap; gap: 6px 8px; margin: 16px 0 0;
+  padding: 0; list-style: none; border-top: 1px solid #f0e9dd; padding-top: 12px;
+  font: 500 0.72rem/1 ui-monospace, Menlo, monospace; letter-spacing: 0.04em;
+  text-transform: uppercase; color: #57514a;
+}
+.facts li { background: #f6f1e8; border-radius: 4px; padding: 5px 7px; }
+.facts .quiet { background: transparent; padding-left: 0; color: #a09a90; }
+footer {
+  margin-top: 40px; font-size: 0.82rem; color: #6b655c;
+  border-top: 1px solid #e6ddd0; padding-top: 16px;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>5 benches, 5 questions</h1>
+  <p class="lede">Each one asks something the others cannot, and none of them
+  depends on another. Colour says whether it is alive.</p>
+  <p class="counts">1 active · 1 live · 2 parked · 1 quiet · 5 with a CI job · generated from README.md</p>
+</header>
+<main>
+    <a class="tile" href="https://github.com/jonnymexican/new-idea2/blob/main/README.md" style="--accent: #1f9d55">
+      <p class="status">Active</p>
+      <p class="question">What does a transformer learn, on a laptop, from scratch?</p>
+      <p class="name">the model</p>
+      <p class="where"></p>
+      <ul class="facts"><li>136 tests</li><li>CI: unittest</li></ul>
+    </a>
+    <a class="tile" href="https://github.com/jonnymexican/new-idea2/blob/main/mediatop/README.md" style="--accent: #0b74c4">
+      <p class="status">Live</p>
+      <p class="question">What is the point of today&#x27;s news, on one screen, in four genres?</p>
+      <p class="name">mediatop</p>
+      <p class="where">the news digest</p>
+      <ul class="facts"><li>56 tests</li><li>CI: mediatop</li></ul>
+    </a>
+    <a class="tile" href="https://github.com/jonnymexican/new-idea2/blob/main/wifi_radar/README.md" style="--accent: #c28800">
+      <p class="status">Quiet</p>
+      <p class="question">Can WiFi signal be read as motion, with no special hardware?</p>
+      <p class="name">wifi_radar</p>
+      <p class="where">WiFi motion sensing</p>
+      <ul class="facts"><li>212 tests</li><li>CI: unittest</li></ul>
+    </a>
+    <a class="tile" href="https://github.com/jonnymexican/new-idea2/blob/main/provenance_lab/README.md" style="--accent: #8a8580">
+      <p class="status">Parked</p>
+      <p class="question">Does a provenance credential survive a real platform?</p>
+      <p class="name">provenance_lab</p>
+      <p class="where">C2PA across platforms</p>
+      <ul class="facts"><li>153 tests</li><li>CI: provenance-lab</li></ul>
+    </a>
+    <a class="tile" href="https://github.com/jonnymexican/new-idea2/blob/main/othello/README.md" style="--accent: #8a8580">
+      <p class="status">Parked</p>
+      <p class="question">How strong can a from-scratch Othello player get on one CPU?</p>
+      <p class="name">othello</p>
+      <p class="where">the engine</p>
+      <ul class="facts"><li>23 tests</li><li>CI: othello</li></ul>
+    </a>
+</main>
+<footer>
+  Written by <code>bench_map.py</code> from the table in <code>README.md</code>,
+  so this page cannot name a bench the repository does not have. Test counts are
+  <code>def test_</code> counted in each bench's own files; a CI job is shown
+  only where the tests workflow names that bench's suite. Regenerate with
+  <code>python bench_map.py</code>.
+</footer>
+</body>
+</html>
