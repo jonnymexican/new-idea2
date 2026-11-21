@@ -128,6 +128,13 @@ jobs:
       - name: Bench map
         run: python ci_tests.py test_bench_map
 
+      # Greedy speculation's one promise: the text is the target's own argmax
+      # output, whatever the draft guessed. The suite compares whole decodes
+      # across draft depths and lookaheads against the plain cached loop, on a
+      # seeded toy model, so it needs no checkpoint and no corpus.
+      - name: Greedy speculative decoding
+        run: python ci_tests.py test_greedy_spec
+
       # A speech engine, so the cue test can ask a real one for its command
       # line rather than skipping. The runner image has none installed, and
       # with the guard above a skip there would fail the job — correctly, but
