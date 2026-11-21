@@ -19,15 +19,23 @@ collapses into a comparison:
 
 Every kept token is the target's own argmax at its position, and the replacement
 is the argmax the plain loop would have emitted next, so the text is the same by
-construction rather than by luck. `bench_greedy_spec` still checks it, because
-"by construction" is the sort of claim that survives right up until an off-by-one
-in the cache.
+construction rather than by luck. The bench still checks it, because "by
+construction" is the sort of claim that survives right up until an off-by-one in
+the cache — and because a check that has never been seen to fail is not a check,
+`verdict` is small enough to test on a deliberately corrupted decode.
 
 The draft is not a second model: it is the target's own first few layers, which
 share the vocabulary and the bottom of the stack exactly, so the target's cache
 primes it for free. It is therefore *biased* — three layers asked to predict what
 six would — which costs acceptance rate and nothing else, since a wrong guess is
 discarded rather than believed.
+
+The draft's cost is the whole question, so the bench also runs an *oracle*: the
+target's own continuation, handed over as guesses, costing no pass at all. Every
+guess is right, so a round returns one more token per target pass than the plain
+loop does. That rate is the ceiling — what speculation would reach here if
+drafting were free — and the gap between it and a real draft's row is exactly
+what the draft is spending.
 
 The one thing the identity depends on is room. Positional embeddings were trained
 to `block_size`, so the target cannot verify guesses past the end of its window;
@@ -73,7 +81,8 @@ class GreedySpeculativeDecoder:
       `target_passes`   passes over the target model, the cost that matters
     """
 
-    def __init__(self, model, ids, window, draft_layers=2, guesses=4):
+    def __init__(self, model, ids, window, draft_layers=2, guesses=4,
+                 oracle=None):
         if not ids:
             raise ValueError("cannot decode from an empty prompt")
         self.model = model.eval()
@@ -81,6 +90,10 @@ class GreedySpeculativeDecoder:
         self.guesses = max(1, int(guesses))
         self.draft_layers = max(1, min(int(draft_layers), model.n_layer))
         self.ids = [int(t) for t in ids]
+        self.prompt_len = len(self.ids)
+        # A draft that is handed the answer, for measuring the ceiling: `None`
+        # means the ordinary draft, the target's own first `draft_layers`.
+        self.oracle = None if oracle is None else [int(t) for t in oracle]
         self.cache = None
         self.logits = None
         self.pending = None      # emitted, but not yet a position in the cache
@@ -118,7 +131,16 @@ class GreedySpeculativeDecoder:
     # ------------------------------------------------------------- guessing
     @torch.inference_mode()
     def _draft(self, count):
-        """`count` greedy guesses from the truncated model, in order."""
+        """`count` greedy guesses, in order.
+
+        With an oracle the guesses are the answer itself and no pass is spent
+        producing them, which is what makes that row a ceiling rather than a
+        draft. Positions are counted from the prompt, so the first guess after
+        `k` emitted tokens is the oracle's token `k`.
+        """
+        if self.oracle is not None:
+            start = len(self.ids) - self.prompt_len
+            return self.oracle[start:start + count]
         base = len(self.cache)
         draft_cache = self.cache.copy_prefix(self.draft_layers)
         if self.pending is not None:
@@ -295,18 +317,38 @@ def measure(model, ids, window, args):
 
             rate, (produced, accepted, proposed, rounds, passes) = best_of(
                 run, tokens, args.reps)
-            if produced != want_cached:
+            result = verdict(produced, want_cached)
+            if result != "identical":
                 mismatches += 1
-                verdict = f"MISMATCH after {_first_difference(produced, want_cached)}"
-            else:
-                verdict = "identical"
             label = f"spec {layers}L/{guesses} ahead"
             print(f"{label:26s} {rate:9.0f} {rate / rate_cached:9.2f}x "
                   f"{rate / rate_uncached:11.2f}x   "
                   f"{accepted / max(proposed, 1):4.0%} accepted "
                   f"({accepted}/{proposed}), "
                   f"{(accepted + rounds) / max(rounds, 1):.2f} tok/round, "
-                  f"{passes} passes, {verdict}")
+                  f"{passes} passes, {result}")
+
+    # The ceiling: the target's own continuation, handed over as guesses for
+    # nothing. Every guess is right, so this is the most speculation could ever
+    # gain on this machine, and the gap to a real draft's row is its cost.
+    for guesses in guesses_list:
+        def run_oracle(guesses=guesses):
+            decoder = GreedySpeculativeDecoder(
+                model, ids, window, guesses=guesses, oracle=want_cached)
+            produced = list(decoder.tokens(tokens))
+            return (produced, decoder.accepted, decoder.proposed,
+                    decoder.rounds, decoder.target_passes)
+
+        rate, (produced, accepted, proposed, rounds, passes) = best_of(
+            run_oracle, tokens, args.reps)
+        result = verdict(produced, want_cached)
+        if result != "identical":
+            mismatches += 1
+        print(f"{f'oracle {guesses} ahead':26s} {rate:9.0f} "
+              f"{rate / rate_cached:9.2f}x {rate / rate_uncached:11.2f}x   "
+              f"draft is free and always right: {passes} passes, "
+              f"{(accepted + rounds) / max(rounds, 1):.2f} tok/round, "
+              f"{result}")
 
     print()
     if mismatches:
@@ -316,14 +358,28 @@ def measure(model, ids, window, args):
               "token.")
         print("The draft proposes, the target decides; acceptance is what the "
               "guess cost.")
+        print("The oracle rows are the ceiling: what free, perfect drafting "
+              "would reach here. A real draft's row pays the difference.")
     return mismatches
 
 
-def _first_difference(got, want):
+def first_difference(got, want):
+    """Where two token sequences stop agreeing, in words."""
     for i, (a, b) in enumerate(zip(got, want)):
         if a != b:
             return f"token {i} ({a} vs {b})"
     return f"length ({len(got)} vs {len(want)})"
+
+
+def verdict(got, want):
+    """The bench's only claim, as a string: is this the target's own text?
+
+    Pulled out of `measure` so the check itself can be tested: a benchmark whose
+    failure path has never run is a benchmark that cannot report a failure.
+    """
+    if got == want:
+        return "identical"
+    return f"MISMATCH after {first_difference(got, want)}"
 
 
 def main():

@@ -44,6 +44,8 @@ mismatch ever stops being tolerable.
 | [`serve.py`](serve.py) | Local web prompt: a stdlib server that streams tokens into the browser |
 | [`peek.py`](peek.py) | What the model is doing while it reads: attention, per-token surprise, the next-token distribution — a local page, read from the inside |
 | [`bench_decode.py`](bench_decode.py) | What the cache, speculation, batching and a sustained run actually buy, measured |
+| [`greedy_spec.py`](greedy_spec.py) | Greedy speculation: the target's exact text, what each guess cost, and the ceiling a free draft would reach |
+| [`test_greedy_spec.py`](test_greedy_spec.py) | The bench's tests: the text is identical, the check can fail, the baseline is the decoder the app serves |
 | [`test_all.py`](test_all.py) | The test suite (standard library only) — run it after any change |
 | [`test_peek.py`](test_peek.py) | The viewer's tests: capture is inert, attention stays causal, the API's shape |
 | [`archil_store.py`](archil_store.py) | A disk that outlives a run: the Archil SDK, configured from `ARCHIL_API_KEY` / `ARCHIL_REGION` / `ARCHIL_DISK_ID` |
@@ -316,6 +318,51 @@ plain caching. On hardware where a batched pass is much cheaper than N single
 steps it should win, which is why `--spec` exists — but the honest result on a
 laptop is that the cache is the whole single-reply speedup and speculation is
 not.
+
+**Greedy speculation is a different question, with its own answer.** The
+sampling version above can only be checked statistically — its output is a
+distribution, so there is no fixed string to be identical to. A greedy decode
+has one: always the argmax, which is what the browser's Greedy preset is (its
+`top_k 1` leaves exactly one candidate), so speculation either reproduces that
+string or it does not.
+[`greedy_spec.py`](greedy_spec.py) checks the text, then measures what each
+guess was worth:
+
+```
+mode                        tokens/s  vs cached   detail
+uncached                          62     0.46x     re-reads the window
+cached                           134     1.00x     one pass per token
+spec 3L/2 ahead                  113     0.84x     71% accepted, 2.43 tok/round, 15 passes
+spec 3L/6 ahead                   39     0.29x     33% accepted, 3.00 tok/round, 13 passes
+oracle 2 ahead                   243     1.81x     free and always right, 12 passes
+oracle 4 ahead                   412     3.06x     free and always right, 8 passes
+oracle 6 ahead                   483     3.60x     free and always right, 6 passes
+```
+
+All nine draft settings — three depths by three lookaheads — reproduced the
+cached baseline token for token. That is the property worth having: the draft's
+accuracy changes the speed and never the text, because a guess the target
+disagrees with is discarded, not written. And it lost anyway. The best row is
+three layers guessing two ahead at 0.84x, because on this CPU the draft's serial
+passes cost more than the verification saves.
+
+The oracle rows are there to say whether that is a fact about the machine or
+about the draft. Handed the target's own continuation, and spending nothing to
+produce it, the decoder reaches **3.60x** at six guesses ahead: 32 tokens in six
+target passes instead of thirty-two, every guess accepted, 6.60 tokens per
+round. So free drafting has 3.6x of headroom here, and the layer-truncated draft
+is spending all of it to be right 33–71% of the time. The draft worth trying next
+is the one that costs no forward pass at all — an n-gram or prompt-lookup drafter
+— not a deeper one.
+
+Two caveats, both stated rather than buried. Every run stays inside the window,
+which is the only regime where the identity is unconditional; past `block_size`
+the decoder re-anchors and the text is then identical to a baseline that
+re-anchors at the same points, not to one that read a full window every token.
+And the same two-thread machine that made `--sustained` necessary moves these
+numbers between runs — the uncached row has read 62 and 79 tokens/s on different
+afternoons — so read the ratio to `cached` and the pass counts, not the
+absolute rate.
 
 ### Serving several replies at once
 
@@ -603,7 +650,7 @@ step, and the checkpoint never leaves the machine.
 .venv/bin/python -m unittest test_archil_store  # the disk store, no key and no network
 
 # What CI runs instead: the same suites, but a skip fails the run.
-python ci_tests.py test_all test_peek
+python ci_tests.py test_all test_peek test_greedy_spec
 ```
 
 The suite runs on the standard library alone — no pytest — and covers the
@@ -622,7 +669,10 @@ and would quietly invalidate the results if it broke again:
   reproduces the reference loop's tokens exactly, no call ever reads a position
   past the window, and the speculative path reproduces the greedy sequence while
   the acceptance rule reproduces the target distribution (checked by histogram
-  over 10,000 rounds, against a draft that disagrees with it)
+  over 10,000 rounds, against a draft that disagrees with it), and the greedy
+  bench's reference is the decoder the app serves — pinned to
+  `infer.Decoder` at the page's own Greedy settings — with its mismatch
+  verdict shown to fire on a deliberately corrupted emission
 - a batched row is a solo row: every row of a mixed-length batch reproduces its
   own uncached decode token for token, no pad is ever attended to (including the
   pad that ends up between a short row's old tokens and its new ones), four rows
